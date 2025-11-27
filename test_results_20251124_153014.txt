@@ -1,0 +1,230 @@
+================================================================================
+🦷 PATIENT AI SERVICE V2 - COMPREHENSIVE INTENT TESTING
+================================================================================
+
+Session ID: +971501234567_test_1763991014
+Base URL: http://localhost:8000
+Started: Mon Nov 24 15:30:14 EET 2025
+
+Checking service health...
+[0;32m✅ Service is healthy and ready[0m
+
+╔════════════════════════════════════════════════════════════════════════╗
+║          CATEGORY 1: APPOINTMENT BOOKING TESTS                         ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+================================================================================
+TEST #1: Booking-1: Complete info
+================================================================================
+📝 Message: I need an appointment with Dr. Mohammed Atef tomorrow at 3pm for a cleaning
+🎯 Expected Intent: appointment_booking
+
+📌 Actual Intent: appointment_booking
+🤖 Agent: unknown
+💬 Response: 
+
+First, let me find Dr. Mohammed Atef's information and then check if that time slot is available.
+
+<function_calls>
+<invoke name="find_doctor_by_name">
+<parameter name="doctor_name">Mohammed Atef</p
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #2: Booking-2: Partial info
+================================================================================
+📝 Message: I want to book a cleaning appointment
+🎯 Expected Intent: appointment_booking
+
+📌 Actual Intent: appointment_booking
+🤖 Agent: unknown
+💬 Response: I understand you'd like to book a cleaning appointment. Unfortunately, Dr. Mohammed Atef isn't available tomorrow at 3pm - that time slot is already booked.
+
+However, Dr. Atef has availability tomorro
+[0;32m✅ PASS - Intent matches![0m
+
+╔════════════════════════════════════════════════════════════════════════╗
+║          CATEGORY 2: APPOINTMENT RESCHEDULING TESTS                    ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+================================================================================
+TEST #3: Reschedule-1: Context-aware
+================================================================================
+📝 Message: can i move it to 3pm?
+🎯 Expected Intent: appointment_reschedule
+
+📌 Actual Intent: appointment_reschedule
+🤖 Agent: unknown
+💬 Response: Hello! Welcome to Bright Smile Dental Clinic! 😊
+
+I'd be happy to help you, but it looks like you're asking about rescheduling an appointment to 3pm. However, I'm the **patient registration assistant**
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #4: Reschedule-2: Explicit date/time
+================================================================================
+📝 Message: reschedule my appointment to tomorrow at 11am
+🎯 Expected Intent: appointment_reschedule
+
+📌 Actual Intent: appointment_reschedule
+🤖 Agent: unknown
+💬 Response: I understand you'd like to reschedule your appointment to tomorrow at 11am. However, I'm specifically the **registration assistant** for new patients. I don't have access to appointment scheduling or 
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #5: Reschedule-3: Change time
+================================================================================
+📝 Message: change my appointment time to 2pm
+🎯 Expected Intent: appointment_reschedule
+
+📌 Actual Intent: appointment_reschedule
+🤖 Agent: unknown
+💬 Response: I understand you're trying to change your appointment time to 2pm, but as I mentioned, I'm the **patient registration assistant** and I don't have access to the appointment scheduling system or your e
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #6: Reschedule-4: Generic request
+================================================================================
+📝 Message: I need to reschedule
+🎯 Expected Intent: appointment_reschedule
+
+📌 Actual Intent: appointment_reschedule
+🤖 Agent: unknown
+💬 Response: I completely understand that you need to reschedule, and I want to make sure you get the help you need! 
+
+However, I'm specifically the **registration assistant** - I help new patients get registered 
+[0;32m✅ PASS - Intent matches![0m
+
+╔════════════════════════════════════════════════════════════════════════╗
+║          CATEGORY 3: APPOINTMENT CANCELLATION TESTS                    ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+================================================================================
+TEST #7: Cancel-1: Direct request
+================================================================================
+📝 Message: cancel my appointment
+🎯 Expected Intent: appointment_cancel
+
+📌 Actual Intent: appointment_cancel
+🤖 Agent: unknown
+💬 Response: I understand you want to cancel your appointment, but as I've mentioned, I'm the **patient registration assistant** and I don't have access to the appointment scheduling system. I cannot view, cancel,
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #8: Cancel-2: Context-aware
+================================================================================
+📝 Message: i can't make it, cancel it
+🎯 Expected Intent: appointment_cancel
+
+📌 Actual Intent: registration
+🤖 Agent: unknown
+💬 Response: I truly understand that you can't make it and need to cancel, and I want to help you - but I genuinely don't have the ability to cancel appointments. I'm only able to help with patient registration.
+[1;33m⚠️  WARN - Intent mismatch (got: registration, expected: appointment_cancel)[0m
+
+================================================================================
+TEST #9: Cancel-3: With reason
+================================================================================
+📝 Message: cancel my appointment tomorrow, something came up
+🎯 Expected Intent: appointment_cancel
+
+📌 Actual Intent: appointment_cancel
+🤖 Agent: unknown
+💬 Response: I completely understand that something came up and you need to cancel your appointment tomorrow. I can hear that this is urgent for you.
+
+However, I truly cannot cancel appointments - **I physically d
+[0;32m✅ PASS - Intent matches![0m
+
+╔════════════════════════════════════════════════════════════════════════╗
+║          CATEGORY 4: APPOINTMENT CHECKING TESTS                        ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+================================================================================
+TEST #10: Check-1: Next appointment
+================================================================================
+📝 Message: when is my next appointment?
+🎯 Expected Intent: appointment_check
+
+📌 Actual Intent: appointment_check
+🤖 Agent: unknown
+💬 Response: You don't have any upcoming appointments. Would you like to schedule that cleaning appointment with Dr. Mohammed Atef? I can book you for tomorrow at one of the available times like 10:30 AM, 2:30 PM,
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #11: Check-2: All appointments
+================================================================================
+📝 Message: show all my appointments
+🎯 Expected Intent: appointment_check
+
+📌 Actual Intent: appointment_check
+🤖 Agent: unknown
+💬 Response: You don't have any appointments scheduled at the moment. 
+
+Would you like to book that cleaning appointment with Dr. Mohammed Atef? I have availability tomorrow (November 24) at times like:
+- 10:30 AM
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #12: Check-3: Specific query
+================================================================================
+📝 Message: what appointments do i have?
+🎯 Expected Intent: appointment_check
+
+📌 Actual Intent: appointment_check
+🤖 Agent: unknown
+💬 Response: You currently have no appointments scheduled.
+
+Would you like to book that cleaning appointment with Dr. Mohammed Atef for tomorrow? I can get you in at 10:30 AM, 2:30 PM, or 4:00 PM. Which time would
+[0;32m✅ PASS - Intent matches![0m
+
+╔════════════════════════════════════════════════════════════════════════╗
+║          CATEGORY 5: FOLLOW-UP TESTS                                   ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+================================================================================
+TEST #13: Followup-1: General request
+================================================================================
+📝 Message: I need a follow-up appointment
+🎯 Expected Intent: follow_up
+
+📌 Actual Intent: follow_up
+🤖 Agent: unknown
+💬 Response: I understand you're looking to schedule a follow-up appointment! 
+
+However, I'm the **patient registration assistant**, so I help with collecting and managing patient information for registration purp
+[0;32m✅ PASS - Intent matches![0m
+
+================================================================================
+TEST #14: Followup-2: Post-treatment
+================================================================================
+📝 Message: I had my cleaning yesterday, is sensitivity normal?
+🎯 Expected Intent: follow_up
+
+📌 Actual Intent: follow_up
+🤖 Agent: unknown
+💬 Response: That's a great question! While I'm the patient registration assistant and not a dental professional, I can tell you that **yes, some sensitivity after a cleaning is quite normal** for many patients. I
+[0;32m✅ PASS - Intent matches![0m
+
+
+================================================================================
+📊 COMPREHENSIVE TEST RESULTS DASHBOARD
+================================================================================
+
+📈 OVERALL STATISTICS
+────────────────────────────────────────────────────────────────────────────────
+Total Tests Run:        14
+✅ Passed:              13 (92%)
+❌ Failed/Mismatched:   1
+
+📊 CATEGORY BREAKDOWN
+────────────────────────────────────────────────────────────────────────────────
+✅ Booking:          2 tests
+✅ Rescheduling:     4 tests
+✅ Cancellation:     3 tests
+✅ Checking:         3 tests
+✅ Follow-up:        2 tests
+
+================================================================================
+Completed: Mon Nov 24 15:35:16 EET 2025
+Full results saved to: test_results_20251124_153014.txt
+================================================================================
+[0;32m🎉 EXCELLENT! All intents working correctly![0m
