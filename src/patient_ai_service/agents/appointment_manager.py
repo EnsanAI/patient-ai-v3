@@ -107,7 +107,7 @@ class AppointmentManagerAgent(BaseAgent):
         self.register_tool(
             name="book_appointment",
             function=self.tool_book_appointment,
-            description="Book a new appointment. MANDATORY: When check_availability returns 'MANDATORY_ACTION': 'CALL book_appointment TOOL IMMEDIATELY', you MUST call this tool immediately. Do NOT generate text - make the tool call. Use 'general consultation' for reason if not provided.",
+            description="Book a new appointment. MANDATORY: When check_availability returns 'MANDATORY_ACTION': 'CALL book_appointment TOOL IMMEDIATELY', you MUST call this tool immediately. Do NOT generate text - make the tool call. Extract the reason from user's message (their exact wording). Only use 'general consultation' if user did not mention any reason.",
             parameters={
                 "patient_id": {
                     "type": "string",
@@ -127,7 +127,7 @@ class AppointmentManagerAgent(BaseAgent):
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Reason for appointment (e.g., 'cleaning', 'checkup', 'consultation'). Use 'general consultation' if not provided."
+                    "description": "Extract the EXACT reason/procedure/symptom from user's message. Use user's own words. ONLY use 'general consultation' if user did not mention any specific reason."
                 }
             }
         )
@@ -319,7 +319,7 @@ WORKFLOW:
    - The tool result will include "required_parameters" - use those exact values for the book_appointment tool call
    - If False or is_conflicting is True: The time is NOT available - proceed to step 9
    - DO NOT ask for more information if availability check shows the slot is free
-7. **If available AND patient registered (Patient ID exists) - MANDATORY ACTION**: 
+7. **If available AND patient registered (Patient ID exists) - MANDATORY ACTION**:
    - **YOU MUST CALL book_appointment tool IMMEDIATELY** - this is not optional, it's mandatory
    - The tool result from check_availability will show "available_at_requested_time": True
    - When you see this, call book_appointment tool immediately with:
@@ -327,11 +327,11 @@ WORKFLOW:
      * doctor_id: The UUID from find_doctor_by_name result
      * date: The parsed date (YYYY-MM-DD)
      * time: The parsed time (HH:MM, 24-hour format)
-     * reason: From user message OR "general consultation" if not provided
+     * reason: Extract user's exact wording from their message (e.g., if they said "root canal", use "root canal"). Only use "general consultation" if they didn't mention any reason.
    - NO confirmation needed
    - NO asking "would you like to book?"
    - NO waiting for user to say "yes"
-   - NO asking for reason if user didn't provide it - use "general consultation"
+   - NO asking for reason if user didn't provide it - extract it from their message or use "general consultation"
    - After booking succeeds, provide a natural confirmation message like: "Sure! Your appointment with Dr. [Name] on [date] at [time] is scheduled. ✅"
 8. **If available BUT patient NOT registered (Patient ID is None or empty)**: 
    - Say: "Dr. [Name] is available on [date] at [time]. To book, I'll need to complete your registration first - it takes just 2 minutes. Should I proceed?"
@@ -394,7 +394,7 @@ MANDATORY:
 - When you see "MANDATORY_ACTION" in tool result, you MUST make a tool call, not generate text
 
 **RULE 4: NO CONFIRMATIONS OR QUESTIONS**
-- DO NOT ask for reason - if user didn't provide it, use "general consultation"
+- DO NOT ask for reason - extract it from user's message. If they didn't mention a reason, use "general consultation"
 - DO NOT ask for confirmation - if available and patient registered, book immediately
 - DO NOT wait for user to say "yes" - book immediately when you see "MANDATORY_ACTION"
 
@@ -672,7 +672,7 @@ MANDATORY:
                                 "doctor_id": "The UUID from find_doctor_by_name result",
                                 "date": f"{date}",
                                 "time": f"{requested_time}",
-                                "reason": "From user message OR 'general consultation'"
+                                "reason": "Extract EXACT wording from user message (their procedure/symptom). Only 'general consultation' if not mentioned."
                             }
                         }
                     else:
