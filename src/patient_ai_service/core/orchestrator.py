@@ -10,7 +10,7 @@ Coordinates:
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from patient_ai_service.core import (
     get_llm_client,
@@ -182,13 +182,61 @@ class Orchestrator:
                 if hasattr(agent, 'set_context'):
                     agent.set_context(session_id, reasoning.response_guidance.minimal_context)
 
-                # Execute agent
-                english_response = await agent.process_message(
+                # Execute agent with logging
+                english_response, execution_log = await agent.process_message_with_log(
                     session_id,
                     english_message
                 )
 
-            # Step 8: Add assistant response to conversation memory
+            # Step 8: Validate response (CLOSED-LOOP)
+            validation = await self.reasoning_engine.validate_response(
+                session_id=session_id,
+                original_reasoning=reasoning,
+                agent_response=english_response,
+                execution_log=execution_log
+            )
+
+            logger.info(f"Validation result: valid={validation.is_valid}, "
+                       f"decision={validation.decision}, "
+                       f"confidence={validation.confidence}")
+
+            # Step 9: Handle validation result (retry loop)
+            max_retries = 1  # Single retry to minimize latency
+            retry_count = 0
+
+            while not validation.is_valid and retry_count < max_retries:
+                if validation.decision == "retry":
+                    logger.info(f"Retrying with feedback: {validation.feedback_to_agent}")
+
+                    # Retry with specific feedback
+                    english_response, execution_log = await agent.process_message_with_log(
+                        session_id,
+                        f"[VALIDATION FEEDBACK]: {validation.feedback_to_agent}\n\n"
+                        f"Original user request: {english_message}"
+                    )
+
+                    # Re-validate
+                    validation = await self.reasoning_engine.validate_response(
+                        session_id,
+                        reasoning,
+                        english_response,
+                        execution_log
+                    )
+                    retry_count += 1
+
+                elif validation.decision == "redirect":
+                    # Could try different agent, but for MVP just break
+                    logger.warning(f"Validation suggests redirect, but using current response")
+                    break
+                else:
+                    break
+
+            # Step 10: Use fallback if still invalid
+            if not validation.is_valid and validation.confidence < 0.5:
+                logger.error(f"Validation failed after retries: {validation.issues}")
+                english_response = self._get_validation_fallback(validation.issues)
+
+            # Step 11: Add assistant response to conversation memory
             self.memory_manager.add_assistant_turn(session_id, english_response)
 
             # Step 9: Translation (output)
@@ -211,6 +259,12 @@ class Orchestrator:
                     "agent": agent_name,
                     "sentiment": reasoning.understanding.sentiment,
                     "reasoning_summary": reasoning.reasoning_chain[0] if reasoning.reasoning_chain else "",
+                    "validation": {
+                        "passed": validation.is_valid,
+                        "retries": retry_count,
+                        "confidence": validation.confidence,
+                        "issues": validation.issues if not validation.is_valid else []
+                    }
                 }
             )
 
@@ -228,6 +282,21 @@ class Orchestrator:
                 detected_language=language or "en",
                 metadata={"error": str(e)}
             )
+
+    def _get_validation_fallback(self, issues: List[str]) -> str:
+        """
+        Generate safe fallback response when validation fails.
+
+        Args:
+            issues: List of validation issues detected
+
+        Returns:
+            Safe fallback response string
+        """
+        return (
+            "I want to make sure I give you accurate information. "
+            "Let me connect you with a team member who can help you with this request."
+        )
 
     async def _ensure_patient_loaded(self, session_id: str):
         """Ensure patient data is loaded in state."""

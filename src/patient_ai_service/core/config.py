@@ -56,6 +56,24 @@ class Settings(BaseSettings):
     enable_medical_inquiry: bool = True
     enable_emergency_response: bool = True
 
+    # Validation (Closed-Loop)
+    enable_validation: bool = Field(
+        default=True,
+        description="Enable closed-loop validation of agent responses"
+    )
+    validation_max_retries: int = Field(
+        default=1,
+        description="Max retry attempts (1 to minimize latency)"
+    )
+    validation_confidence_threshold: float = Field(
+        default=0.7,
+        description="Min confidence to send response"
+    )
+    validation_temperature: float = Field(
+        default=0.2,
+        description="LLM temperature for validation calls"
+    )
+
     # Clinic Configuration
     default_clinic_id: str = "clinic_001"
     clinic_name: str = "Bright Smile Dental Clinic"

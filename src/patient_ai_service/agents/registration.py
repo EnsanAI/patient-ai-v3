@@ -29,9 +29,7 @@ class RegistrationAgent(BaseAgent):
         "last_name",
         "phone",
         "date_of_birth",
-        "gender",
-        "emergency_contact_name",
-        "emergency_contact_phone"
+        "gender"
     ]
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
@@ -158,11 +156,11 @@ COLLECTED INFORMATION:
 
 YOUR ROLE:
 1. Welcome new patients warmly
-2. Collect required information step-by-step
-3. Explain why each piece of information is needed
+2. Collect ONLY the 5 required fields (first name, last name, phone, DOB, gender)
+3. DO NOT ask for any optional information (email, address, emergency contacts, insurance, allergies, medications, etc.)
 4. Validate inputs (phone numbers, dates, etc.)
 5. Track progress and show completion status
-6. Handle concerns about privacy
+6. Complete registration as soon as all 5 fields are collected
 7. **IMPORTANT**: If user wants to schedule an appointment, redirect them to appointment scheduling AFTER registration is complete
 
 REQUIRED FIELDS:
@@ -171,8 +169,6 @@ REQUIRED FIELDS:
 ✓ Phone Number
 ✓ Date of Birth
 ✓ Gender
-✓ Emergency Contact Name
-✓ Emergency Contact Phone
 
 IMPORTANT INSTRUCTIONS:
 - When ALL required fields are collected (form_completion = 100%), you MUST call the complete_registration tool
@@ -182,21 +178,13 @@ IMPORTANT INSTRUCTIONS:
   "🎉 Congratulations! Your registration is now complete! You're all set to book appointments with us. How can I help you today?"
 - Always follow up tool calls with a natural, conversational response
 
-OPTIONAL FIELDS:
-- Email
-- Address
-- Gender
-- Insurance Information
-- Allergies
-- Current Medications
-- Medical Conditions
-
 COLLECTION STRATEGY:
-1. Start with basic info (name, phone, DOB)
-2. Emergency contact details
-3. Medical history (allergies, medications)
-4. Insurance (if applicable)
-5. Preferences (language, communication)
+1. Collect first name
+2. Collect last name
+3. Collect phone number (international format)
+4. Collect date of birth (YYYY-MM-DD)
+5. Collect gender
+6. Complete registration - DO NOT ask for any other information
 
 GUIDELINES:
 - One question at a time (don't overwhelm)

@@ -20,6 +20,11 @@ from patient_ai_service.core.conversation_memory import (
     ConversationMemoryManager,
     get_conversation_memory_manager
 )
+from patient_ai_service.models.validation import (
+    ValidationResult,
+    ExecutionLog,
+    ToolExecution
+)
 
 logger = logging.getLogger(__name__)
 
@@ -455,6 +460,178 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             ),
             reasoning_chain=["Fallback reasoning used"]
         )
+
+    async def validate_response(
+        self,
+        session_id: str,
+        original_reasoning: ReasoningOutput,
+        agent_response: str,
+        execution_log: ExecutionLog
+    ) -> ValidationResult:
+        """
+        Validate agent response against original intent and execution reality.
+
+        This closes the loop by checking:
+        1. Did agent complete the expected task?
+        2. Does response match tool results?
+        3. Is agent being honest about what happened?
+        4. Any safety/policy violations?
+
+        Args:
+            session_id: Session identifier
+            original_reasoning: The original reasoning output that routed to this agent
+            agent_response: The response the agent generated
+            execution_log: Log of tools executed and their results
+
+        Returns:
+            ValidationResult with decision on whether to send, retry, or fallback
+        """
+        try:
+            # Build validation prompt
+            prompt = self._build_validation_prompt(
+                original_reasoning,
+                agent_response,
+                execution_log
+            )
+
+            # Call LLM for validation (low temperature for consistency)
+            response = self.llm_client.create_message(
+                system=self._get_validation_system_prompt(),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2  # Low temp for deterministic validation
+            )
+
+            # Parse validation response
+            validation = self._parse_validation_response(response)
+
+            logger.info(f"Validation complete for session {session_id}: "
+                       f"valid={validation.is_valid}, "
+                       f"decision={validation.decision}, "
+                       f"confidence={validation.confidence}")
+
+            return validation
+
+        except Exception as e:
+            logger.error(f"Error in validation: {e}", exc_info=True)
+            # On validation error, assume response is valid (fail open)
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.5,
+                decision="send",
+                issues=[f"Validation error: {str(e)}"],
+                reasoning=["Validation failed, defaulting to send"]
+            )
+
+    def _get_validation_system_prompt(self) -> str:
+        """Get system prompt for validation LLM call."""
+        return """You are a validation system for a dental clinic AI assistant.
+
+Your job is to verify that agent responses are:
+1. COMPLETE - Did the agent finish the task?
+2. ACCURATE - Does the response match what actually happened?
+3. HONEST - Is the agent claiming something that didn't occur?
+4. SAFE - No policy violations or dangerous advice?
+
+CRITICAL VALIDATION CHECKS:
+
+Tool Usage:
+- If task requires booking: Did agent call book_appointment tool?
+- If agent says "booked": Is there a book_appointment result?
+- If tool returned data: Did agent use it correctly?
+
+Completeness:
+- If user asked for confirmation number: Is it in the response?
+- If user requested action: Was action completed?
+
+Accuracy:
+- Does response match tool results?
+- Are dates/times valid?
+- Do entity references exist?
+
+Safety:
+- No medical diagnosis
+- No unauthorized actions
+- No false confirmations
+
+Always respond with structured JSON for automated processing."""
+
+    def _build_validation_prompt(
+        self,
+        original_reasoning: ReasoningOutput,
+        agent_response: str,
+        execution_log: ExecutionLog
+    ) -> str:
+        """Build validation prompt with context."""
+        tools_summary = "\n".join([
+            f"- {exec.tool_name}: inputs={exec.inputs}, outputs={exec.outputs}"
+            for exec in execution_log.tools_used
+        ])
+
+        return f"""VALIDATION REQUEST
+
+═══ ORIGINAL ANALYSIS ═══
+User wanted: {original_reasoning.understanding.what_user_means}
+Expected action: {original_reasoning.routing.action}
+Expected tools: (inferred from action type)
+
+═══ WHAT ACTUALLY HAPPENED ═══
+Agent response: "{agent_response}"
+
+Tools executed:
+{tools_summary if tools_summary else "No tools used"}
+
+═══ VALIDATION TASK ═══
+Check if response is valid and safe to send to user.
+
+Respond with JSON:
+{{
+  "is_valid": true/false,
+  "confidence": 0.0-1.0,
+  "issues": ["list of specific problems found"],
+  "decision": "send" | "retry" | "redirect" | "fallback",
+  "feedback_to_agent": "specific guidance if retry needed",
+  "reasoning": ["step 1: ...", "step 2: ..."]
+}}
+
+DECISION GUIDE:
+- "send": Response is valid, send to user
+- "retry": Fixable issue, give agent specific feedback
+- "redirect": Wrong agent, need different approach
+- "fallback": Unfixable, use safe fallback response
+
+IMPORTANT: Only mark is_valid=true if you're confident response is complete, accurate, and safe."""
+
+    def _parse_validation_response(self, response: str) -> ValidationResult:
+        """Parse LLM validation response into ValidationResult."""
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON found in validation response")
+
+            data = json.loads(json_match.group())
+
+            # Create ValidationResult
+            return ValidationResult(
+                is_valid=data.get("is_valid", False),
+                confidence=data.get("confidence", 1.0),
+                issues=data.get("issues", []),
+                decision=data.get("decision", "send"),
+                feedback_to_agent=data.get("feedback_to_agent", ""),
+                reasoning=data.get("reasoning", [])
+            )
+
+        except Exception as e:
+            logger.error(f"Error parsing validation response: {e}")
+            logger.debug(f"Response was: {response}")
+            # On parse error, assume valid (fail open)
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.5,
+                decision="send",
+                issues=[f"Parse error: {str(e)}"],
+                reasoning=["Failed to parse validation, defaulting to send"]
+            )
 
 
 # Global instance

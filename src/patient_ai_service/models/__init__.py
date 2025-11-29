@@ -38,6 +38,12 @@ from .appointments import (
     AppointmentContext,
 )
 
+from .validation import (
+    ToolExecution,
+    ExecutionLog,
+    ValidationResult,
+)
+
 __all__ = [
     # Enums
     "IntentType",
@@ -67,4 +73,8 @@ __all__ = [
     "Appointment",
     "Doctor",
     "AppointmentContext",
+    # Validation
+    "ToolExecution",
+    "ExecutionLog",
+    "ValidationResult",
 ]

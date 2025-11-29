@@ -11,11 +11,13 @@ Provides common functionality including:
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
+from datetime import datetime
 
 from patient_ai_service.core import get_llm_client, get_state_manager
 from patient_ai_service.core.llm import LLMClient
 from patient_ai_service.core.state_manager import StateManager
+from patient_ai_service.models.validation import ExecutionLog, ToolExecution
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,9 @@ class BaseAgent(ABC):
 
         # Minimal context from reasoning engine (per session)
         self._context: Dict[str, Dict[str, Any]] = {}
+
+        # Execution log for validation (per session)
+        self._execution_log: Dict[str, ExecutionLog] = {}
 
         # Tool registry
         self._tools: Dict[str, Callable] = {}
@@ -304,6 +309,36 @@ class BaseAgent(ABC):
         logger.info(f"🤖 AUTO-BOOKING TRIGGERED: {booking_params}")
         return booking_params
 
+    async def process_message_with_log(
+        self,
+        session_id: str,
+        user_message: str
+    ) -> Tuple[str, ExecutionLog]:
+        """
+        Process message and return both response and execution log.
+
+        This method initializes execution logging, calls process_message(),
+        and returns the execution log for validation purposes.
+
+        Args:
+            session_id: Session identifier
+            user_message: User's input message
+
+        Returns:
+            Tuple of (response, execution_log)
+        """
+        # Initialize execution log for this turn
+        self._execution_log[session_id] = ExecutionLog(
+            tools_used=[],
+            conversation_turns=len(self.conversation_history.get(session_id, []))
+        )
+
+        # Call existing process_message
+        response = await self.process_message(session_id, user_message)
+
+        # Return response and log
+        return response, self._execution_log[session_id]
+
     async def process_message(self, session_id: str, user_message: str) -> str:
         """
         Process a user message and return a response.
@@ -553,11 +588,34 @@ class BaseAgent(ABC):
                 result = tool_function(**tool_input)
 
             logger.info(f"Tool '{tool_name}' executed successfully")
+
+            # Log tool execution for validation
+            if session_id in self._execution_log:
+                tool_execution = ToolExecution(
+                    tool_name=tool_name,
+                    inputs=tool_input,
+                    outputs=result if isinstance(result, dict) else {"result": result},
+                    timestamp=datetime.utcnow()
+                )
+                self._execution_log[session_id].tools_used.append(tool_execution)
+
             return result if isinstance(result, dict) else {"result": result}
 
         except Exception as e:
             logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True)
-            return {"error": str(e)}
+            error_result = {"error": str(e)}
+
+            # Log failed tool execution for validation
+            if session_id in self._execution_log:
+                tool_execution = ToolExecution(
+                    tool_name=tool_name,
+                    inputs=tool_input,
+                    outputs=error_result,
+                    timestamp=datetime.utcnow()
+                )
+                self._execution_log[session_id].tools_used.append(tool_execution)
+
+            return error_result
 
     def _get_error_response(self, error: str) -> str:
         """Generate user-friendly error response."""
