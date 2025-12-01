@@ -266,6 +266,49 @@ class StateManager:
             **kwargs
         )
 
+    # Execution Log Management
+
+    def get_execution_log(self, session_id: str) -> Optional['ExecutionLog']:
+        """
+        Get execution log from state (for debugging/auditing).
+        
+        Note: Execution log is primarily in-memory during pipeline execution.
+        This method retrieves persisted log if available.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            ExecutionLog if found, None otherwise
+        """
+        from patient_ai_service.models.validation import ExecutionLog
+        return self._get_local_state(
+            session_id,
+            "execution_log",
+            ExecutionLog
+        )
+
+    def save_execution_log(self, session_id: str, execution_log: 'ExecutionLog'):
+        """
+        Persist execution log to state (for debugging/auditing).
+        
+        Args:
+            session_id: Session identifier
+            execution_log: ExecutionLog to persist
+        """
+        from patient_ai_service.models.validation import ExecutionLog
+        self._save_state(session_id, "execution_log", execution_log)
+
+    def clear_execution_log(self, session_id: str):
+        """
+        Clear persisted execution log.
+        
+        Args:
+            session_id: Session identifier
+        """
+        key = self._make_key(session_id, "execution_log")
+        self.backend.delete(key)
+
     # Helper Methods
 
     def _get_local_state(self, session_id: str, state_type: str, model_class):

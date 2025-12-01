@@ -10,6 +10,7 @@ Provides common functionality including:
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable, Tuple
 from datetime import datetime
@@ -17,7 +18,17 @@ from datetime import datetime
 from patient_ai_service.core import get_llm_client, get_state_manager
 from patient_ai_service.core.llm import LLMClient
 from patient_ai_service.core.state_manager import StateManager
+from patient_ai_service.core.observability import get_observability_logger
+from patient_ai_service.core.config import settings
 from patient_ai_service.models.validation import ExecutionLog, ToolExecution
+from patient_ai_service.models.observability import (
+    LLMCall,
+    ToolExecutionDetail,
+    AgentExecutionDetails,
+    AgentContext,
+    TokenUsage,
+    CostInfo
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +60,9 @@ class BaseAgent(ABC):
         # Minimal context from reasoning engine (per session)
         self._context: Dict[str, Dict[str, Any]] = {}
 
-        # Execution log for validation (per session)
+        # Temporary storage for execution log during tool execution
+        # Note: Execution log is now passed from orchestrator, not created here
+        # This dict is only used temporarily to pass log to _execute_tool()
         self._execution_log: Dict[str, ExecutionLog] = {}
 
         # Tool registry
@@ -84,6 +97,17 @@ class BaseAgent(ABC):
         """
         self._context[session_id] = context
         logger.debug(f"Set context for {self.agent_name} session {session_id}: {context}")
+        
+        # Record agent context in observability
+        if settings.enable_observability:
+            obs_logger = get_observability_logger(session_id)
+            system_prompt = self._get_system_prompt(session_id)
+            obs_logger.record_agent_context(
+                agent_name=self.agent_name,
+                minimal_context=context,
+                conversation_history_length=len(self.conversation_history.get(session_id, [])),
+                system_prompt_preview=system_prompt[:200] if system_prompt else ""
+            )
 
     def _get_context_note(self, session_id: str) -> str:
         """
@@ -312,32 +336,33 @@ class BaseAgent(ABC):
     async def process_message_with_log(
         self,
         session_id: str,
-        user_message: str
+        user_message: str,
+        execution_log: ExecutionLog
     ) -> Tuple[str, ExecutionLog]:
         """
-        Process message and return both response and execution log.
+        Process message and append tool executions to provided execution log.
 
-        This method initializes execution logging, calls process_message(),
-        and returns the execution log for validation purposes.
+        This method receives an execution log from the orchestrator, appends
+        tool executions during message processing, and returns the updated log.
 
         Args:
             session_id: Session identifier
             user_message: User's input message
+            execution_log: Execution log to append tool executions to
 
         Returns:
-            Tuple of (response, execution_log)
+            Tuple of (response, execution_log with appended tools)
         """
-        # Initialize execution log for this turn
-        self._execution_log[session_id] = ExecutionLog(
-            tools_used=[],
-            conversation_turns=len(self.conversation_history.get(session_id, []))
-        )
+        # Store execution_log temporarily for _execute_tool() access
+        # This is needed because _execute_tool() is called from process_message()
+        # which doesn't have direct access to execution_log parameter
+        self._execution_log[session_id] = execution_log
 
-        # Call existing process_message
+        # Call existing process_message (which calls _execute_tool)
         response = await self.process_message(session_id, user_message)
 
-        # Return response and log
-        return response, self._execution_log[session_id]
+        # Return the log (now with tools appended)
+        return response, execution_log
 
     async def process_message(self, session_id: str, user_message: str) -> str:
         """
@@ -352,6 +377,11 @@ class BaseAgent(ABC):
         Returns:
             Agent's response message
         """
+        agent_start_time = time.time()
+        llm_calls = []
+        tool_executions = []
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        
         try:
             # Initialize conversation history if needed
             if session_id not in self.conversation_history:
@@ -366,21 +396,56 @@ class BaseAgent(ABC):
             # Get system prompt with context
             system_prompt = self._get_system_prompt(session_id)
 
-            # Call LLM
+            # Call LLM with token tracking
+            llm_start_time = time.time()
             if self._tool_schemas:
                 # Use tools if available
-                response_text, tool_use = self.llm_client.create_message_with_tools(
-                    system=system_prompt,
-                    messages=self.conversation_history[session_id],
-                    tools=self._tool_schemas
-                )
+                if hasattr(self.llm_client, 'create_message_with_tools_and_usage'):
+                    response_text, tool_use, tokens = self.llm_client.create_message_with_tools_and_usage(
+                        system=system_prompt,
+                        messages=self.conversation_history[session_id],
+                        tools=self._tool_schemas
+                    )
+                else:
+                    response_text, tool_use = self.llm_client.create_message_with_tools(
+                        system=system_prompt,
+                        messages=self.conversation_history[session_id],
+                        tools=self._tool_schemas
+                    )
+                    tokens = TokenUsage()  # Fallback if method not available
             else:
                 # No tools
-                response_text = self.llm_client.create_message(
-                    system=system_prompt,
-                    messages=self.conversation_history[session_id]
+                if hasattr(self.llm_client, 'create_message_with_usage'):
+                    response_text, tokens = self.llm_client.create_message_with_usage(
+                        system=system_prompt,
+                        messages=self.conversation_history[session_id]
+                    )
+                    tool_use = None
+                else:
+                    response_text = self.llm_client.create_message(
+                        system=system_prompt,
+                        messages=self.conversation_history[session_id]
+                    )
+                    tokens = TokenUsage()  # Fallback if method not available
+                    tool_use = None
+            
+            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            
+            # Record LLM call
+            if obs_logger:
+                llm_call = obs_logger.record_llm_call(
+                    component="agent",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_ms=llm_duration_ms,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=len(self.conversation_history[session_id]),
+                    temperature=settings.llm_temperature,
+                    max_tokens=settings.llm_max_tokens
                 )
-                tool_use = None
+                if llm_call:
+                    llm_calls.append(llm_call)
 
             # Handle tool calls
             if tool_use:
@@ -434,14 +499,51 @@ class BaseAgent(ABC):
                     final_response = ""
                 else:
                     # Normal flow: Ask LLM if another tool call is needed
-                    final_response, next_tool_use = self.llm_client.create_message_with_tools(
-                        system=system_prompt,
-                        messages=self.conversation_history[session_id],
-                        tools=self._tool_schemas
-                    ) if self._tool_schemas else (self.llm_client.create_message(
-                        system=system_prompt,
-                        messages=self.conversation_history[session_id]
-                    ), None)
+                    llm_start_time = time.time()
+                    if self._tool_schemas:
+                        if hasattr(self.llm_client, 'create_message_with_tools_and_usage'):
+                            final_response, next_tool_use, tokens = self.llm_client.create_message_with_tools_and_usage(
+                                system=system_prompt,
+                                messages=self.conversation_history[session_id],
+                                tools=self._tool_schemas
+                            )
+                        else:
+                            final_response, next_tool_use = self.llm_client.create_message_with_tools(
+                                system=system_prompt,
+                                messages=self.conversation_history[session_id],
+                                tools=self._tool_schemas
+                            )
+                            tokens = TokenUsage()
+                    else:
+                        if hasattr(self.llm_client, 'create_message_with_usage'):
+                            final_response, tokens = self.llm_client.create_message_with_usage(
+                                system=system_prompt,
+                                messages=self.conversation_history[session_id]
+                            )
+                            next_tool_use = None
+                        else:
+                            final_response = self.llm_client.create_message(
+                                system=system_prompt,
+                                messages=self.conversation_history[session_id]
+                            )
+                            tokens = TokenUsage()
+                            next_tool_use = None
+                    
+                    llm_duration_ms = (time.time() - llm_start_time) * 1000
+                    if obs_logger:
+                        llm_call = obs_logger.record_llm_call(
+                            component="agent",
+                            provider=settings.llm_provider.value,
+                            model=settings.get_llm_model(),
+                            tokens=tokens,
+                            duration_ms=llm_duration_ms,
+                            system_prompt_length=len(system_prompt),
+                            messages_count=len(self.conversation_history[session_id]),
+                            temperature=settings.llm_temperature,
+                            max_tokens=settings.llm_max_tokens
+                        )
+                        if llm_call:
+                            llm_calls.append(llm_call)
                 # ========== END AUTO-BOOKING ENFORCEMENT ==========
 
                 # If another tool is needed, execute it (chained tool call)
@@ -514,10 +616,34 @@ class BaseAgent(ABC):
                         if not msg.get("content", "").startswith("Tool result:")
                     ]
                     
-                    assistant_message = self.llm_client.create_message(
-                        system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
-                        messages=clean_messages
-                    )
+                    llm_start_time = time.time()
+                    if hasattr(self.llm_client, 'create_message_with_usage'):
+                        assistant_message, tokens = self.llm_client.create_message_with_usage(
+                            system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
+                            messages=clean_messages
+                        )
+                    else:
+                        assistant_message = self.llm_client.create_message(
+                            system=system_prompt + "\n\nCRITICAL: Provide ONLY a natural language response. Do NOT include tool results, JSON, or technical details. Just provide a friendly confirmation message.",
+                            messages=clean_messages
+                        )
+                        tokens = TokenUsage()
+                    
+                    llm_duration_ms = (time.time() - llm_start_time) * 1000
+                    if obs_logger:
+                        llm_call = obs_logger.record_llm_call(
+                            component="agent",
+                            provider=settings.llm_provider.value,
+                            model=settings.get_llm_model(),
+                            tokens=tokens,
+                            duration_ms=llm_duration_ms,
+                            system_prompt_length=len(system_prompt),
+                            messages_count=len(clean_messages),
+                            temperature=settings.llm_temperature,
+                            max_tokens=settings.llm_max_tokens
+                        )
+                        if llm_call:
+                            llm_calls.append(llm_call)
                     
                     # Clean up any tool result JSON that might have leaked into the response
                     if "Tool result:" in assistant_message:
@@ -547,6 +673,44 @@ class BaseAgent(ABC):
                 self.conversation_history[session_id] = \
                     self.conversation_history[session_id][-20:]
 
+            # Build agent execution details for observability
+            if obs_logger:
+                agent_duration_ms = (time.time() - agent_start_time) * 1000
+                
+                # Get tool executions from tracker
+                tool_executions = obs_logger.tool_tracker.get_executions()
+                
+                # Calculate totals
+                total_tokens = TokenUsage()
+                total_cost = CostInfo()
+                for llm_call in llm_calls:
+                    total_tokens += llm_call.tokens
+                    total_cost += llm_call.cost
+                
+                # Get agent context
+                context = self._context.get(session_id, {})
+                system_prompt = self._get_system_prompt(session_id)
+                agent_context = AgentContext(
+                    session_id=session_id,
+                    agent_name=self.agent_name,
+                    minimal_context=context,
+                    conversation_history_length=len(self.conversation_history[session_id]),
+                    system_prompt_preview=system_prompt[:200] if system_prompt else ""
+                )
+                
+                agent_execution = AgentExecutionDetails(
+                    agent_name=self.agent_name,
+                    context=agent_context,
+                    llm_calls=llm_calls,
+                    tool_executions=tool_executions,
+                    total_tokens=total_tokens,
+                    total_cost=total_cost,
+                    duration_ms=agent_duration_ms,
+                    response_preview=assistant_message[:200] if assistant_message else ""
+                )
+                
+                obs_logger.set_agent_execution(agent_execution)
+
             return assistant_message
 
         except Exception as e:
@@ -570,9 +734,22 @@ class BaseAgent(ABC):
         Returns:
             Tool execution result
         """
+        tool_start_time = time.time()
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        
         if tool_name not in self._tools:
             logger.error(f"Unknown tool: {tool_name}")
-            return {"error": f"Unknown tool: {tool_name}"}
+            error_result = {"error": f"Unknown tool: {tool_name}"}
+            if obs_logger:
+                obs_logger.record_tool_execution(
+                    tool_name=tool_name,
+                    inputs=tool_input,
+                    outputs=error_result,
+                    duration_ms=(time.time() - tool_start_time) * 1000,
+                    success=False,
+                    error=f"Unknown tool: {tool_name}"
+                )
+            return error_result
 
         try:
             tool_function = self._tools[tool_name]
@@ -588,22 +765,51 @@ class BaseAgent(ABC):
                 result = tool_function(**tool_input)
 
             logger.info(f"Tool '{tool_name}' executed successfully")
+            
+            tool_duration_ms = (time.time() - tool_start_time) * 1000
+            result_dict = result if isinstance(result, dict) else {"result": result}
+
+            # Log tool execution for observability
+            if obs_logger:
+                obs_logger.record_tool_execution(
+                    tool_name=tool_name,
+                    inputs=tool_input,
+                    outputs=result_dict,
+                    duration_ms=tool_duration_ms,
+                    success=True
+                )
 
             # Log tool execution for validation
             if session_id in self._execution_log:
                 tool_execution = ToolExecution(
                     tool_name=tool_name,
                     inputs=tool_input,
-                    outputs=result if isinstance(result, dict) else {"result": result},
+                    outputs=result_dict,
                     timestamp=datetime.utcnow()
                 )
+                # APPEND to log (don't replace) - log is passed from orchestrator
                 self._execution_log[session_id].tools_used.append(tool_execution)
+                logger.debug(f"Appended tool execution to log: {tool_name}")
+            else:
+                logger.warning(f"⚠️ No execution_log found for session {session_id} - tool {tool_name} not logged!")
 
-            return result if isinstance(result, dict) else {"result": result}
+            return result_dict
 
         except Exception as e:
             logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True)
             error_result = {"error": str(e)}
+            tool_duration_ms = (time.time() - tool_start_time) * 1000
+
+            # Log failed tool execution for observability
+            if obs_logger:
+                obs_logger.record_tool_execution(
+                    tool_name=tool_name,
+                    inputs=tool_input,
+                    outputs=error_result,
+                    duration_ms=tool_duration_ms,
+                    success=False,
+                    error=str(e)
+                )
 
             # Log failed tool execution for validation
             if session_id in self._execution_log:
@@ -613,7 +819,11 @@ class BaseAgent(ABC):
                     outputs=error_result,
                     timestamp=datetime.utcnow()
                 )
+                # APPEND to log (don't replace) - log is passed from orchestrator
                 self._execution_log[session_id].tools_used.append(tool_execution)
+                logger.debug(f"Appended failed tool execution to log: {tool_name} (error: {str(e)})")
+            else:
+                logger.warning(f"⚠️ No execution_log found for session {session_id} - failed tool {tool_name} not logged!")
 
             return error_result
 

@@ -74,6 +74,16 @@ class Settings(BaseSettings):
         description="LLM temperature for validation calls"
     )
 
+    # Finalization (Two-Layer Quality Control)
+    enable_finalization: bool = Field(
+        default=True,
+        description="Enable finalization layer (final quality check before sending)"
+    )
+    finalization_temperature: float = Field(
+        default=0.3,
+        description="LLM temperature for finalization (slightly higher for natural edits)"
+    )
+
     # Clinic Configuration
     default_clinic_id: str = "clinic_001"
     clinic_name: str = "Bright Smile Dental Clinic"
@@ -91,6 +101,24 @@ class Settings(BaseSettings):
     # Monitoring
     enable_metrics: bool = False
     metrics_port: int = 9090
+
+    # Observability
+    enable_observability: bool = Field(
+        default=True,
+        description="Enable detailed observability logging"
+    )
+    observability_output_format: Literal["json", "structured", "detailed"] = Field(
+        default="structured",
+        description="Output format for observability logs"
+    )
+    observability_log_to_file: Optional[str] = Field(
+        default=None,
+        description="Optional file path for observability logs (None = stdout only)"
+    )
+    cost_tracking_enabled: bool = Field(
+        default=True,
+        description="Enable cost tracking for LLM calls"
+    )
 
     class Config:
         env_file = ".env"

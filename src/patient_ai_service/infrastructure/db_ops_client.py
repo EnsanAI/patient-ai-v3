@@ -249,10 +249,14 @@ class DbOpsClient:
 
                 # Success cases
                 if response.status_code == 200:
-                    return response.json()
+                    response_data = response.json()
+                    logger.debug(f"📥 Response (200): {response_data}")
+                    return response_data
 
                 elif response.status_code == 201:
-                    return response.json()
+                    response_data = response.json()
+                    logger.info(f"📥 Response (201 Created): {response_data}")
+                    return response_data
 
                 elif response.status_code == 204:
                     return True  # No content success
@@ -288,7 +292,7 @@ class DbOpsClient:
                 return None
 
             except Exception as e:
-                logger.error(f"❌ Unexpected error: {e}")
+                logger.error(f"❌ Unexpected error: {e}", exc_info=True)
                 return None
 
         logger.error(f"❌ Request failed after {attempts} attempts")
@@ -462,7 +466,11 @@ class DbOpsClient:
         logger.info(f"Payload for creating the appointment: {payload}")
         result = self._make_request("POST", "/appointments", json_data=payload)
         if result:
-            logger.info(f"✅ Appointment created successfully: {result.get('id')}")
+            appointment_id = result.get('id')
+            logger.info(f"✅ Appointment created successfully: {appointment_id}")
+            logger.debug(f"📋 Full appointment response: {result}")
+            if not appointment_id:
+                logger.warning(f"⚠️ Appointment response received but 'id' field is missing. Response keys: {result.keys() if isinstance(result, dict) else 'Not a dict'}")
         else:
             logger.error(f"❌ Failed to create appointment - API returned None or error")
         return result

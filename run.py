@@ -9,8 +9,17 @@ Usage:
 """
 
 import sys
+import os
 import argparse
+from pathlib import Path
 import uvicorn
+
+# Add src directory to Python path if not already there
+project_root = Path(__file__).parent
+src_path = str(project_root / "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+    os.environ["PYTHONPATH"] = src_path
 
 
 def main():

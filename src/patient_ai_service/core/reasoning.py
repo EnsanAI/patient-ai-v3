@@ -12,10 +12,13 @@ Performs chain-of-thought reasoning in a single LLM call for:
 import json
 import logging
 import re
+import time
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 
 from patient_ai_service.core.llm import LLMClient, get_llm_client
+from patient_ai_service.core.config import settings
+from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.core.conversation_memory import (
     ConversationMemoryManager,
     get_conversation_memory_manager
@@ -25,6 +28,7 @@ from patient_ai_service.models.validation import (
     ExecutionLog,
     ToolExecution
 )
+from patient_ai_service.models.observability import TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -167,17 +171,114 @@ class ReasoningEngine:
 
         # Build unified reasoning prompt
         prompt = self._build_reasoning_prompt(user_message, memory, patient_info or {})
+        
+        # Get observability logger
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        reasoning_tracker = obs_logger.reasoning_tracker if obs_logger else None
 
         try:
+            # Record reasoning step
+            if reasoning_tracker:
+                reasoning_tracker.record_step(1, "Building reasoning prompt", {
+                    "user_message": user_message[:100],
+                    "memory_summary": memory.summary[:200] if memory.summary else None
+                })
+                # Broadcast reasoning step (fire and forget)
+                if obs_logger and obs_logger._broadcaster:
+                    try:
+                        import asyncio
+                        step_data = {
+                            "step_number": 1,
+                            "description": "Building reasoning prompt",
+                            "context": {
+                                "user_message": user_message[:100],
+                                "memory_summary": memory.summary[:200] if memory.summary else None
+                            }
+                        }
+                        try:
+                            loop = asyncio.get_running_loop()
+                            # Schedule task without awaiting
+                            loop.create_task(obs_logger._broadcaster.broadcast_reasoning_step(step_data))
+                        except RuntimeError:
+                            # No running loop, create new one
+                            asyncio.run(obs_logger._broadcaster.broadcast_reasoning_step(step_data))
+                    except Exception as e:
+                        logger.debug(f"Error broadcasting reasoning step: {e}")
+            
             # Single LLM call does everything
-            response = self.llm_client.create_message(
-                system=self._get_system_prompt(),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
+            llm_start_time = time.time()
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=self._get_system_prompt(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=self._get_system_prompt(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+                tokens = TokenUsage()
+            
+            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            
+            # Record LLM call
+            if obs_logger:
+                llm_call = obs_logger.record_llm_call(
+                    component="reasoning",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_ms=llm_duration_ms,
+                    system_prompt_length=len(self._get_system_prompt()),
+                    messages_count=1,
+                    temperature=0.3,
+                    max_tokens=settings.llm_max_tokens
+                )
+            
+            # Record reasoning step
+            if reasoning_tracker:
+                reasoning_tracker.record_step(2, "LLM reasoning call completed", {
+                    "response_length": len(response),
+                    "tokens_used": tokens.total_tokens
+                })
 
             # Parse and validate response
             output = self._parse_reasoning_response(response, user_message, memory)
+            
+            # Record reasoning details
+            if reasoning_tracker:
+                reasoning_tracker.set_understanding({
+                    "what_user_means": output.understanding.what_user_means,
+                    "is_continuation": output.understanding.is_continuation,
+                    "sentiment": output.understanding.sentiment,
+                    "is_conversation_restart": output.understanding.is_conversation_restart
+                })
+                reasoning_tracker.set_routing({
+                    "agent": output.routing.agent,
+                    "action": output.routing.action,
+                    "urgency": output.routing.urgency
+                })
+                reasoning_tracker.set_memory_updates({
+                    "new_facts": output.memory_updates.new_facts,
+                    "system_action": output.memory_updates.system_action,
+                    "awaiting": output.memory_updates.awaiting
+                })
+                reasoning_tracker.set_response_guidance({
+                    "tone": output.response_guidance.tone,
+                    "minimal_context": output.response_guidance.minimal_context
+                })
+                
+                # Record reasoning chain steps
+                for i, step_desc in enumerate(output.reasoning_chain, start=3):
+                    reasoning_tracker.record_step(i, step_desc, {})
+                
+                # Set LLM call in reasoning details
+                reasoning_details = reasoning_tracker.get_details()
+                if obs_logger and llm_call:
+                    reasoning_details.llm_call = llm_call
+                    obs_logger.reasoning_tracker = reasoning_tracker
 
             # Update memory with extracted facts
             if output.memory_updates.new_facts:
@@ -495,14 +596,57 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             )
 
             # Call LLM for validation (low temperature for consistency)
-            response = self.llm_client.create_message(
-                system=self._get_validation_system_prompt(),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2  # Low temp for deterministic validation
-            )
+            obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+            llm_start_time = time.time()
+            
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=self._get_validation_system_prompt(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2  # Low temp for deterministic validation
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=self._get_validation_system_prompt(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2
+                )
+                tokens = TokenUsage()
+            
+            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            
+            # Record LLM call
+            llm_call = None
+            if obs_logger:
+                llm_call = obs_logger.record_llm_call(
+                    component="validation",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_ms=llm_duration_ms,
+                    system_prompt_length=len(self._get_validation_system_prompt()),
+                    messages_count=1,
+                    temperature=0.2,
+                    max_tokens=settings.llm_max_tokens
+                )
 
             # Parse validation response
             validation = self._parse_validation_response(response)
+            
+            # Add LLM call to validation details
+            if obs_logger:
+                from patient_ai_service.models.observability import ValidationDetails
+                validation_details = ValidationDetails(
+                    is_valid=validation.is_valid,
+                    confidence=validation.confidence,
+                    decision=validation.decision,
+                    issues=validation.issues,
+                    reasoning=validation.reasoning,
+                    feedback_to_agent=validation.feedback_to_agent,
+                    llm_call=llm_call,
+                    retry_count=0
+                )
+                obs_logger.set_validation_details(validation_details)
 
             logger.info(f"Validation complete for session {session_id}: "
                        f"valid={validation.is_valid}, "
@@ -520,6 +664,268 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
                 decision="send",
                 issues=[f"Validation error: {str(e)}"],
                 reasoning=["Validation failed, defaulting to send"]
+            )
+
+    async def finalize_response(
+        self,
+        session_id: str,
+        original_reasoning: ReasoningOutput,
+        agent_response: str,
+        execution_log: ExecutionLog,
+        validation_result: ValidationResult
+    ) -> ValidationResult:
+        """
+        Finalize agent response by approving or editing before sending to user.
+
+        This is the SECOND layer of quality control that runs AFTER validation (and retry if needed).
+        Even if validation passed, finalization ensures response is grounded in tool results.
+
+        The reasoning engine examines:
+        1. Original user intent (from reasoning output)
+        2. Actual tool execution results (from execution log)
+        3. Agent's response accuracy
+        4. Previous validation feedback (if retry occurred)
+
+        Three outcomes:
+        - APPROVE: Response is accurate and complete, send as-is
+        - EDIT: Minor issues or improvements needed, provide edited version
+        - FALLBACK: Cannot confidently approve, escalate to human
+
+        Args:
+            session_id: Session identifier
+            original_reasoning: Initial reasoning before agent execution
+            agent_response: The response from agent (possibly after retry)
+            execution_log: Record of all tool calls and results
+            validation_result: Result from validation layer (for context)
+
+        Returns:
+            ValidationResult with optional rewritten_response
+        """
+        try:
+            # Build finalization prompt
+            prompt = self._build_finalization_prompt(
+                original_reasoning,
+                agent_response,
+                execution_log,
+                validation_result
+            )
+
+            # Call LLM for finalization (slightly higher temp for natural edits)
+            from patient_ai_service.core.config import settings
+            obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+            llm_start_time = time.time()
+            
+            finalization_temp = getattr(settings, 'finalization_temperature', 0.3)
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=self._get_finalization_system_prompt(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=finalization_temp
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=self._get_finalization_system_prompt(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=finalization_temp
+                )
+                tokens = TokenUsage()
+            
+            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            
+            # Record LLM call
+            llm_call = None
+            if obs_logger:
+                llm_call = obs_logger.record_llm_call(
+                    component="finalization",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_ms=llm_duration_ms,
+                    system_prompt_length=len(self._get_finalization_system_prompt()),
+                    messages_count=1,
+                    temperature=finalization_temp,
+                    max_tokens=settings.llm_max_tokens
+                )
+
+            # Parse finalization response
+            finalization = self._parse_finalization_response(response)
+            
+            # Add LLM call to finalization details
+            if obs_logger:
+                from patient_ai_service.models.observability import FinalizationDetails
+                finalization_details = FinalizationDetails(
+                    decision=finalization.decision,
+                    confidence=finalization.confidence,
+                    was_rewritten=finalization.was_rewritten,
+                    rewritten_response_preview=finalization.rewritten_response[:200] if finalization.rewritten_response else "",
+                    issues=finalization.issues,
+                    reasoning=finalization.reasoning,
+                    llm_call=llm_call
+                )
+                obs_logger.set_finalization_details(finalization_details)
+
+            logger.info(f"Finalization complete for session {session_id}: "
+                       f"decision={finalization.decision}, "
+                       f"edited={finalization.was_rewritten}, "
+                       f"confidence={finalization.confidence}")
+
+            return finalization
+
+        except Exception as e:
+            logger.error(f"Error in finalization: {e}", exc_info=True)
+            # On finalization error, approve agent response (fail open)
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.5,
+                decision="send",
+                issues=[f"Finalization error: {str(e)}"],
+                reasoning=["Finalization failed, defaulting to agent response"]
+            )
+
+    def _get_finalization_system_prompt(self) -> str:
+        """System prompt for response finalization (second-layer quality check)."""
+        return """You are a response finalizer for a dental clinic AI system.
+
+CONTEXT:
+This is the FINAL quality check before sending response to user. The response has already been:
+1. Validated for major issues
+2. Potentially retried if validation failed
+Now you perform a final check to approve or make minor edits.
+
+YOUR TASK:
+Review the agent's response and ensure it:
+1. Accurately reflects tool execution results
+2. Answers the user's actual request
+3. Is grounded in facts (no hallucinations)
+4. Is complete and helpful
+
+CRITICAL CHECKS:
+- If agent says "appointment confirmed" → verify book_appointment was called with success=true
+- If agent provides data (dates, times, doctor names, confirmation numbers) → verify exact match with tool outputs
+- If agent says "no availability" → verify check_availability returned available=false
+- Agent should NEVER invent information not present in tool results
+
+DECISION OUTCOMES:
+1. "send" - Response is accurate and complete, send as-is (rewritten_response = null, is_valid = true)
+2. "edit" - Minor issues detected, provide edited version (rewritten_response = edited text, is_valid = false, decision = "edit")
+3. "fallback" - Cannot confidently approve, escalate to human (decision = "fallback")
+
+RESPONSE FORMAT (JSON):
+{
+    "is_valid": true/false,
+    "confidence": 0.0-1.0,
+    "decision": "send|edit|fallback",
+    "issues": ["issue 1", "issue 2"],
+    "reasoning": ["reasoning step 1", "step 2"],
+    "rewritten_response": "edited response text" or null,
+    "was_rewritten": true/false
+}
+
+GROUNDING PRINCIPLE:
+All responses must be grounded in actual tool outputs. If tools say available=true,
+response cannot say "no availability". If book_appointment returns "APT-123",
+response MUST include "APT-123".
+
+WHEN EDITING:
+- Maintain the agent's conversational tone
+- Fix only inaccuracies or missing information
+- Include all relevant information from tool outputs
+- Keep it natural and helpful
+- Make minimal changes (don't rewrite unnecessarily)
+
+FAIL OPEN:
+If you're uncertain or detect a complex issue, use decision="fallback" to escalate to human."""
+
+    def _build_finalization_prompt(
+        self,
+        original_reasoning: ReasoningOutput,
+        agent_response: str,
+        execution_log: ExecutionLog,
+        validation_result: ValidationResult
+    ) -> str:
+        """Build prompt for response finalization (second-layer quality check)."""
+        import json
+
+        # Format tool executions for context
+        tools_section = ""
+        if execution_log.tools_used:
+            tools_section = "\n\nTOOL EXECUTIONS:\n"
+            for i, tool in enumerate(execution_log.tools_used, 1):
+                tools_section += f"\n{i}. {tool.tool_name}"
+                tools_section += f"\n   Inputs: {json.dumps(tool.inputs, indent=2)}"
+                tools_section += f"\n   Outputs: {json.dumps(tool.outputs, indent=2)}"
+        else:
+            tools_section = "\n\nTOOL EXECUTIONS: None (no tools were called)"
+
+        # Include validation context if retry occurred
+        validation_context = ""
+        if not validation_result.is_valid:
+            validation_context = f"""
+
+VALIDATION HISTORY:
+The response was validated and retried. Previous validation found these issues:
+{chr(10).join(f"- {issue}" for issue in validation_result.issues)}
+
+The agent was given this feedback and retried:
+{validation_result.feedback_to_agent}
+
+The current response is the result AFTER retry."""
+
+        prompt = f"""ORIGINAL USER INTENT:
+{original_reasoning.understanding.what_user_means}
+
+ROUTING DECISION:
+Agent: {original_reasoning.routing.agent}
+Action: {original_reasoning.routing.action}
+{tools_section}
+{validation_context}
+
+AGENT'S RESPONSE (final version after validation/retry):
+{agent_response}
+
+TASK:
+Perform final quality check on the agent's response.
+- If response is accurate and complete → approve (decision: "send")
+- If minor issues detected → provide edited version (decision: "edit")
+- If you cannot confidently approve → escalate (decision: "fallback")
+
+Respond in JSON format as specified in the system prompt."""
+
+        return prompt
+
+    def _parse_finalization_response(self, response: str) -> ValidationResult:
+        """Parse LLM finalization response into ValidationResult."""
+        try:
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON found in finalization response")
+
+            import json
+            data = json.loads(json_match.group())
+
+            # Create ValidationResult with finalization fields
+            return ValidationResult(
+                is_valid=data.get("is_valid", True),
+                confidence=data.get("confidence", 1.0),
+                decision=data.get("decision", "send"),
+                issues=data.get("issues", []),
+                reasoning=data.get("reasoning", []),
+                feedback_to_agent=data.get("feedback_to_agent", ""),
+                rewritten_response=data.get("rewritten_response"),
+                was_rewritten=data.get("was_rewritten", False)
+            )
+
+        except Exception as e:
+            logger.error(f"Error parsing finalization response: {e}")
+            logger.debug(f"Response was: {response}")
+            # On parse error, approve agent response (fail open)
+            return ValidationResult(
+                is_valid=True,
+                confidence=0.5,
+                decision="send",
+                issues=[f"Parse error: {str(e)}"],
+                reasoning=["Failed to parse finalization, approving agent response"]
             )
 
     def _get_validation_system_prompt(self) -> str:

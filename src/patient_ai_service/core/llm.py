@@ -3,13 +3,15 @@ LLM abstraction layer supporting multiple providers.
 """
 
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import anthropic
 import openai
 
 from .config import settings
 from patient_ai_service.models.enums import LLMProvider
+from patient_ai_service.models.observability import TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,45 @@ class AnthropicClient(LLMClient):
         except Exception as e:
             logger.error(f"Unexpected error calling Anthropic: {e}")
             raise
+    
+    def create_message_with_usage(
+        self,
+        system: str,
+        messages: List[Dict[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[str, TokenUsage]:
+        """Create a message using Claude and return text with token usage."""
+        start_time = time.time()
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens or settings.llm_max_tokens,
+                temperature=temperature or settings.llm_temperature,
+                system=system,
+                messages=messages,
+            )
+
+            # Extract token usage
+            tokens = TokenUsage(
+                input_tokens=response.usage.input_tokens if response.usage else 0,
+                output_tokens=response.usage.output_tokens if response.usage else 0,
+                total_tokens=response.usage.input_tokens + response.usage.output_tokens if response.usage else 0
+            )
+
+            # Extract text from response
+            text = ""
+            if response.content and len(response.content) > 0:
+                text = response.content[0].text
+
+            return text, tokens
+
+        except anthropic.APIError as e:
+            logger.error(f"Anthropic API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error calling Anthropic: {e}")
+            raise
 
     def create_message_with_tools(
         self,
@@ -115,6 +156,55 @@ class AnthropicClient(LLMClient):
                     }
 
             return text_response, tool_use
+
+        except anthropic.APIError as e:
+            logger.error(f"Anthropic API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error calling Anthropic: {e}")
+            raise
+    
+    def create_message_with_tools_and_usage(
+        self,
+        system: str,
+        messages: List[Dict[str, str]],
+        tools: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[str, Optional[Dict[str, Any]], TokenUsage]:
+        """Create a message with tool calling support and return token usage."""
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens or settings.llm_max_tokens,
+                temperature=temperature or settings.llm_temperature,
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
+
+            # Extract token usage
+            tokens = TokenUsage(
+                input_tokens=response.usage.input_tokens if response.usage else 0,
+                output_tokens=response.usage.output_tokens if response.usage else 0,
+                total_tokens=response.usage.input_tokens + response.usage.output_tokens if response.usage else 0
+            )
+
+            # Check if there's a tool use
+            tool_use = None
+            text_response = ""
+
+            for block in response.content:
+                if block.type == "text":
+                    text_response += block.text
+                elif block.type == "tool_use":
+                    tool_use = {
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input
+                    }
+
+            return text_response, tool_use, tokens
 
         except anthropic.APIError as e:
             logger.error(f"Anthropic API error: {e}")
@@ -162,6 +252,45 @@ class OpenAIClient(LLMClient):
         except Exception as e:
             logger.error(f"Unexpected error calling OpenAI: {e}")
             raise
+    
+    def create_message_with_usage(
+        self,
+        system: str,
+        messages: List[Dict[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[str, TokenUsage]:
+        """Create a message using GPT and return text with token usage."""
+        try:
+            # Prepend system message
+            full_messages = [{"role": "system", "content": system}] + messages
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                max_tokens=max_tokens or settings.llm_max_tokens,
+                temperature=temperature or settings.llm_temperature,
+            )
+
+            # Extract token usage
+            tokens = TokenUsage(
+                input_tokens=response.usage.prompt_tokens if response.usage else 0,
+                output_tokens=response.usage.completion_tokens if response.usage else 0,
+                total_tokens=response.usage.total_tokens if response.usage else 0
+            )
+
+            text = ""
+            if response.choices and len(response.choices) > 0:
+                text = response.choices[0].message.content or ""
+
+            return text, tokens
+
+        except openai.APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error calling OpenAI: {e}")
+            raise
 
     def create_message_with_tools(
         self,
@@ -199,6 +328,57 @@ class OpenAIClient(LLMClient):
                 }
 
             return message.content or "", tool_use
+
+        except openai.APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error calling OpenAI: {e}")
+            raise
+    
+    def create_message_with_tools_and_usage(
+        self,
+        system: str,
+        messages: List[Dict[str, str]],
+        tools: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[str, Optional[Dict[str, Any]], TokenUsage]:
+        """Create a message with tool calling support and return token usage."""
+        try:
+            # Convert Anthropic tool format to OpenAI function format
+            functions = self._convert_tools_to_functions(tools)
+
+            # Prepend system message
+            full_messages = [{"role": "system", "content": system}] + messages
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                functions=functions,
+                max_tokens=max_tokens or settings.llm_max_tokens,
+                temperature=temperature or settings.llm_temperature,
+            )
+
+            # Extract token usage
+            tokens = TokenUsage(
+                input_tokens=response.usage.prompt_tokens if response.usage else 0,
+                output_tokens=response.usage.completion_tokens if response.usage else 0,
+                total_tokens=response.usage.total_tokens if response.usage else 0
+            )
+
+            message = response.choices[0].message
+
+            # Check for function call
+            tool_use = None
+            if message.function_call:
+                import json
+                tool_use = {
+                    "name": message.function_call.name,
+                    "input": json.loads(message.function_call.arguments)
+                }
+
+            return message.content or "", tool_use, tokens
 
         except openai.APIError as e:
             logger.error(f"OpenAI API error: {e}")

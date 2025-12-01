@@ -10,6 +10,8 @@ Coordinates:
 """
 
 import logging
+import time
+from contextlib import nullcontext
 from typing import Optional, Dict, Any, List
 
 from patient_ai_service.core import (
@@ -17,10 +19,13 @@ from patient_ai_service.core import (
     get_state_manager,
     get_message_broker,
 )
+from patient_ai_service.core.config import settings
 from patient_ai_service.core.reasoning import get_reasoning_engine
 from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
+from patient_ai_service.core.observability import get_observability_logger, clear_observability_logger
 from patient_ai_service.models.messages import Topics, ChatResponse
 from patient_ai_service.models.enums import UrgencyLevel
+from patient_ai_service.models.validation import ExecutionLog
 from patient_ai_service.agents import (
     AppointmentManagerAgent,
     MedicalInquiryAgent,
@@ -109,23 +114,37 @@ class Orchestrator:
         Returns:
             ChatResponse with agent's reply
         """
+        pipeline_start_time = time.time()
+        # Import settings at function level to avoid UnboundLocalError
+        from patient_ai_service.core.config import settings as config_settings
+        obs_logger = get_observability_logger(session_id) if config_settings.enable_observability else None
+        
         try:
             logger.info(f"Processing message for session: {session_id}")
 
             # Step 1: Load or initialize patient
-            await self._ensure_patient_loaded(session_id)
+            with obs_logger.pipeline_step(1, "load_patient", "orchestrator", {"session_id": session_id}) if obs_logger else nullcontext():
+                await self._ensure_patient_loaded(session_id)
 
             # Step 2: Translation (input)
-            translation_agent = self.agents["translation"]
-            english_message, detected_lang = await translation_agent.process_input(
-                session_id,
-                message
-            )
+            with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
+                translation_agent = self.agents["translation"]
+                english_message, detected_lang = await translation_agent.process_input(
+                    session_id,
+                    message
+                )
+                if obs_logger:
+                    obs_logger.record_pipeline_step(
+                        2, "translation_input", "translation",
+                        inputs={"message": message[:100]},
+                        outputs={"english_message": english_message[:100], "detected_lang": detected_lang}
+                    )
 
             logger.info(f"Detected language: {detected_lang}")
 
             # Step 3: Add user message to conversation memory
-            self.memory_manager.add_user_turn(session_id, english_message)
+            with obs_logger.pipeline_step(3, "add_to_memory", "memory_manager", {"message": english_message[:100]}) if obs_logger else nullcontext():
+                self.memory_manager.add_user_turn(session_id, english_message)
 
             # Step 4: Unified reasoning (replaces intent classification)
             global_state = self.state_manager.get_global_state(session_id)
@@ -137,11 +156,24 @@ class Orchestrator:
                 "phone": global_state.patient_profile.phone,
             }
 
-            reasoning = await self.reasoning_engine.reason(
-                session_id,
-                english_message,
-                patient_info
-            )
+            # Step 4: Unified reasoning
+            with obs_logger.pipeline_step(4, "reasoning", "reasoning_engine", {"message": english_message[:100]}) if obs_logger else nullcontext():
+                reasoning = await self.reasoning_engine.reason(
+                    session_id,
+                    english_message,
+                    patient_info
+                )
+                if obs_logger:
+                    obs_logger.record_pipeline_step(
+                        4, "reasoning", "reasoning_engine",
+                        inputs={"message": english_message[:100]},
+                        outputs={
+                            "agent": reasoning.routing.agent,
+                            "action": reasoning.routing.action,
+                            "urgency": reasoning.routing.urgency,
+                            "sentiment": reasoning.understanding.sentiment
+                        }
+                    )
 
             logger.info(
                 f"Reasoning: agent={reasoning.routing.agent}, "
@@ -151,8 +183,17 @@ class Orchestrator:
 
             # Step 5: Handle conversation restart if detected
             if reasoning.understanding.is_conversation_restart:
-                self.memory_manager.archive_and_reset(session_id)
-                logger.info(f"Conversation restarted for session {session_id}")
+                with obs_logger.pipeline_step(5, "conversation_restart", "memory_manager", {}) if obs_logger else nullcontext():
+                    self.memory_manager.archive_and_reset(session_id)
+                    logger.info(f"Conversation restarted for session {session_id}")
+
+            # Initialize execution log at START of pipeline (before agent selection)
+            # This ensures execution_log always exists, even in error paths
+            execution_log = ExecutionLog(
+                tools_used=[],
+                conversation_turns=len(self.memory_manager.get_memory(session_id).recent_turns)
+            )
+            logger.debug(f"Initialized execution_log for session {session_id}")
 
             # Step 6: Select agent from reasoning
             agent_name = reasoning.routing.agent
@@ -167,34 +208,71 @@ class Orchestrator:
                 session_id,
                 active_agent=agent_name
             )
+            
+            if obs_logger:
+                obs_logger.agent_flow_tracker.record_transition(
+                    from_agent=None,
+                    to_agent=agent_name,
+                    reason=f"Reasoning: {reasoning.routing.action}",
+                    context=reasoning.response_guidance.minimal_context
+                )
 
             # Step 7: Agent transition hook
             agent = self.agents.get(agent_name)
             if not agent:
                 logger.error(f"Agent not found: {agent_name}")
                 english_response = "I'm sorry, I encountered an error. Please try again."
+                # execution_log already initialized above, no need to create again
             else:
+                
                 # Call agent activation hook (for state setup)
-                if hasattr(agent, 'on_activated'):
-                    await agent.on_activated(session_id, reasoning)
+                with obs_logger.pipeline_step(7, "agent_activation", "agent", {"agent_name": agent_name}) if obs_logger else nullcontext():
+                    if hasattr(agent, 'on_activated'):
+                        await agent.on_activated(session_id, reasoning)
 
-                # Pass minimal context to agent
-                if hasattr(agent, 'set_context'):
-                    agent.set_context(session_id, reasoning.response_guidance.minimal_context)
+                    # Pass minimal context to agent
+                    if hasattr(agent, 'set_context'):
+                        agent.set_context(session_id, reasoning.response_guidance.minimal_context)
 
-                # Execute agent with logging
-                english_response, execution_log = await agent.process_message_with_log(
-                    session_id,
-                    english_message
-                )
+                # Execute agent with logging - PASS execution_log
+                with obs_logger.pipeline_step(8, "agent_execution", "agent", {"agent_name": agent_name, "message": english_message[:100]}) if obs_logger else nullcontext():
+                    english_response, execution_log = await agent.process_message_with_log(
+                        session_id,
+                        english_message,
+                        execution_log  # Pass log to agent (agent will append tools)
+                    )
+                    
+                    # Monitor execution log size after agent execution
+                    tool_count = len(execution_log.tools_used)
+                    if tool_count > 100:
+                        logger.warning(
+                            f"Execution log for session {session_id} has {tool_count} tools. "
+                            f"Consider investigating potential loops or excessive tool calls."
+                        )
+                    elif tool_count > 50:
+                        logger.info(
+                            f"Execution log for session {session_id} has {tool_count} tools "
+                            f"(monitoring for potential issues)"
+                        )
 
             # Step 8: Validate response (CLOSED-LOOP)
-            validation = await self.reasoning_engine.validate_response(
-                session_id=session_id,
-                original_reasoning=reasoning,
-                agent_response=english_response,
-                execution_log=execution_log
-            )
+            with obs_logger.pipeline_step(9, "validation", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                validation = await self.reasoning_engine.validate_response(
+                    session_id=session_id,
+                    original_reasoning=reasoning,
+                    agent_response=english_response,
+                    execution_log=execution_log
+                )
+                if obs_logger:
+                    obs_logger.record_pipeline_step(
+                        9, "validation", "reasoning_engine",
+                        inputs={"response_preview": english_response[:100]},
+                        outputs={
+                            "is_valid": validation.is_valid,
+                            "decision": validation.decision,
+                            "confidence": validation.confidence
+                        }
+                    )
 
             logger.info(f"Validation result: valid={validation.is_valid}, "
                        f"decision={validation.decision}, "
@@ -206,23 +284,48 @@ class Orchestrator:
 
             while not validation.is_valid and retry_count < max_retries:
                 if validation.decision == "retry":
-                    logger.info(f"Retrying with feedback: {validation.feedback_to_agent}")
-
-                    # Retry with specific feedback
-                    english_response, execution_log = await agent.process_message_with_log(
-                        session_id,
-                        f"[VALIDATION FEEDBACK]: {validation.feedback_to_agent}\n\n"
-                        f"Original user request: {english_message}"
+                    # Store tool count before retry for validation
+                    tools_before_retry = len(execution_log.tools_used)
+                    logger.info(
+                        f"Retrying with feedback (current tools: {tools_before_retry}): "
+                        f"{validation.feedback_to_agent}"
                     )
+                    logger.debug(f"Execution log before retry: {len(execution_log.tools_used)} tools")
+                    
+                    with obs_logger.pipeline_step(10, "agent_retry", "agent", {"retry_count": retry_count + 1}) if obs_logger else nullcontext():
+                        # Retry with specific feedback - PASS SAME execution_log
+                        # Tools from first attempt are preserved, new tools will be appended
+                        english_response, execution_log = await agent.process_message_with_log(
+                            session_id,
+                            f"[VALIDATION FEEDBACK]: {validation.feedback_to_agent}\n\n"
+                            f"Original user request: {english_message}",
+                            execution_log  # Same log - tools accumulate across retries
+                        )
+                        
+                        # Validate tools accumulated (not replaced)
+                        tools_after_retry = len(execution_log.tools_used)
+                        logger.info(f"Retry complete (tools now: {tools_after_retry}, was: {tools_before_retry})")
+                        logger.debug(f"Execution log after retry: {len(execution_log.tools_used)} tools")
+                        
+                        # Assertion: tools should only increase, never decrease
+                        # This catches regressions where log is replaced instead of appended
+                        assert tools_after_retry >= tools_before_retry, (
+                            f"Execution log tools decreased during retry: "
+                            f"{tools_before_retry} -> {tools_after_retry}. "
+                            f"This indicates execution_log was replaced instead of appended!"
+                        )
 
-                    # Re-validate
-                    validation = await self.reasoning_engine.validate_response(
-                        session_id,
-                        reasoning,
-                        english_response,
-                        execution_log
-                    )
-                    retry_count += 1
+                        # Re-validate with accumulated execution_log
+                        validation = await self.reasoning_engine.validate_response(
+                            session_id,
+                            reasoning,
+                            english_response,
+                            execution_log  # Contains tools from ALL attempts
+                        )
+                        retry_count += 1
+                        
+                        if obs_logger:
+                            obs_logger._validation_details.retry_count = retry_count
 
                 elif validation.decision == "redirect":
                     # Could try different agent, but for MVP just break
@@ -231,49 +334,121 @@ class Orchestrator:
                 else:
                     break
 
-            # Step 10: Use fallback if still invalid
-            if not validation.is_valid and validation.confidence < 0.5:
-                logger.error(f"Validation failed after retries: {validation.issues}")
-                english_response = self._get_validation_fallback(validation.issues)
+            # LAYER 2: Finalization (final quality check)
+            if getattr(config_settings, 'enable_finalization', True):
+                with obs_logger.pipeline_step(11, "finalization", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                    finalization = await self.reasoning_engine.finalize_response(
+                        session_id=session_id,
+                        original_reasoning=reasoning,
+                        agent_response=english_response,
+                        execution_log=execution_log,
+                        validation_result=validation
+                    )
+                    if obs_logger:
+                        obs_logger.record_pipeline_step(
+                            11, "finalization", "reasoning_engine",
+                            inputs={"response_preview": english_response[:100]},
+                            outputs={
+                                "decision": finalization.decision,
+                                "was_rewritten": finalization.was_rewritten,
+                                "confidence": finalization.confidence
+                            }
+                        )
 
-            # Step 11: Add assistant response to conversation memory
-            self.memory_manager.add_assistant_turn(session_id, english_response)
+                logger.info(f"Finalization result: decision={finalization.decision}, "
+                           f"edited={finalization.was_rewritten}, "
+                           f"confidence={finalization.confidence}")
 
-            # Step 9: Translation (output)
+                # Use finalized response
+                if finalization.should_use_rewritten():
+                    english_response = finalization.rewritten_response
+                    logger.info("Using edited response from finalization layer")
+                elif finalization.should_fallback():
+                    english_response = self._get_validation_fallback(finalization.issues)
+                    logger.warning(f"Finalization triggered fallback: {finalization.issues}")
+                else:
+                    logger.info("Finalization approved agent's response")
+            else:
+                # Finalization disabled - use validation fallback if needed
+                finalization = None
+                if not validation.is_valid and validation.confidence < 0.5:
+                    logger.error(f"Validation failed after retries: {validation.issues}")
+                    english_response = self._get_validation_fallback(validation.issues)
+
+            # Step 12: Add assistant response to conversation memory
+            with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                self.memory_manager.add_assistant_turn(session_id, english_response)
+
+            # Step 13: Translation (output)
             if detected_lang != "en":
-                translated_response = await translation_agent.process_output(
-                    session_id,
-                    english_response
-                )
+                with obs_logger.pipeline_step(13, "translation_output", "translation", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                    translated_response = await translation_agent.process_output(
+                        session_id,
+                        english_response
+                    )
             else:
                 translated_response = english_response
 
-            # Step 10: Build response
-            response = ChatResponse(
-                response=translated_response,
-                session_id=session_id,
-                detected_language=detected_lang,
-                intent=reasoning.understanding.what_user_means,
-                urgency=reasoning.routing.urgency,
-                metadata={
-                    "agent": agent_name,
-                    "sentiment": reasoning.understanding.sentiment,
-                    "reasoning_summary": reasoning.reasoning_chain[0] if reasoning.reasoning_chain else "",
-                    "validation": {
-                        "passed": validation.is_valid,
-                        "retries": retry_count,
-                        "confidence": validation.confidence,
-                        "issues": validation.issues if not validation.is_valid else []
+            # Step 14: Build response
+            with obs_logger.pipeline_step(14, "build_response", "orchestrator", {}) if obs_logger else nullcontext():
+                response = ChatResponse(
+                    response=translated_response,
+                    session_id=session_id,
+                    detected_language=detected_lang,
+                    intent=reasoning.understanding.what_user_means,
+                    urgency=reasoning.routing.urgency,
+                    metadata={
+                        "agent": agent_name,
+                        "sentiment": reasoning.understanding.sentiment,
+                        "reasoning_summary": reasoning.reasoning_chain[0] if reasoning.reasoning_chain else "",
+                        "validation": {
+                            "passed": validation.is_valid,
+                            "retries": retry_count,
+                            "confidence": validation.confidence,
+                            "issues": validation.issues if not validation.is_valid else []
+                        },
+                        "finalization": {
+                            "decision": finalization.decision if finalization else "disabled",
+                            "was_edited": finalization.was_rewritten if finalization else False,
+                            "confidence": finalization.confidence if finalization else None,
+                            "issues": finalization.issues if finalization else []
+                        } if finalization is not None else {"enabled": False}
                     }
-                }
-            )
+                )
 
             logger.info(f"Response generated by {agent_name}")
+            
+            # Optional: Persist execution_log for debugging/auditing (if enabled)
+            # Note: This is optional and should not fail the pipeline if it fails
+            if getattr(config_settings, 'persist_execution_logs', False):
+                try:
+                    self.state_manager.save_execution_log(session_id, execution_log)
+                    logger.debug(
+                        f"Persisted execution_log for session {session_id} "
+                        f"({len(execution_log.tools_used)} tools)"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to persist execution_log for session {session_id}: {e}")
+            
+            # Log observability summary
+            if obs_logger:
+                pipeline_duration_ms = (time.time() - pipeline_start_time) * 1000
+                obs_logger.record_pipeline_step(
+                    15, "pipeline_complete", "orchestrator",
+                    metadata={"total_duration_ms": pipeline_duration_ms}
+                )
+                obs_logger.log_summary()
 
             return response
 
         except Exception as e:
             logger.error(f"Error in orchestrator: {e}", exc_info=True)
+            
+            if obs_logger:
+                obs_logger.record_pipeline_step(
+                    999, "error", "orchestrator",
+                    error=str(e)
+                )
 
             # Return error response
             return ChatResponse(
