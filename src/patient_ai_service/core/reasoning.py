@@ -59,6 +59,7 @@ class ResponseGuidance(BaseModel):
     """Guidance for the selected agent's response."""
     tone: str = "helpful"  # "helpful", "empathetic", "urgent", "professional"
     minimal_context: Dict[str, Any] = Field(default_factory=dict)
+    plan: str = ""  # Short step-by-step plan/command for the agent to follow
 
 
 class ReasoningOutput(BaseModel):
@@ -246,7 +247,21 @@ class ReasoningEngine:
 
             # Parse and validate response
             output = self._parse_reasoning_response(response, user_message, memory)
-            
+
+            # [CRITICAL] Inject language context into minimal_context
+            # This ensures ALL agents receive language awareness
+            global_state = self.state_manager.get_global_state(session_id)
+            language_context = global_state.language_context
+
+            # Add language context to minimal_context
+            output.response_guidance.minimal_context["current_language"] = language_context.current_language
+            output.response_guidance.minimal_context["current_dialect"] = language_context.current_dialect
+
+            logger.info(
+                f"Injected language context into minimal_context: "
+                f"{language_context.get_full_language_code()}"
+            )
+
             # Record reasoning details
             if reasoning_tracker:
                 reasoning_tracker.set_understanding({
@@ -301,6 +316,32 @@ class ReasoningEngine:
                        f"agent={output.routing.agent}, "
                        f"urgency={output.routing.urgency}, "
                        f"sentiment={output.understanding.sentiment}")
+
+            # Print full reasoning output to terminal logs
+            logger.info("=" * 80)
+            logger.info("REASONING OUTPUT (Full Structure):")
+            logger.info("=" * 80)
+            logger.info(f"UNDERSTANDING:")
+            logger.info(f"  - what_user_means: {output.understanding.what_user_means}")
+            logger.info(f"  - is_continuation: {output.understanding.is_continuation}")
+            logger.info(f"  - sentiment: {output.understanding.sentiment}")
+            logger.info(f"  - is_conversation_restart: {output.understanding.is_conversation_restart}")
+            logger.info(f"ROUTING:")
+            logger.info(f"  - agent: {output.routing.agent}")
+            logger.info(f"  - action: {output.routing.action}")
+            logger.info(f"  - urgency: {output.routing.urgency}")
+            logger.info(f"MEMORY_UPDATES:")
+            logger.info(f"  - new_facts: {json.dumps(output.memory_updates.new_facts, indent=4) if output.memory_updates.new_facts else '(empty)'}")
+            logger.info(f"  - system_action: '{output.memory_updates.system_action}' {'(EMPTY - should be filled!)' if not output.memory_updates.system_action else ''}")
+            logger.info(f"  - awaiting: '{output.memory_updates.awaiting}' {'(EMPTY - OK if nothing needed)' if not output.memory_updates.awaiting else ''}")
+            logger.info(f"RESPONSE_GUIDANCE:")
+            logger.info(f"  - tone: {output.response_guidance.tone}")
+            logger.info(f"  - minimal_context: {json.dumps(output.response_guidance.minimal_context, indent=4)}")
+            logger.info(f"  - plan: {output.response_guidance.plan}")
+            logger.info(f"REASONING_CHAIN:")
+            for i, step in enumerate(output.reasoning_chain, 1):
+                logger.info(f"  {i}. {step}")
+            logger.info("=" * 80)
 
             return output
 
@@ -397,8 +438,8 @@ Analyze and respond with ONE JSON object:
     }},
     "memory_updates": {{
         "new_facts": {{}},  # NEW facts only (don't repeat existing user_facts)
-        "system_action": "What system is about to do (proposed_registration, asked_question, provided_info, etc.)",
-        "awaiting": "What system is waiting for (confirmation, date_selection, etc.)"
+        "system_action": "What the system/agent DID so far in this conversation. Examples: 'asked_for_date', 'provided_doctor_list', 'checked_availability', 'proposed_registration', 'showed_appointments', 'asked_for_confirmation'. Use past tense. REQUIRED - always provide this.",
+        "awaiting": "What the system is waiting for from the user. Examples: 'date_selection', 'time_confirmation', 'doctor_choice', 'user_info', 'confirmation', 'appointment_id'. Use empty string '' if not waiting for anything. REQUIRED - always provide this (even if empty)."
     }},
     "response_guidance": {{
         "tone": "helpful/empathetic/urgent/professional",
@@ -406,7 +447,8 @@ Analyze and respond with ONE JSON object:
             "user_wants": "Brief what user wants",
             "action": "Suggested action",
             "prior_context": "Any relevant prior context"
-        }}
+        }},
+        "plan": "Short step-by-step plan for the agent. For appointment_manager, include specific steps like: 1. Check if patient is registered, 2. Get doctor list, 3. Check availability, 4. Book appointment. Keep it concise (2-4 steps max)."
     }},
     "reasoning_chain": [
         "Step 1: What I observe...",
@@ -422,6 +464,18 @@ KEY RULES:
 4. For minimal_context, keep it BRIEF - just essential info
 5. If user not registered and wants to book appointment → recommend registration first
 6. Short ambiguous responses like "tomorrow" → likely continuation of previous topic
+
+
+
+PLAN GENERATION (for response_guidance.plan):
+- ALWAYS generate a plan when routing to appointment_manager
+- Plan should be 2-4 concise steps
+- Include specific tool names and actions
+- Examples:
+  * "1. Check if patient is registered (if not, redirect to registration), 2. Get doctor list, 3. Check availability for requested date/time, 4. Book appointment if available"
+  * "1. Get patient's existing appointments, 2. Display appointment details"
+  * "1. Get appointment by ID, 2. Update status to cancelled with reason"
+- For other agents, plan can be brief or empty
 
 RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
 

@@ -48,6 +48,84 @@ class PatientProfile(BaseModel):
         }
 
 
+class LanguageContext(BaseModel):
+    """
+    Unified language context for session.
+
+    This information MUST be passed to all agents in minimal_context.
+
+    Tracks:
+    - Current detected language + dialect
+    - User's preferred language + dialect
+    - Language switch history
+    - Translation metadata
+    """
+    # Current conversation language - MUST BE PASSED TO AGENTS
+    current_language: str = "en"  # ISO 639-1 code (e.g., "en", "ar", "es")
+    current_dialect: Optional[str] = None  # Dialect code (e.g., "US", "GB", "EG", "SA")
+
+    # User's preferred language (from profile or auto-detected)
+    preferred_language: str = "en"
+    preferred_dialect: Optional[str] = None
+
+    # Language switch tracking
+    language_history: List[Dict[str, Any]] = Field(default_factory=list)
+    # Example: [{"from_language": "en", "to_language": "ar", "timestamp": "...", "turn": 1}, ...]
+
+    # Metadata
+    auto_detect_enabled: bool = True
+    last_detected_at: Optional[datetime] = None
+    turn_count: int = 0
+
+    # Translation quality tracking
+    translation_failures: int = 0
+    last_translation_error: Optional[str] = None
+
+    def get_full_language_code(self) -> str:
+        """Get language code with dialect (e.g., 'en-US', 'ar-EG')."""
+        if self.current_dialect:
+            return f"{self.current_language}-{self.current_dialect}"
+        return self.current_language
+
+    def record_language_switch(self, new_language: str, new_dialect: Optional[str], turn: int):
+        """Record when user switches language."""
+        if self.current_language != new_language or self.current_dialect != new_dialect:
+            self.language_history.append({
+                "from_language": self.current_language,
+                "from_dialect": self.current_dialect,
+                "to_language": new_language,
+                "to_dialect": new_dialect,
+                "timestamp": datetime.utcnow().isoformat(),
+                "turn": turn
+            })
+        self.current_language = new_language
+        self.current_dialect = new_dialect
+        self.last_detected_at = datetime.utcnow()
+
+    def to_agent_context(self) -> Dict[str, Any]:
+        """
+        Format language context for passing to agents.
+
+        THIS IS WHAT GETS PASSED IN MINIMAL_CONTEXT.
+        """
+        return {
+            "current_language": self.current_language,
+            "current_dialect": self.current_dialect,
+            "full_code": self.get_full_language_code(),
+            "recently_switched": len(self.language_history) > 0
+        }
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "current_language": "ar",
+                "current_dialect": "EG",
+                "preferred_language": "ar",
+                "auto_detect_enabled": True
+            }
+        }
+
+
 class AppointmentContext(BaseModel):
     """Context for current appointment being booked/managed."""
     appointment_id: Optional[str] = None
@@ -71,17 +149,33 @@ class GlobalState(BaseModel):
     intent_history: List[str] = Field(default_factory=list)
     entities_collected: Dict[str, Any] = Field(default_factory=dict)
     conversation_summary: str = ""
-    detected_language: str = "en"
+
+    # [NEW] Unified language context (replaces detected_language)
+    language_context: LanguageContext = Field(default_factory=LanguageContext)
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     version: int = 0
+
+    # Backward compatibility property
+    @property
+    def detected_language(self) -> str:
+        """
+        Deprecated: Use language_context.current_language instead.
+
+        Maintained for backward compatibility.
+        """
+        return self.language_context.current_language
 
     class Config:
         json_schema_extra = {
             "example": {
                 "session_id": "user_12345",
                 "conversation_stage": "initial",
-                "detected_language": "en"
+                "language_context": {
+                    "current_language": "en",
+                    "current_dialect": "US"
+                }
             }
         }
 
@@ -95,6 +189,7 @@ class AppointmentAgentState(BaseModel):
     available_slots: List[Dict[str, Any]] = Field(default_factory=list)
     operation_type: Optional[str] = None  # "booking", "rescheduling", "canceling"
     target_appointment_id: Optional[str] = None
+    reasoning_plan: Optional[str] = None  # Plan from reasoning engine for agent to follow
 
     # Lightweight booking state tracking (Phase 2.1)
     booking_pending: bool = False

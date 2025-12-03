@@ -538,6 +538,37 @@ class DbOpsClient:
         }
         return self._make_request("PATCH", f"/appointments/{appointment_id}/reschedule", json_data=payload)
 
+    def update_appointment(self, appointment_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Update an appointment with one or more parameters.
+        
+        This is a flexible method that can update any combination of appointment fields.
+        Supported fields (all optional):
+        - doctor_id: Change the doctor
+        - clinic_id: Change the clinic
+        - patient_id: Change the patient
+        - appointment_type_id: Change appointment type
+        - appointment_date: Change the date (YYYY-MM-DD)
+        - start_time: Change start time (HH:MM)
+        - end_time: Change end time (HH:MM)
+        - status: Change status (scheduled, confirmed, checked_in, in_progress, completed, cancelled, no_show, rescheduled)
+        - reason: Update reason
+        - notes: Update notes
+        - emergency_level: Change emergency level (routine, urgent, emergency, critical)
+        - follow_up_required: Boolean
+        - follow_up_days: Number of days
+        - procedure_type: Procedure type string
+        
+        Args:
+            appointment_id: The appointment ID to update
+            updates: Dictionary of fields to update (only include fields you want to change)
+        
+        Returns:
+            Updated appointment dict if successful, None if error
+        """
+        logger.info(f"Updating appointment ID: {appointment_id} with fields: {list(updates.keys())}")
+        return self._make_request("PATCH", f"/appointments/{appointment_id}", json_data=updates)
+
     def get_patient_by_id(self, patient_id: Optional[str]) -> Optional[Dict[str, Any]]:
         if not patient_id:
             logger.warning(f"DbOpsClient.get_patient_by_id called with missing or invalid patient_id: '{patient_id}'. Aborting API call.")

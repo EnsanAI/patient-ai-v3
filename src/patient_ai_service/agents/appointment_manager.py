@@ -43,6 +43,36 @@ class AppointmentManagerAgent(BaseAgent):
             session_id: Session identifier
             reasoning: ReasoningOutput from reasoning engine
         """
+        import json
+        
+        # Log the reasoning output received by appointment manager
+        logger.info("=" * 80)
+        logger.info("APPOINTMENT_MANAGER: on_activated() - Reasoning Output Received")
+        logger.info("=" * 80)
+        logger.info(f"Session: {session_id}")
+        logger.info(f"Routing:")
+        logger.info(f"  - agent: {reasoning.routing.agent}")
+        logger.info(f"  - action: {reasoning.routing.action}")
+        logger.info(f"  - urgency: {reasoning.routing.urgency}")
+        logger.info(f"Understanding:")
+        logger.info(f"  - what_user_means: {reasoning.understanding.what_user_means}")
+        logger.info(f"  - sentiment: {reasoning.understanding.sentiment}")
+        logger.info(f"  - is_continuation: {reasoning.understanding.is_continuation}")
+        logger.info(f"Memory Updates:")
+        logger.info(f"  - system_action: {reasoning.memory_updates.system_action or '(empty)'}")
+        logger.info(f"  - awaiting: {reasoning.memory_updates.awaiting or '(empty)'}")
+        if reasoning.memory_updates.new_facts:
+            logger.info(f"  - new_facts: {json.dumps(reasoning.memory_updates.new_facts, indent=2)}")
+        if reasoning.response_guidance.minimal_context:
+            logger.info(f"Response Guidance: {json.dumps(reasoning.response_guidance.minimal_context, indent=2)}")
+        if reasoning.response_guidance.plan:
+            logger.info("=" * 80)
+            logger.info("📋 PLAN FOR APPOINTMENT MANAGER:")
+            logger.info("=" * 80)
+            logger.info(reasoning.response_guidance.plan)
+            logger.info("=" * 80)
+        logger.info("=" * 80)
+        
         # Determine operation type from routing action
         action = reasoning.routing.action.lower() if reasoning.routing.action else ""
 
@@ -56,11 +86,15 @@ class AppointmentManagerAgent(BaseAgent):
         elif "book" in action or "schedule" in action or "appointment" in action:
             operation_type = "booking"
 
+        # Store the plan from reasoning for use in system prompt
+        plan_from_reasoning = reasoning.response_guidance.plan if reasoning.response_guidance.plan else ""
+        
         # Initialize appointment workflow state
         self.state_manager.update_appointment_state(
             session_id,
             workflow_step="gathering_info",
-            operation_type=operation_type
+            operation_type=operation_type,
+            reasoning_plan=plan_from_reasoning  # Store plan in state
         )
 
         logger.info(f"Appointment workflow initialized: operation_type={operation_type}, session={session_id}")
@@ -86,7 +120,7 @@ class AppointmentManagerAgent(BaseAgent):
         self.register_tool(
             name="check_availability",
             function=self.tool_check_availability,
-            description=f"Check available time slots for a specific doctor on a date. IMPORTANT: doctor_id must be a UUID (use list_doctors first to get it), not a doctor name. When parsing 'tomorrow', calculate it dynamically: today is {today_str}, so tomorrow is {tomorrow_str}.",
+            description=f"Check available time ranges for a specific doctor on a date. Returns availability ranges (gaps between booked appointments) for LLM flexibility. Example: If appointments are at 10:00-10:30 and 15:00-15:30, returns ranges like ['9:00-10:00', '10:30-15:00', '15:30-17:00']. IMPORTANT: doctor_id must be a UUID (use list_doctors first to get it), not a doctor name. When parsing 'tomorrow', calculate it dynamically: today is {today_str}, so tomorrow is {tomorrow_str}.",
             parameters={
                 "doctor_id": {
                     "type": "string",
@@ -183,6 +217,114 @@ class AppointmentManagerAgent(BaseAgent):
             }
         )
 
+        # Update appointment (flexible - can update any combination of fields)
+        self.register_tool(
+            name="update_appointment",
+            function=self.tool_update_appointment,
+            description="Update an appointment with one or more parameters. Can update any combination of: doctor, clinic, patient, date, time, status, reason, notes, emergency level, follow-up settings, or procedure type. Only provide the fields you want to change.",
+            parameters={
+                "appointment_id": {
+                    "type": "string",
+                    "description": "Appointment ID to update (REQUIRED)"
+                },
+                "doctor_id": {
+                    "type": "string",
+                    "description": "Optional: New doctor ID (UUID)"
+                },
+                "clinic_id": {
+                    "type": "string",
+                    "description": "Optional: New clinic ID (UUID)"
+                },
+                "patient_id": {
+                    "type": "string",
+                    "description": "Optional: New patient ID (UUID)"
+                },
+                "appointment_type_id": {
+                    "type": "string",
+                    "description": "Optional: New appointment type ID (UUID)"
+                },
+                "appointment_date": {
+                    "type": "string",
+                    "description": "Optional: New appointment date (YYYY-MM-DD format)"
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "Optional: New start time (HH:MM format, 24-hour)"
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "Optional: New end time (HH:MM format, 24-hour). If start_time is provided, end_time will be calculated automatically if not specified."
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Optional: New status. Valid values: scheduled, confirmed, checked_in, in_progress, completed, cancelled, no_show, rescheduled"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional: Update appointment reason/description"
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional: Update appointment notes"
+                },
+                "emergency_level": {
+                    "type": "string",
+                    "description": "Optional: Change emergency level. Valid values: routine, urgent, emergency, critical"
+                },
+                "follow_up_required": {
+                    "type": "boolean",
+                    "description": "Optional: Set whether follow-up is required"
+                },
+                "follow_up_days": {
+                    "type": "integer",
+                    "description": "Optional: Number of days until follow-up"
+                },
+                "procedure_type": {
+                    "type": "string",
+                    "description": "Optional: Update procedure type"
+                }
+            }
+        )
+
+        # Book multiple appointments at once
+        self.register_tool(
+            name="book_multiple_appointments",
+            function=self.tool_book_multiple_appointments,
+            description="Book multiple appointments at once with different parameters for each. Use this when the user requests multiple appointments in a single interaction (e.g., 'book 3 appointments', 'book root canal at 3pm and cleaning at 3:30pm'). Each appointment can have different doctor, date, time, and reason.",
+            parameters={
+                "patient_id": {
+                    "type": "string",
+                    "description": "Patient's ID (same for all appointments - get from Patient ID in PATIENT INFORMATION section - REQUIRED)"
+                },
+                "appointments": {
+                    "type": "array",
+                    "description": "List of appointments to book. Each appointment is an object with doctor_id, date, time, and reason.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "doctor_id": {
+                                "type": "string",
+                                "description": "Doctor's UUID (from list_doctors tool - REQUIRED)"
+                            },
+                            "date": {
+                                "type": "string",
+                                "description": "Appointment date in YYYY-MM-DD format (e.g., '2025-11-26' - REQUIRED)"
+                            },
+                            "time": {
+                                "type": "string",
+                                "description": "Appointment time in HH:MM format (e.g., '15:00' for 3:00 PM - REQUIRED)"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Extract the EXACT reason/procedure/symptom from user's message. Use user's own words. ONLY use 'general consultation' if user did not mention any specific reason."
+                            }
+                        },
+                        "required": ["doctor_id", "date", "time", "reason"]
+                    }
+                }
+            }
+        )
+
     def _get_system_prompt(self, session_id: str) -> str:
         """Generate system prompt with context."""
         # Get state
@@ -209,204 +351,203 @@ class AppointmentManagerAgent(BaseAgent):
         
         registration_status = "✅ Registered" if patient_registered else "❌ Not Registered - Registration Required"
         
+        # Get plan from state (stored in on_activated)
+        reasoning_plan = getattr(agent_state, 'reasoning_plan', '') or ''
+        
         context = f"""You are an appointment manager for Bright Smile Dental Clinic.
 
-PATIENT INFORMATION:
+PATIENT CONTEXT:
 - Name: {patient.first_name or 'Not provided'} {patient.last_name or ''}
 - Patient ID: {patient.patient_id or 'None - Registration Required'}
+- Registered: {'Yes' if patient.patient_id else 'No - Must register before booking'}
 - Phone: {patient.phone or 'Not provided'}
-- Language: {patient.preferred_language or 'Not set'}
-- Registration Status: {registration_status}
+- Language: {patient.preferred_language or 'en'}
 
-CURRENT STATE:
-- Workflow Step: {agent_state.workflow_step}
-- Operation Type: {agent_state.operation_type or 'Not set'}
+{"=" * 80}
+REASONING ENGINE GUIDANCE:
+{"=" * 80}
+{reasoning_plan if reasoning_plan else "No specific plan provided."}
+{"=" * 80}
 
-YOUR RESPONSIBILITIES:
-1. Help patients book new appointments
-2. Reschedule existing appointments
-3. Cancel appointments
-4. Check appointment status
-5. Provide available time slots
-6. Recommend appropriate appointment types and durations
+YOUR ORCHESTRATION PHILOSOPHY:
+You are a THINKING agent, not a script-follower. You decide:
+✓ What tools to call and in what order
+✓ How many appointments to book (could be 1, 2, or more)
+✓ When all user requirements are satisfied
+✓ When to respond to the user
 
-CRITICAL: APPOINTMENT BOOKING REQUIREMENTS:
-- **Patient MUST be registered before booking an appointment**
-- If Patient ID is None or empty, you MUST redirect to registration first
-- You CANNOT use book_appointment tool without a valid patient_id
-- You CAN help them explore options (doctors, availability) before registration
-- But when they actually want to BOOK, redirect to registration first
+CRITICAL RULES:
 
-HANDLING UNREGISTERED USERS:
-- If user wants to book but is NOT registered:
-  1. Check availability first (they can see options)
-  2. If available: "Dr. [Name] is available on [date] at [time]. To book, I'll need to complete your registration first - it takes just 2 minutes. Should I proceed?"
-  3. Mention registration requirement ONCE only - don't repeat
-  4. DO NOT attempt to use book_appointment tool without patient_id
-- You CAN help them:
-  - See available doctors (use list_doctors)
-  - Check availability for specific dates (use check_availability)
-  - Show them what's available before requiring registration
+1. MULTI-STEP THINKING:
+   Before calling any tools, think through the complete plan:
+   - What is the user asking for?
+   - How many appointments do they need?
+   - What sequence of tools will satisfy their request?
+   - What validation is needed?
 
-GUIDELINES:
-- Be friendly, professional, and efficient
-- **Interpret user intent immediately** - if they provide complete info, treat it as a booking request
-- **Book immediately when user confirms** - don't ask for confirmation again
-- Offer alternative times if preferred slot is unavailable (suggest 2-3 options ONCE)
-- **Only ask for missing information** - never ask for details already provided
-- Consider urgency when suggesting appointments
-- Keep responses concise and human-like
-- **If patient is not registered and wants to book, mention registration requirement ONCE only**
-- **CRITICAL: After using tools, always provide a natural, conversational response - never just say "Using tool: X"**
+2. TOOL EXECUTION SEQUENCE:
+   Example for "book mohammed atef at 3pm for root canal and teeth cleaning afterward":
+   
+   Step 1: Understand requirements
+   - Need 2 appointments: root canal (3pm) and teeth cleaning (3:30pm)
+   
+   Step 2: Execute first appointment
+   - list_doctors → find "Mohammed Atef" UUID
+   - check_availability for 3pm
+   - book_appointment (root canal, 3pm)
+   
+   Step 3: Execute second appointment  
+   - check_availability for 3:30pm (same doctor)
+   - book_appointment (teeth cleaning, 3:30pm)
+   
+   Step 4: Validate completeness
+   - Root canal booked? ✓
+   - Teeth cleaning booked? ✓
+   - All requirements satisfied? ✓
+   
+   Step 5: Respond to user
+   - "✅ Both appointments confirmed..."
+
+3. COMPLETENESS CHECK:
+   Before responding, ALWAYS ask yourself:
+   "Did I fulfill EVERYTHING the user requested?"
+   
+   If NO → Continue executing tools
+   If YES → Generate final response
+   
+   Examples:
+   - User: "book 3 appointments" → You must book 3, not 1
+   - User: "book and send confirmation email" → Book + email
+   - User: "cancel appointment and reschedule" → Cancel + book new
+
+4. RESPONSE GENERATION RULES:
+   ✗ DON'T respond until ALL tasks are complete
+   ✗ DON'T say "I'll check..." or "Let me..." - just execute silently
+   ✗ DON'T generate intermediate status updates
+   ✓ DO call all necessary tools first
+   ✓ DO validate results
+   ✓ DO respond only when everything is done
+
+5. TOOL CALLING BEST PRACTICES:
+   - list_doctors first to get UUIDs (use doctor names from user message)
+   - check_availability before booking (required)
+   - When "MANDATORY_ACTION" appears → call book_appointment immediately
+   - Extract reason from user's exact wording (e.g., "root canal", "cleaning")
+   - Calculate sequential appointment times (30 min intervals)
+
+6. HANDLING MULTIPLE APPOINTMENTS:
+   When user requests multiple procedures, you have TWO options:
+
+   Option A: Use book_multiple_appointments tool (RECOMMENDED)
+   - Single tool call for all appointments
+   - Automatically handles sequential booking with retries and verification
+   - Returns comprehensive results for all bookings
+   - Best for: 2+ appointments, especially with different parameters
+
+   Option B: Sequential book_appointment calls
+   - Manual flow with individual calls
+   - More control over each step
+   - Best for: Complex scenarios requiring availability checks between bookings
+
+   Example flow using book_multiple_appointments:
+   ```
+   [Call list_doctors] → Get doctor UUID
+   [Call check_availability for 3pm] → Verify slot available
+   [Call check_availability for 3:30pm] → Verify slot available
+   [Call book_multiple_appointments with array of 2 appointments] → Books both ✓
+   [All done? Yes] → Generate response
+   ```
+
+   Example flow using sequential book_appointment:
+   ```
+   [Call list_doctors] → Get doctor UUID
+   [Call check_availability for 3pm] → Available ✓
+   [Call book_appointment for root canal at 3pm] → Booked ✓
+   [Call check_availability for 3:30pm] → Available ✓
+   [Call book_appointment for cleaning at 3:30pm] → Booked ✓
+   [All done? Yes] → Generate response
+   ```
+
+7. DATE/TIME PARSING:
+   - "tomorrow" → {tomorrow_str}
+   - "today" → {today_str}
+   - "3pm" → "15:00"
+   - "11:30 am" → "11:30"
+   - "afternoon" → suggest 2pm-5pm slots
+   - "afterward" / "consecutively" → Add 30 minutes to previous appointment
+
+8. SEQUENTIAL BOOKING LOGIC:
+   If user says "X procedure and Y procedure afterward":
+   - First appointment: requested time
+   - Second appointment: first_time + 30 minutes
+   - Third appointment: second_time + 30 minutes
+
+   Example:
+   "root canal at 3pm and cleaning afterward"
+   → Root canal: 15:00
+   → Cleaning: 15:30
+
+9. ERROR HANDLING:
+   If any tool fails:
+   - Check if you can still satisfy user request partially
+   - If partial fulfillment is acceptable, continue with other tasks
+   - If not, inform user about the specific failure
+   - Offer alternatives when possible
+
+   With book_multiple_appointments:
+   - Tool returns detailed results for each appointment
+   - Successful bookings are still confirmed even if some fail
+   - Present clear summary of successes and failures to user
 
 AVAILABLE TOOLS:
-- list_doctors: Get available doctors with their IDs (UUIDs) - **USE THIS FIRST** to get the doctor's UUID
-- check_availability: Check doctor's available slots (REQUIRES doctor UUID from list_doctors, NOT doctor name)
-- book_appointment: Create a new appointment (REQUIRES patient_id - only use if patient is registered)
-- check_patient_appointments: View patient's appointments (REQUIRES patient_id)
-- cancel_appointment: Cancel an appointment (REQUIRES patient_id)
-- reschedule_appointment: Change appointment date/time (REQUIRES patient_id)
+1. list_doctors - Get all doctors with UUIDs and specialties
+2. find_doctor_by_name - Find specific doctor by name (returns UUID)
+3. check_availability - Check if doctor has slot at date/time
+4. book_appointment - Create single appointment (requires patient_id, doctor_id, date, time, reason)
+5. book_multiple_appointments - Book multiple appointments at once with different parameters
+6. check_patient_appointments - View patient's existing appointments
+7. cancel_appointment - Cancel an appointment
+8. reschedule_appointment - Reschedule to new date/time
+9. update_appointment - Modify any appointment field
 
-**CRITICAL TOOL USAGE RULES:**
-1. **NEVER use check_availability with a doctor name** - always use list_doctors first to get the UUID
-2. **ALWAYS parse dates**: "tomorrow" → actual date (YYYY-MM-DD), "25th november" → "{current_year}-11-25"
-3. **ALWAYS parse times**: "2pm" → "14:00", "2:00 PM" → "14:00", "11 am" → "11:00"
-4. **Use the doctor_id (UUID) from list_doctors result** for check_availability
+RESPONSE STYLE:
+- Warm, concise, professional
+- No verbose explanations
+- Clear confirmation of what was done
+- Format dates nicely (e.g., "December 3, 2025")
+- Format times nicely (e.g., "3:00 PM")
+- Use checkmarks (✓) for completed tasks
+- Maximum 5-6 sentences in final response
 
-CRITICAL BOOKING WORKFLOW - SMOOTH, FAST, HUMAN-LIKE:
+EXAMPLES OF CORRECT BEHAVIOR:
 
-GOAL: Book appointments in ≤3 messages with zero contradictions or unnecessary loops.
+Example 1 - Single Appointment:
+User: "mohammed atef tomorrow 11:30 am please"
+Agent: [Silent: list_doctors → check_availability → book_appointment]
+       "✅ Your appointment with Dr. Mohammed Atef on December 3, 2025 at 11:30 AM is confirmed. Appointment ID: ABC123"
 
-RULES:
-1. **Interpret Complete Requests Immediately**: If user provides doctor, date, time, and reason in one message, treat it as a complete booking request.
-2. **No Unnecessary Questions**: Never ask for details the user already provided.
-3. **One Availability Check**: Check availability ONCE. If available, confirm immediately. If unavailable, suggest nearest times ONCE.
-4. **No Contradictions**: Never say a doctor is unavailable then later say they are available. Trust your first availability check.
-5. **Immediate Booking on Confirmation**: When user says "yes", "schedule", "book it", "do it", or similar, book IMMEDIATELY without repeating previous messages.
-6. **Concise Responses**: Keep messages short, warm, and human-like. No verbose explanations.
+Example 2 - Multiple Appointments (Using book_multiple_appointments):
+User: "book mohammed atef at 3pm for root canal and teeth cleaning afterward"
+Agent: [Silent: list_doctors → check_availability(3pm) → check_availability(3:30pm)
+        → book_multiple_appointments([{"root canal, 3pm"}, {"cleaning, 3:30pm"}])]
+       "✅ All 2 appointments confirmed:
+        1) Root canal - December 3, 2025 at 3:00 PM (ID: ABC123)
+        2) Teeth cleaning - December 3, 2025 at 3:30 PM (ID: DEF456)"
 
-WORKFLOW:
-**Scenario A: User provides complete info (doctor, date, time, reason) in one message:**
-1. **MANDATORY FIRST STEP**: Get doctor list using list_doctors tool, then find the doctor by name from the list
-2. **CRITICAL**: Extract the doctor "id" (UUID) from list_doctors result - this is what you'll use for check_availability
-3. **Parse date IMMEDIATELY and CORRECTLY**: 
-   - "tomorrow" → Calculate: Today is {today_str}, so tomorrow is {tomorrow_str} (YYYY-MM-DD format)
-   - "26th nov" or "26th november" or "november 26" → "{current_year}-11-26" (use current year {current_year} if year not specified)
-   - "25th november" or "november 25" → "{current_year}-11-25" (use current year {current_year} if year not specified)
-   - "{current_year}-{current_month:02d}-25" → Use as-is
-   - ALWAYS use YYYY-MM-DD format for dates
-   - Handle ordinal numbers: "26th", "27th", "28th", etc.
-   - ALWAYS calculate dates dynamically based on today's date
-4. **Parse time IMMEDIATELY**: 
-   - "3pm" → "15:00"
-   - "2pm" → "14:00"
-   - "2:00 PM" → "14:00"
-   - "11 am" → "11:00"
-   - "3:00 PM" → "15:00"
-   - "14:00" → Use as-is
-   - ALWAYS use HH:MM format (24-hour) for times
-5. **IMMEDIATELY call check_availability** with:
-   - doctor_id: The UUID from list_doctors result (e.g., "c1111111-c111-c111-c111-c11111111111")
-   - date: Parsed date in YYYY-MM-DD format (e.g., "{tomorrow_str}")
-   - requested_time: Parsed time in HH:MM format (e.g., "14:00")
-6. **Analyze availability result CRITICALLY - THIS IS MANDATORY**: 
-   - When check_availability tool returns, you MUST check the tool result JSON
-   - **LOOK FOR**: "available_at_requested_time": True AND "MANDATORY_ACTION": "CALL book_appointment TOOL IMMEDIATELY"
-   - **CRITICAL RULE**: If you see BOTH of these in the tool result AND patient is registered (Patient ID exists), you MUST IMMEDIATELY call book_appointment tool
-   - **DO NOT generate any text response** - when you see "MANDATORY_ACTION": "CALL book_appointment TOOL IMMEDIATELY", you MUST make a tool call
-   - **DO NOT say "booking" or "would you like me to book"** - you MUST call the book_appointment tool
-   - **DO NOT generate text saying "Using tool: book_appointment"** - you MUST actually make a tool call using the tool
-   - The tool result will include "required_parameters" - use those exact values for the book_appointment tool call
-   - If False or is_conflicting is True: The time is NOT available - proceed to step 9
-   - DO NOT ask for more information if availability check shows the slot is free
-7. **If available AND patient registered (Patient ID exists) - MANDATORY ACTION**:
-   - **YOU MUST CALL book_appointment tool IMMEDIATELY** - this is not optional, it's mandatory
-   - The tool result from check_availability will show "available_at_requested_time": True
-   - When you see this, call book_appointment tool immediately with:
-     * patient_id: From PATIENT INFORMATION section
-     * doctor_id: The UUID from find_doctor_by_name result
-     * date: The parsed date (YYYY-MM-DD)
-     * time: The parsed time (HH:MM, 24-hour format)
-     * reason: Extract user's exact wording from their message (e.g., if they said "root canal", use "root canal"). Only use "general consultation" if they didn't mention any reason.
-   - NO confirmation needed
-   - NO asking "would you like to book?"
-   - NO waiting for user to say "yes"
-   - NO asking for reason if user didn't provide it - extract it from their message or use "general consultation"
-   - After booking succeeds, provide a natural confirmation message like: "Sure! Your appointment with Dr. [Name] on [date] at [time] is scheduled. ✅"
-8. **If available BUT patient NOT registered (Patient ID is None or empty)**: 
-   - Say: "Dr. [Name] is available on [date] at [time]. To book, I'll need to complete your registration first - it takes just 2 minutes. Should I proceed?"
-   - DO NOT use book_appointment tool without patient_id
-9. **If unavailable**: Suggest 2-3 nearest available times from available_slots ONCE, then wait for user choice
+Example 3 - Multiple Appointments (Sequential booking):
+User: "book dr. sarah at 2pm for checkup and dr. mohammed at 4pm for cleaning"
+Agent: [Silent: list_doctors → check_availability(2pm for sarah) → book(checkup, 2pm, sarah)
+        → check_availability(4pm for mohammed) → book(cleaning, 4pm, mohammed)]
+       "✅ Both appointments confirmed:
+        1) Checkup with Dr. Sarah - December 3, 2025 at 2:00 PM (ID: ABC123)
+        2) Cleaning with Dr. Mohammed - December 3, 2025 at 4:00 PM (ID: DEF456)"
 
-**Scenario B: User provides partial info:**
-1. Ask ONLY for missing pieces (doctor OR date OR time OR reason)
-2. Once complete, follow Scenario A
+Example 4 - Exploration (No Booking):
+User: "what doctors do you have?"
+Agent: [Calls list_doctors]
+       "We have Dr. Mohammed Atef (General Dentist), Dr. Sarah Johnson (Orthodontist)..."
 
-**Scenario C: User confirms booking ("yes", "schedule", "book it"):**
-1. If you already checked availability and confirmed it's available: Book IMMEDIATELY (book_appointment)
-2. DO NOT re-check availability
-3. DO NOT repeat previous confirmation messages
-4. Just book and confirm: "All set! Your appointment is confirmed. [Details]"
-
-**Scenario D: User asks to schedule without details:**
-1. "Sure! Please share: doctor name, date, time, and reason. Or I can show available doctors."
-
-AVOID:
-- ❌ Asking for details already provided
-- ❌ Re-checking availability after already confirming
-- ❌ Contradicting earlier availability statements
-- ❌ Multiple confirmation loops
-- ❌ Verbose, repetitive messages
-- ❌ Forcing registration unless required (mention once only)
-- ❌ Just saying "Using tool: X" - always provide a natural response after tool calls
-
-MANDATORY:
-- ✅ If patient is registered AND all details provided AND availability confirmed: Book immediately
-- ✅ If patient is NOT registered: Mention registration requirement ONCE, then proceed
-- ✅ Always be concise, warm, and human-like
-- ✅ Trust your first availability check - don't contradict yourself
-- ✅ After using ANY tool, provide a natural, conversational response - never just show tool names
-- ✅ When booking succeeds: "All set! Your appointment is confirmed. Doctor: [Name] | Date: [date] | Time: [time] | Reason: [reason] | ID: [id]"
-- ✅ When checking availability: "Dr. [Name] is available on [date] at [time]. Would you like me to book this?"
-
-**CRITICAL RESPONSE RULES - MANDATORY (VIOLATION = FAILURE):**
-
-**RULE 1: TOOL RESULT INTERPRETATION - ABSOLUTE REQUIREMENT**
-- When check_availability tool returns, you MUST check for "MANDATORY_ACTION": "CALL book_appointment TOOL IMMEDIATELY"
-- If you see this field in the tool result AND patient is registered, you MUST call book_appointment tool
-- DO NOT generate text - make the actual tool call
-- The tool result will include "required_parameters" - use those exact values
-
-**RULE 2: WORKFLOW - SEQUENTIAL AND AUTOMATIC - NO EXCEPTIONS**
-- Step 1: list_doctors → Get doctor UUID from the list (store it)
-- Step 2: check_availability with doctor UUID, date, and requested_time
-- Step 3: **MANDATORY CHECK**: Read the check_availability tool result JSON
-- Step 4: **IF tool result shows "MANDATORY_ACTION": "CALL book_appointment TOOL IMMEDIATELY" AND patient is registered**: 
-  * YOU MUST call book_appointment tool IMMEDIATELY in the SAME response
-  * Use values from "required_parameters" in the tool result
-  * DO NOT generate any text - just make the tool call
-- Step 5: **DO NOT just say "booking" or "would you like me to book" - you MUST actually call the book_appointment tool**
-- Step 6: After book_appointment succeeds, respond: "Sure! Your appointment with Dr. [Name] on [date] at [time] is scheduled. ✅"
-
-**RULE 3: TOOL CALLS VS TEXT - CRITICAL DISTINCTION**
-- **MAKING A TOOL CALL**: Using the book_appointment tool with proper parameters = CORRECT
-- **GENERATING TEXT**: Saying "booking that for you" or "Using tool: book_appointment" = WRONG
-- When you see "MANDATORY_ACTION" in tool result, you MUST make a tool call, not generate text
-
-**RULE 4: NO CONFIRMATIONS OR QUESTIONS**
-- DO NOT ask for reason - extract it from user's message. If they didn't mention a reason, use "general consultation"
-- DO NOT ask for confirmation - if available and patient registered, book immediately
-- DO NOT wait for user to say "yes" - book immediately when you see "MANDATORY_ACTION"
-
-**RULE 5: RESPONSE FORMAT**
-- After successful booking: "Sure! Your appointment with Dr. [Name] on [date] at [time] is scheduled. ✅"
-- Always be conversational and human-like - never show tool names to the user
-- Never show "Tool result:" or JSON in responses
-
-**RULE 6: REMEMBER**
-- Saying "booking that for you" is NOT the same as calling book_appointment tool - you MUST call the tool
-- If check_availability returns {{"MANDATORY_ACTION": "CALL book_appointment TOOL IMMEDIATELY"}}, immediately call book_appointment
-- The tool result will tell you exactly what to do - follow it precisely
+REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, execute all necessary tools, validate completeness, then respond. Don't rush to respond before all tasks are done.
 """
 
         return context
@@ -501,19 +642,156 @@ MANDATORY:
             logger.error(f"Error finding doctor by name: {e}")
             return {"error": str(e)}
 
+    def _merge_timeslots_to_ranges(self, timeslots: List[Dict[str, Any]]) -> List[str]:
+        """
+        Merge consecutive available timeslots into time ranges.
+
+        This is the primary method for calculating availability ranges from the
+        /appointments/:doctorId/time-slots endpoint, which already filters out booked slots.
+
+        Example:
+        Input: [
+            {"start_time": "10:00", "end_time": "10:30", "is_available": True},
+            {"start_time": "10:30", "end_time": "11:00", "is_available": True},
+            {"start_time": "15:00", "end_time": "15:30", "is_available": True}
+        ]
+        Output: ["10:00-11:00", "15:00-15:30"]
+
+        Args:
+            timeslots: List of timeslot dicts with start_time, end_time, is_available
+
+        Returns:
+            List of merged time ranges in "HH:MM-HH:MM" format
+        """
+        if not timeslots:
+            return []
+
+        # Filter only available slots
+        available = [s for s in timeslots if s.get('is_available', False)]
+        if not available:
+            return []
+
+        # Sort by start time to ensure correct ordering
+        available.sort(key=lambda x: x.get('start_time', ''))
+
+        ranges = []
+        current_start = available[0]['start_time']
+        current_end = available[0]['end_time']
+
+        for slot in available[1:]:
+            slot_start = slot['start_time']
+            slot_end = slot['end_time']
+
+            # If this slot starts exactly where the previous one ended, merge them
+            if slot_start == current_end:
+                current_end = slot_end
+            else:
+                # Gap detected - save current range and start a new one
+                ranges.append(f"{current_start}-{current_end}")
+                current_start = slot_start
+                current_end = slot_end
+
+        # Don't forget the last range
+        ranges.append(f"{current_start}-{current_end}")
+
+        return ranges
+
+    def _calculate_availability_ranges(
+        self,
+        availability_windows: List[Dict[str, Any]],
+        booked_slots: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Calculate availability ranges by finding gaps between booked appointments.
+
+        DEPRECATED: This method is kept for backward compatibility when availability
+        windows are available. The preferred approach is _merge_timeslots_to_ranges()
+        which uses the pre-filtered timeslots from the API.
+
+        Example: If availability is 9:00-17:00 and booked slots are 10:00-10:30 and 15:00-15:30,
+        returns ["9:00-10:00", "10:30-15:00", "15:30-17:00"]
+
+        Args:
+            availability_windows: List of availability windows with start_time and end_time
+            booked_slots: List of booked slots with start_time and end_time
+
+        Returns:
+            List of availability ranges in "HH:MM-HH:MM" format
+        """
+        from datetime import datetime, timedelta
+
+        if not availability_windows:
+            return []
+
+        ranges = []
+
+        for window in availability_windows:
+            window_start_str = window.get("start_time", "00:00:00")
+            window_end_str = window.get("end_time", "23:59:59")
+
+            # Parse window times
+            window_start = datetime.strptime(window_start_str[:5], "%H:%M").time() if len(window_start_str) >= 5 else datetime.strptime("00:00", "%H:%M").time()
+            window_end = datetime.strptime(window_end_str[:5], "%H:%M").time() if len(window_end_str) >= 5 else datetime.strptime("23:59", "%H:%M").time()
+
+            # Get booked slots within this window
+            window_booked = []
+            for booked in booked_slots:
+                booked_start_str = booked.get("start_time", "00:00:00")
+                booked_end_str = booked.get("end_time", "23:59:59")
+                booked_start = datetime.strptime(booked_start_str[:5], "%H:%M").time() if len(booked_start_str) >= 5 else datetime.strptime("00:00", "%H:%M").time()
+                booked_end = datetime.strptime(booked_end_str[:5], "%H:%M").time() if len(booked_end_str) >= 5 else datetime.strptime("23:59", "%H:%M").time()
+
+                # Check if booked slot overlaps with window
+                if not (booked_end <= window_start or booked_start >= window_end):
+                    window_booked.append({
+                        "start": booked_start,
+                        "end": booked_end
+                    })
+
+            # Sort booked slots by start time
+            window_booked.sort(key=lambda x: x["start"])
+
+            # Calculate ranges
+            current_start = window_start
+
+            for booked in window_booked:
+                # If there's a gap before this booked slot, add it as a range
+                if current_start < booked["start"]:
+                    ranges.append(f"{current_start.strftime('%H:%M')}-{booked['start'].strftime('%H:%M')}")
+
+                # Move current_start to after this booked slot
+                current_start = booked["end"]
+
+            # Add final range from last booked slot (or window start if no bookings) to window end
+            if current_start < window_end:
+                ranges.append(f"{current_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}")
+
+        return ranges
+
     def tool_check_availability(
         self,
         session_id: str,
         doctor_id: str,
         date: str,
-        requested_time: Optional[str] = None
+        requested_time: Optional[str] = None  # Keep as optional, but don't use it
     ) -> Dict[str, Any]:
-        """Check doctor availability. 
-        
+        """Check doctor availability and return time ranges.
+
+        Returns availability_ranges only - simple list of time ranges where doctor is available.
+        Example: ["10:00-15:00", "15:30-16:00", "16:30-17:30"]
+
         Args:
             doctor_id: Must be a valid UUID (use find_doctor_by_name first to get the ID)
             date: Date in YYYY-MM-DD format
-            requested_time: Optional time in HH:MM format to check specific slot availability
+            requested_time (only when provided by patient): Optional time in HH:MM format to check specific slot availability
+
+
+        Returns:
+            Dictionary with:
+            - success: Boolean
+            - date: The date checked
+            - availability_ranges: List of available time ranges
+            - count: Number of ranges
+            - message: Human-readable message
         """
         try:
             # Validate doctor_id is a UUID (not a name)
@@ -528,200 +806,40 @@ MANDATORY:
                     "suggestion": "Use find_doctor_by_name tool first to get the doctor's UUID"
                 }
 
-            availability = self.db_client.get_doctor_availability(doctor_id, date)
-
-            if not availability:
-                return {
-                    "success": True,
-                    "available_slots": [],
-                    "message": "No available slots found",
-                    "date": date
-                }
-
-            # Get existing appointments for this doctor on this date to check for conflicts
-            existing_appointments = self.db_client.get_doctor_appointments(
+            # Get available timeslots (pre-filtered by API)
+            available_timeslots = self.db_client.get_available_time_slots(
                 doctor_id=doctor_id,
                 date=date,
-                status=None  # Get all non-cancelled appointments
+                slot_duration_minutes=30
             )
-            
-            # Filter out cancelled appointments
-            booked_slots = []
-            if existing_appointments:
-                for apt in existing_appointments:
-                    if apt.get("status") not in ["cancelled", "completed", "no_show"]:
-                        booked_slots.append({
-                            "start_time": apt.get("start_time"),
-                            "end_time": apt.get("end_time")
-                        })
-            
-            logger.info(f"Found {len(booked_slots)} booked slots for doctor {doctor_id} on {date}")
 
-            # If requested_time is provided, check if that specific time is available
-            if requested_time:
-                # Parse requested time to HH:MM format
-                from datetime import datetime
-                try:
-                    # Try parsing various formats
-                    time_str = requested_time.replace(" ", "").upper()
-                    parsed_time = None
-                    
-                    # Handle formats like "2pm", "2:00pm", "14:00", etc.
-                    if "PM" in time_str or "AM" in time_str:
-                        # 12-hour format
-                        time_str_clean = time_str.replace("PM", "").replace("AM", "").strip()
-                        if ":" in time_str_clean:
-                            hour, minute = time_str_clean.split(":")
-                            hour = int(hour)
-                            minute = int(minute)
-                        else:
-                            hour = int(time_str_clean)
-                            minute = 0
-                        
-                        if "PM" in time_str and hour < 12:
-                            hour += 12
-                        elif "AM" in time_str and hour == 12:
-                            hour = 0
-                        
-                        parsed_time = datetime.strptime(f"{hour:02d}:{minute:02d}", "%H:%M").time()
-                    else:
-                        # 24-hour format
-                        if ":" in time_str:
-                            parsed_time = datetime.strptime(time_str, "%H:%M").time()
-                        else:
-                            # Just hour
-                            hour = int(time_str)
-                            parsed_time = datetime.strptime(f"{hour:02d}:00", "%H:%M").time()
-                except Exception as e:
-                    logger.warning(f"Could not parse requested time '{requested_time}': {e}")
-                    parsed_time = None
+            if not available_timeslots:
+                return {
+                    "success": True,
+                    "date": date,
+                    "availability_ranges": [],
+                    "count": 0,
+                    "message": f"No available slots found for {date}"
+                }
 
-                # Check if requested time falls within any availability slot AND is not already booked
-                if parsed_time:
-                    available_at_requested_time = False
-                    matching_slot = None
-                    is_conflicting = False
-                    
-                    # Calculate requested time slot (30 min default)
-                    from datetime import timedelta
-                    requested_start = parsed_time
-                    requested_end_dt = datetime.combine(datetime.today(), requested_start) + timedelta(minutes=30)
-                    requested_end = requested_end_dt.time()
-                    
-                    # Check for conflicts with existing appointments
-                    for booked in booked_slots:
-                        booked_start_str = booked.get("start_time", "00:00:00")
-                        booked_end_str = booked.get("end_time", "23:59:59")
-                        booked_start = datetime.strptime(booked_start_str[:5], "%H:%M").time() if len(booked_start_str) >= 5 else datetime.strptime("00:00", "%H:%M").time()
-                        booked_end = datetime.strptime(booked_end_str[:5], "%H:%M").time() if len(booked_end_str) >= 5 else datetime.strptime("23:59", "%H:%M").time()
-                        
-                        # Check if requested time overlaps with booked slot
-                        if not (requested_end <= booked_start or requested_start >= booked_end):
-                            is_conflicting = True
-                            logger.warning(f"Requested time {requested_time} conflicts with existing appointment {booked_start}-{booked_end}")
-                            break
-                    
-                    # Only check availability slots if no conflict
-                    if not is_conflicting:
-                        for slot in availability:
-                            slot_start_str = slot.get("start_time", "00:00:00")
-                            slot_end_str = slot.get("end_time", "23:59:59")
-                            
-                            # Parse slot times
-                            slot_start = datetime.strptime(slot_start_str[:5], "%H:%M").time() if len(slot_start_str) >= 5 else datetime.strptime("00:00", "%H:%M").time()
-                            slot_end = datetime.strptime(slot_end_str[:5], "%H:%M").time() if len(slot_end_str) >= 5 else datetime.strptime("23:59", "%H:%M").time()
-                            
-                            # Check if requested time is within slot range
-                            if slot_start <= parsed_time < slot_end:
-                                available_at_requested_time = True
-                                matching_slot = slot
-                                break
-                    
-                    # Update agent state
-                    self.state_manager.update_appointment_state(
-                        session_id,
-                        available_slots=availability
-                    )
-                    
-                    if is_conflicting:
-                        return {
-                            "success": True,
-                            "date": date,
-                            "requested_time": requested_time,
-                            "available_at_requested_time": False,
-                            "is_conflicting": True,
-                            "available_slots": availability,
-                            "booked_slots": booked_slots,
-                            "message": f"Requested time {requested_time} is already booked. Please choose a different time."
-                        }
-                    elif available_at_requested_time:
-                        logger.info(f"✅ Time {requested_time} on {date} is AVAILABLE for doctor {doctor_id}")
-                        return {
-                            "success": True,
-                            "date": date,
-                            "requested_time": requested_time,
-                            "available_at_requested_time": True,
-                            "available_slots": availability,
-                            "matching_slot": matching_slot,
-                            "message": f"Dr. is available on {date} at {requested_time}",
-                            "MANDATORY_ACTION": "CALL book_appointment TOOL IMMEDIATELY",
-                            "instructions": "You MUST call the book_appointment tool NOW with patient_id, doctor_id, date, time, and reason. Do NOT generate text - make the tool call.",
-                            "tool_to_call": "book_appointment",
-                            "required_parameters": {
-                                "patient_id": "From PATIENT INFORMATION section",
-                                "doctor_id": "The UUID from find_doctor_by_name result",
-                                "date": f"{date}",
-                                "time": f"{requested_time}",
-                                "reason": "Extract EXACT wording from user message (their procedure/symptom). Only 'general consultation' if not mentioned."
-                            }
-                        }
-                    else:
-                        return {
-                            "success": True,
-                            "date": date,
-                            "requested_time": requested_time,
-                            "available_at_requested_time": False,
-                            "available_slots": availability,
-                            "message": f"Requested time {requested_time} is not available, but other slots are available"
-                        }
-
-            # Filter out slots that conflict with existing appointments
-            # This provides available time ranges, but individual slots may still be booked
-            filtered_slots = []
-            for slot in availability:
-                slot_start_str = slot.get("start_time", "00:00:00")
-                slot_end_str = slot.get("end_time", "23:59:59")
-                slot_start = datetime.strptime(slot_start_str[:5], "%H:%M").time() if len(slot_start_str) >= 5 else datetime.strptime("00:00", "%H:%M").time()
-                slot_end = datetime.strptime(slot_end_str[:5], "%H:%M").time() if len(slot_end_str) >= 5 else datetime.strptime("23:59", "%H:%M").time()
-                
-                # Check if this slot overlaps with any booked appointments
-                has_conflict = False
-                for booked in booked_slots:
-                    booked_start_str = booked.get("start_time", "00:00:00")
-                    booked_end_str = booked.get("end_time", "23:59:59")
-                    booked_start = datetime.strptime(booked_start_str[:5], "%H:%M").time() if len(booked_start_str) >= 5 else datetime.strptime("00:00", "%H:%M").time()
-                    booked_end = datetime.strptime(booked_end_str[:5], "%H:%M").time() if len(booked_end_str) >= 5 else datetime.strptime("23:59", "%H:%M").time()
-                    
-                    # Check for overlap
-                    if not (slot_end <= booked_start or slot_start >= booked_end):
-                        has_conflict = True
-                        break
-                
-                if not has_conflict:
-                    filtered_slots.append(slot)
+            # Merge consecutive timeslots into ranges
+            logger.info(f"Using timeslots-based approach: {len(available_timeslots)} available slots")
+            availability_ranges = self._merge_timeslots_to_ranges(available_timeslots)
+            logger.info(f"Merged into {len(availability_ranges)} availability range(s)")
 
             # Update agent state
             self.state_manager.update_appointment_state(
                 session_id,
-                available_slots=filtered_slots if filtered_slots else availability
+                available_slots=available_timeslots
             )
 
+            # Simple return - ONLY availability_ranges
             return {
                 "success": True,
                 "date": date,
-                "available_slots": filtered_slots if filtered_slots else availability,
-                "booked_slots": booked_slots,
-                "message": f"Found {len(filtered_slots if filtered_slots else availability)} available slot(s) on {date}. {len(booked_slots)} time slot(s) already booked."
+                "availability_ranges": availability_ranges,
+                "count": len(availability_ranges),
+                "message": f"Found {len(availability_ranges)} available time range(s) on {date}"
             }
 
         except Exception as e:
@@ -1017,34 +1135,58 @@ MANDATORY:
                 "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
             }
     
-    def _get_alternative_slots(self, doctor_id: str, date: str, requested_time: str) -> str:
+    def _get_alternative_slots(self, doctor_id: str, date: str, time: str) -> str:
         """
-        Get alternative time slots when requested time is unavailable.
-        
+        Get alternative time slots closest to the requested time when unavailable.
+
+        Ranks available slots by time proximity (absolute difference in minutes).
+
         Args:
             doctor_id: Doctor ID
             date: Requested date
-            requested_time: Requested time
-        
+            time: Requested time (HH:MM format)
+
         Returns:
-            String with up to 3 alternative slots
+            String with up to 3 alternative slots closest to the requested time
         """
         try:
             availability = self.db_client.get_doctor_availability(doctor_id, date)
             if not availability:
                 return "No alternative slots available"
-            
-            # Get available slots
-            slots = []
-            for slot in availability[:3]:  # Max 3 alternatives
+
+            # Convert time to minutes since midnight for fast comparison
+            def time_to_minutes(time_str: str) -> int:
+                """Convert HH:MM to minutes since midnight"""
+                try:
+                    h, m = time_str[:5].split(':')
+                    return int(h) * 60 + int(m)
+                except (ValueError, IndexError):
+                    return -1  # Invalid time
+
+            requested_minutes = time_to_minutes(time)
+            if requested_minutes == -1:
+                # Fallback: return first 3 slots if time is invalid
+                slots = [slot.get('start_time', '')[:5] for slot in availability[:3] if slot.get('start_time')]
+                return ", ".join(slots) if slots else "No alternative slots available"
+
+            # Extract valid slots with their time differences
+            valid_slots = []
+            for slot in availability:
                 start = slot.get('start_time', '')[:5]
                 if start:
-                    slots.append(start)
-            
-            if slots:
-                return ", ".join(slots)
-            else:
+                    minutes = time_to_minutes(start)
+                    if minutes != -1:
+                        valid_slots.append((start, abs(minutes - requested_minutes)))
+
+            if not valid_slots:
                 return "No alternative slots available"
+
+            # Sort by proximity (time difference) and take top 3
+            closest_slots = sorted(valid_slots, key=lambda x: x[1])[:3]
+
+            # Return just the time strings
+            return ", ".join(slot[0] for slot in closest_slots)
+
         except Exception as e:
             logger.warning(f"Failed to get alternative slots: {e}")
             return "No alternative slots available"
@@ -1149,211 +1291,250 @@ MANDATORY:
                 "message": "Sorry — I couldn't schedule your appointment right now because of a system error. Would you like me to try again? (Yes / No)"
             }
     
-    # Old tool_book_appointment method removed - replaced with new synchronous workflow
-            # Validate patient_id exists
-            if not patient_id or patient_id.strip() == "":
+    def tool_book_multiple_appointments(
+        self,
+        session_id: str,
+        patient_id: str,
+        appointments: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Book multiple appointments at once with different parameters.
+
+        This method books multiple appointments sequentially, each with its own
+        doctor, date, time, and reason. All appointments are for the same patient.
+
+        Args:
+            session_id: Session identifier
+            patient_id: Patient's ID (same for all appointments)
+            appointments: List of appointment dicts, each containing:
+                - doctor_id: Doctor's UUID
+                - date: Appointment date (YYYY-MM-DD)
+                - time: Appointment time (HH:MM)
+                - reason: Appointment reason
+
+        Returns:
+            Dict with:
+            - success: True if all bookings succeeded, False if any failed
+            - results: List of individual booking results
+            - summary: Human-readable summary
+            - successful_count: Number of successful bookings
+            - failed_count: Number of failed bookings
+        """
+        import asyncio
+        import time as time_module
+
+        overall_start = time_module.time()
+        correlation_id = session_id
+
+        logger.info(f"📋 MULTIPLE BOOKING REQUEST: correlation_id={correlation_id}")
+        logger.info(f"   patient_id={patient_id}, appointments_count={len(appointments)}")
+
+        # Validate inputs
+        if not patient_id or patient_id.strip() == "":
+            return {
+                "success": False,
+                "error": "Patient registration required",
+                "message": "You must complete registration before booking appointments. Please register first.",
+                "results": []
+            }
+
+        if not appointments or len(appointments) == 0:
+            return {
+                "success": False,
+                "error": "No appointments provided",
+                "message": "Please provide at least one appointment to book.",
+                "results": []
+            }
+
+        # Validate each appointment has required fields
+        for idx, apt in enumerate(appointments):
+            if not all(k in apt for k in ['doctor_id', 'date', 'time', 'reason']):
                 return {
                     "success": False,
-                    "error": "Patient registration required",
-                    "message": "You must complete registration before booking an appointment. Please register first."
+                    "error": f"Appointment {idx + 1} missing required fields",
+                    "message": f"Appointment {idx + 1} is missing required fields (doctor_id, date, time, reason)",
+                    "results": []
                 }
-            
-            # Get clinic ID (use first available clinic or default)
-            clinic_info = self.db_client.get_clinic_info()
-            if not clinic_info:
-                # Try to get all clinics and use the first one
-                all_clinics = self.db_client.get_all_clinics()
-                if all_clinics and len(all_clinics) > 0:
-                    clinic_id = all_clinics[0].get("id")
-                    logger.info(f"Using first available clinic: {clinic_id}")
+
+        # Book each appointment sequentially
+        results = []
+        successful_bookings = []
+        failed_bookings = []
+
+        for idx, apt in enumerate(appointments):
+            logger.info(f"📋 Booking appointment {idx + 1}/{len(appointments)}")
+            logger.info(f"   doctor_id={apt['doctor_id']}, date={apt['date']}, time={apt['time']}, reason={apt['reason']}")
+
+            try:
+                # Execute booking workflow for this appointment
+                try:
+                    loop = None
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                    if loop.is_running():
+                        # If loop is already running, use ThreadPoolExecutor
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(
+                                lambda: asyncio.run(
+                                    asyncio.wait_for(
+                                        self._execute_booking_workflow(
+                                            session_id=session_id,
+                                            patient_id=patient_id,
+                                            doctor_id=apt['doctor_id'],
+                                            date=apt['date'],
+                                            time=apt['time'],
+                                            reason=apt['reason'],
+                                            correlation_id=f"{correlation_id}_apt{idx + 1}"
+                                        ),
+                                        timeout=20.0
+                                    )
+                                )
+                            )
+                            result = future.result(timeout=25.0)
+                    else:
+                        result = loop.run_until_complete(
+                            asyncio.wait_for(
+                                self._execute_booking_workflow(
+                                    session_id=session_id,
+                                    patient_id=patient_id,
+                                    doctor_id=apt['doctor_id'],
+                                    date=apt['date'],
+                                    time=apt['time'],
+                                    reason=apt['reason'],
+                                    correlation_id=f"{correlation_id}_apt{idx + 1}"
+                                ),
+                                timeout=20.0
+                            )
+                        )
+                except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+                    logger.error(f"❌ Appointment {idx + 1} timed out")
+                    result = {
+                        "success": False,
+                        "error": "Timeout",
+                        "error_code": "TIMEOUT",
+                        "message": f"Appointment {idx + 1} timed out",
+                        "appointment_number": idx + 1
+                    }
+
+                # Add appointment details to result
+                result['appointment_number'] = idx + 1
+                result['requested_doctor_id'] = apt['doctor_id']
+                result['requested_date'] = apt['date']
+                result['requested_time'] = apt['time']
+                result['requested_reason'] = apt['reason']
+
+                results.append(result)
+
+                if result.get('success'):
+                    successful_bookings.append(result)
+                    logger.info(f"✅ Appointment {idx + 1} booked successfully: {result.get('appointment_id')}")
                 else:
-                    # Use a known clinic ID from the database
-                    clinic_id = "11111111-1111-1111-1111-111111111111"  # Al Dhait Branch
-                    logger.warning(f"No clinic found, using default: {clinic_id}")
-            else:
-                clinic_id = clinic_info.get("id")
-                logger.info(f"Using clinic from get_clinic_info: {clinic_id}")
+                    failed_bookings.append(result)
+                    logger.error(f"❌ Appointment {idx + 1} failed: {result.get('error')}")
 
-            # Calculate end time (default 30 min appointments)
-            from datetime import datetime
-            start_dt = datetime.strptime(time, "%H:%M")
-            end_dt = start_dt + timedelta(minutes=30)
-            end_time = end_dt.strftime("%H:%M")
-
-            # Get appointment type ID (use a default or fetch)
-            appointment_types = self.db_client.get_appointment_types()
-            appointment_type_id = appointment_types[0].get("id") if appointment_types else None
-            
-            if not appointment_type_id:
-                return {
+            except Exception as e:
+                logger.error(f"❌ Exception booking appointment {idx + 1}: {e}", exc_info=True)
+                error_result = {
                     "success": False,
-                    "error": "Appointment type not found",
-                    "message": "Unable to determine appointment type. Please try again."
+                    "error": str(e),
+                    "error_code": "EXCEPTION",
+                    "message": f"Appointment {idx + 1} failed with exception",
+                    "appointment_number": idx + 1,
+                    "requested_doctor_id": apt['doctor_id'],
+                    "requested_date": apt['date'],
+                    "requested_time": apt['time'],
+                    "requested_reason": apt['reason']
                 }
+                results.append(error_result)
+                failed_bookings.append(error_result)
 
-            # Create appointment (status is set automatically by API, don't pass it)
-            logger.info(f"📋 BOOKING APPOINTMENT: patient_id={patient_id}, doctor_id={doctor_id}, date={date}, time={time}")
-            logger.info(f"   clinic_id={clinic_id}, appointment_type_id={appointment_type_id}")
-            
-            # Track scheduling API latency
-            import time as time_module
-            scheduling_start = time_module.time()
-            
-            appointment = self.db_client.create_appointment(
-                clinic_id=clinic_id,
-                patient_id=patient_id,
-                doctor_id=doctor_id,
-                appointment_type_id=appointment_type_id,
-                appointment_date=date,
-                start_time=time,
-                end_time=end_time,
-                reason=reason,
-                emergency_level="routine"
+        # Calculate overall duration
+        overall_duration_ms = (time_module.time() - overall_start) * 1000
+
+        # Generate summary
+        all_successful = len(failed_bookings) == 0
+        successful_count = len(successful_bookings)
+        failed_count = len(failed_bookings)
+
+        logger.info(f"📊 Multiple booking completed in {overall_duration_ms:.0f}ms")
+        logger.info(f"   Successful: {successful_count}/{len(appointments)}")
+        logger.info(f"   Failed: {failed_count}/{len(appointments)}")
+
+        # Build formatted message
+        if all_successful:
+            # Format success message
+            message_lines = [f"✅ All {successful_count} appointments confirmed:"]
+            for result in successful_bookings:
+                apt_id = result.get('appointment_id', 'N/A')
+                date = result.get('requested_date', 'N/A')
+                time = result.get('requested_time', 'N/A')
+                reason = result.get('requested_reason', 'N/A')
+
+                # Format date
+                try:
+                    date_obj = datetime.strptime(date, "%Y-%m-%d")
+                    date_display = date_obj.strftime("%B %d, %Y")
+                except:
+                    date_display = date
+
+                # Format time
+                try:
+                    time_obj = datetime.strptime(time, "%H:%M")
+                    time_display = time_obj.strftime("%I:%M %p")
+                except:
+                    time_display = time
+
+                message_lines.append(f"{result['appointment_number']}) {reason} - {date_display} at {time_display} (ID: {apt_id})")
+
+            message = "\n".join(message_lines)
+        else:
+            # Partial success or complete failure
+            message_lines = []
+
+            if successful_count > 0:
+                message_lines.append(f"⚠️ Booked {successful_count} of {len(appointments)} appointments:")
+                for result in successful_bookings:
+                    apt_id = result.get('appointment_id', 'N/A')
+                    reason = result.get('requested_reason', 'N/A')
+                    message_lines.append(f"✅ {result['appointment_number']}) {reason} (ID: {apt_id})")
+
+            if failed_count > 0:
+                message_lines.append(f"\n❌ Failed to book {failed_count} appointments:")
+                for result in failed_bookings:
+                    reason = result.get('requested_reason', 'N/A')
+                    error = result.get('error', 'Unknown error')
+                    message_lines.append(f"   {result['appointment_number']}) {reason} - {error}")
+
+            message = "\n".join(message_lines)
+
+        # Update state
+        if all_successful:
+            self.state_manager.update_appointment_state(
+                session_id,
+                workflow_step="completed",
+                operation_type="multiple_booking"
             )
-            
-            scheduling_latency_ms = (time_module.time() - scheduling_start) * 1000
-            logger.info(f"📊 Scheduling API call completed in {scheduling_latency_ms:.0f}ms")
 
-            if appointment:
-                appointment_id = appointment.get('id')
-                logger.info(f"✅ API returned appointment: {appointment_id}")
-                
-                # ========== MANDATORY DB VERIFICATION ==========
-                # CRITICAL: Never trust API response alone - verify appointment exists in DB
-                # This prevents false confirmations when DB writes fail silently
-                logger.info(f"🔍 VERIFICATION: Confirming appointment exists in database...")
-                verification_start = time_module.time()
-                
-                # Step 1: Verify appointment exists in DB
-                verified_appointment = self._verify_appointment_in_db(
-                    appointment_id=appointment_id,
-                    max_retries=3,
-                    retry_delay_ms=500
-                )
-                
-                verification_latency_ms = (time_module.time() - verification_start) * 1000
-                logger.info(f"📊 DB verification completed in {verification_latency_ms:.0f}ms")
-                
-                if not verified_appointment:
-                    # CRITICAL: API returned success but appointment NOT in DB
-                    # This is the exact false confirmation scenario we must prevent
-                    logger.error(f"❌ VERIFICATION FAILED: Appointment {appointment_id} not found in DB!")
-                    logger.error(f"   API returned: {appointment}")
-                    logger.error(f"   DB query returned: None")
-                    logger.error(f"   🚨 This is a FALSE CONFIRMATION scenario - NOT confirming to user")
-                    
-                    # Log metrics for this mismatch
-                    self._log_booking_metrics(
-                        appointment_inserted=False,
-                        db_row_id=appointment_id,
-                        verification_latency_ms=verification_latency_ms,
-                        scheduling_latency_ms=scheduling_latency_ms,
-                        dashboard_visible=False,
-                        request_id=None,
-                        mismatch_detected=True,
-                        error_code="DB_VERIFICATION_FAILED"
-                    )
-                    
-                    return {
-                        "success": False,
-                        "error": "Verification failed - appointment not found in database",
-                        "error_code": "DB_VERIFICATION_FAILED",
-                        "message": "I couldn't complete your booking. The system encountered an issue. Please try again or contact support."
-                    }
-                
-                # Step 2: Verify appointment details match
-                if not self._verify_appointment_details(
-                    appointment=verified_appointment,
-                    expected_patient_id=patient_id,
-                    expected_doctor_id=doctor_id,
-                    expected_date=date,
-                    expected_time=time
-                ):
-                    logger.error(f"❌ VERIFICATION FAILED: Appointment details mismatch!")
-                    logger.error(f"   Expected: patient={patient_id}, doctor={doctor_id}, date={date}, time={time}")
-                    logger.error(f"   Found: {verified_appointment}")
-                    
-                    # Log metrics for this mismatch
-                    self._log_booking_metrics(
-                        appointment_inserted=False,
-                        db_row_id=appointment_id,
-                        verification_latency_ms=verification_latency_ms,
-                        scheduling_latency_ms=scheduling_latency_ms,
-                        dashboard_visible=False,
-                        request_id=None,
-                        mismatch_detected=True,
-                        error_code="DB_VERIFICATION_MISMATCH"
-                    )
-                    
-                    return {
-                        "success": False,
-                        "error": "Verification failed - appointment details don't match",
-                        "error_code": "DB_VERIFICATION_MISMATCH",
-                        "message": "I couldn't verify your booking. Please try again or contact support."
-                    }
-                
-                # ========== VERIFICATION PASSED ==========
-                logger.info(f"✅ VERIFICATION PASSED: Appointment {appointment_id} confirmed in database")
-                
-                # Log successful metrics
-                self._log_booking_metrics(
-                    appointment_inserted=True,
-                    db_row_id=appointment_id,
-                    verification_latency_ms=verification_latency_ms,
-                    scheduling_latency_ms=scheduling_latency_ms,
-                    dashboard_visible=True,  # Assume visible if DB verification passed
-                    request_id=None,
-                    mismatch_detected=False,
-                    error_code=None
-                )
-                
-                # Update state
-                self.state_manager.update_appointment_state(
-                    session_id,
-                    workflow_step="completed",
-                    operation_type="booking"
-                )
-
-                return {
-                    "success": True,
-                    "appointment": verified_appointment,
-                    "appointment_id": appointment_id,
-                    "verified": True,
-                    "verification_latency_ms": round(verification_latency_ms, 2),
-                    "message": f"Appointment booked successfully for {date} at {time}"
-                }
-            else:
-                logger.error(f"❌ Failed to create appointment - API returned None")
-                
-                # Log failed metrics
-                self._log_booking_metrics(
-                    appointment_inserted=False,
-                    db_row_id=None,
-                    verification_latency_ms=0,
-                    scheduling_latency_ms=scheduling_latency_ms,
-                    dashboard_visible=False,
-                    request_id=None,
-                    mismatch_detected=False,
-                    error_code="API_RETURNED_NONE"
-                )
-                
-                return {
-                    "success": False,
-                    "error": "Failed to create appointment",
-                    "error_code": "API_RETURNED_NONE",
-                    "message": "The appointment could not be created. Please try again or contact support."
-                }
-
-        except Exception as e:
-            logger.error(f"Error booking appointment: {e}")
-            return {"error": str(e)}
+        return {
+            "success": all_successful,
+            "results": results,
+            "successful_count": successful_count,
+            "failed_count": failed_count,
+            "total_count": len(appointments),
+            "overall_duration_ms": round(overall_duration_ms, 2),
+            "message": message
+        }
 
     def tool_check_patient_appointments(
         self,
         session_id: str,
         patient_id: str
     ) -> Dict[str, Any]:
-        """Get patient's appointments."""
+        """Get patient's appointments.""" 
         try:
             appointments = self.db_client.get_patient_appointments(patient_id)
 
@@ -1429,6 +1610,127 @@ MANDATORY:
         except Exception as e:
             logger.error(f"Error rescheduling appointment: {e}")
             return {"error": str(e)}
+
+    def tool_update_appointment(
+        self,
+        session_id: str,
+        appointment_id: str,
+        doctor_id: Optional[str] = None,
+        clinic_id: Optional[str] = None,
+        patient_id: Optional[str] = None,
+        appointment_type_id: Optional[str] = None,
+        appointment_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        status: Optional[str] = None,
+        reason: Optional[str] = None,
+        notes: Optional[str] = None,
+        emergency_level: Optional[str] = None,
+        follow_up_required: Optional[bool] = None,
+        follow_up_days: Optional[int] = None,
+        procedure_type: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Update an appointment with one or more parameters.
+        
+        This tool allows updating any combination of appointment fields in a single call.
+        Only the fields provided will be updated; all other fields remain unchanged.
+        """
+        try:
+            # Build updates dictionary - only include non-None values
+            updates = {}
+            
+            if doctor_id is not None:
+                updates["doctor_id"] = doctor_id
+            if clinic_id is not None:
+                updates["clinic_id"] = clinic_id
+            if patient_id is not None:
+                updates["patient_id"] = patient_id
+            if appointment_type_id is not None:
+                updates["appointment_type_id"] = appointment_type_id
+            if appointment_date is not None:
+                updates["appointment_date"] = appointment_date
+            if start_time is not None:
+                updates["start_time"] = start_time
+                # If start_time is provided but end_time is not, calculate it (30 min default)
+                if end_time is None:
+                    try:
+                        start_dt = datetime.strptime(start_time, "%H:%M")
+                        end_dt = start_dt + timedelta(minutes=30)
+                        updates["end_time"] = end_dt.strftime("%H:%M")
+                        logger.info(f"Calculated end_time: {updates['end_time']} from start_time: {start_time}")
+                    except ValueError as e:
+                        logger.warning(f"Could not parse start_time '{start_time}' to calculate end_time: {e}")
+            if end_time is not None:
+                updates["end_time"] = end_time
+            if status is not None:
+                # Validate status
+                valid_statuses = ['scheduled', 'confirmed', 'checked_in', 'in_progress', 'completed', 'cancelled', 'no_show', 'rescheduled']
+                if status not in valid_statuses:
+                    return {
+                        "success": False,
+                        "error": f"Invalid status '{status}'. Valid values: {', '.join(valid_statuses)}"
+                    }
+                updates["status"] = status
+            if reason is not None:
+                updates["reason"] = reason
+            if notes is not None:
+                updates["notes"] = notes
+            if emergency_level is not None:
+                # Validate emergency_level
+                valid_levels = ['routine', 'urgent', 'emergency', 'critical']
+                if emergency_level not in valid_levels:
+                    return {
+                        "success": False,
+                        "error": f"Invalid emergency_level '{emergency_level}'. Valid values: {', '.join(valid_levels)}"
+                    }
+                updates["emergency_level"] = emergency_level
+            if follow_up_required is not None:
+                updates["follow_up_required"] = follow_up_required
+            if follow_up_days is not None:
+                updates["follow_up_days"] = follow_up_days
+            if procedure_type is not None:
+                updates["procedure_type"] = procedure_type
+            
+            # Check if at least one field is being updated
+            if not updates:
+                return {
+                    "success": False,
+                    "error": "No fields provided to update. Please specify at least one field to update."
+                }
+            
+            logger.info(f"Updating appointment {appointment_id} with fields: {list(updates.keys())}")
+            
+            # Call the database client update method
+            result = self.db_client.update_appointment(appointment_id, updates)
+            
+            if result:
+                # Format success message with what was updated
+                updated_fields = list(updates.keys())
+                return {
+                    "success": True,
+                    "appointment": result,
+                    "updated_fields": updated_fields,
+                    "message": f"Appointment updated successfully. Updated fields: {', '.join(updated_fields)}"
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "Failed to update appointment. The appointment may not exist or the update may have failed."
+                }
+                
+        except ValueError as e:
+            logger.error(f"Value error updating appointment: {e}")
+            return {
+                "success": False,
+                "error": f"Invalid input format: {str(e)}"
+            }
+        except Exception as e:
+            logger.error(f"Error updating appointment: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
 
     # ========== SYNCHRONOUS BOOKING WORKFLOW INFRASTRUCTURE ==========
     # These methods support the strict synchronous booking workflow

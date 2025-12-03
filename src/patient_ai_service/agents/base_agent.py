@@ -113,6 +113,8 @@ class BaseAgent(ABC):
         """
         Generate a brief context note for the system prompt.
 
+        IMPORTANT: Now includes language context received from reasoning engine.
+
         Args:
             session_id: Session identifier
 
@@ -134,6 +136,27 @@ class BaseAgent(ABC):
 
         if "prior_context" in context:
             parts.append(f"Context: {context['prior_context']}")
+
+        # [NEW] Language context (received from reasoning engine via minimal_context)
+        current_language = context.get("current_language")
+        current_dialect = context.get("current_dialect")
+
+        if current_language:
+            lang_display = f"{current_language}"
+            if current_dialect:
+                lang_display += f"-{current_dialect}"
+
+            parts.append(f"User's language: {lang_display}")
+
+            # Check if this is a language switch
+            # Note: We could check global_state.language_context.language_history
+            # but for simplicity, we just note the current language
+            if current_language != "en":
+                parts.append(
+                    f"Note: User speaks {lang_display}. "
+                    f"Messages you receive are translated to English. "
+                    f"Your responses will be translated back to {lang_display}."
+                )
 
         if not parts:
             return ""
@@ -333,6 +356,82 @@ class BaseAgent(ABC):
         logger.info(f"🤖 AUTO-BOOKING TRIGGERED: {booking_params}")
         return booking_params
 
+    def _is_likely_english(self, text: str) -> bool:
+        """
+        Quick heuristic check if text is likely English.
+
+        This is a safety check to catch obvious non-English text that
+        might have bypassed translation.
+
+        Args:
+            text: Text to check
+
+        Returns:
+            True if likely English, False otherwise
+        """
+        # Check for non-Latin scripts (Arabic, Chinese, etc.)
+        # These would indicate translation failed
+        non_latin_ranges = [
+            (0x0600, 0x06FF),  # Arabic
+            (0x0750, 0x077F),  # Arabic Supplement
+            (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+            (0x3040, 0x309F),  # Hiragana
+            (0x30A0, 0x30FF),  # Katakana
+            (0x0400, 0x04FF),  # Cyrillic
+        ]
+
+        for char in text[:100]:  # Check first 100 chars
+            code_point = ord(char)
+            for start, end in non_latin_ranges:
+                if start <= code_point <= end:
+                    return False
+
+        # If we get here, text uses Latin/common scripts
+        return True
+
+    async def _emergency_translate(self, session_id: str, text: str) -> str:
+        """
+        Emergency fallback translation if non-English text reaches agent.
+
+        This should rarely be needed if orchestrator works correctly.
+
+        Args:
+            session_id: Session identifier
+            text: Text to translate
+
+        Returns:
+            Translated English text, or original if translation fails
+        """
+        logger.error(
+            f"TRANSLATION BARRIER BREACH: Non-English text reached {self.agent_name} agent. "
+            f"Text: '{text[:100]}...'"
+        )
+
+        try:
+            # Get translation agent from orchestrator
+            # Note: This is a fallback - ideally shouldn't happen
+            from patient_ai_service.agents import TranslationAgent
+            translation_agent = TranslationAgent()
+
+            # Detect and translate
+            detected_lang, detected_dialect = await translation_agent.detect_language_and_dialect(text)
+            if detected_lang != "en":
+                english_text = await translation_agent.translate_to_english_with_dialect(
+                    text,
+                    detected_lang,
+                    detected_dialect
+                )
+                logger.info(f"Emergency translation succeeded: {detected_lang}-{detected_dialect} → en")
+                return english_text
+            else:
+                # False alarm - text was English
+                return text
+
+        except Exception as e:
+            logger.error(f"Emergency translation failed: {e}")
+            # Return original and hope for the best
+            return text
+
     async def process_message_with_log(
         self,
         session_id: str,
@@ -370,9 +469,12 @@ class BaseAgent(ABC):
 
         This is the main entry point for agent interaction.
 
+        IMPORTANT: This method expects user_message to be in ENGLISH.
+        Translation should happen at the orchestrator level before calling this method.
+
         Args:
             session_id: Session identifier
-            user_message: User's input message
+            user_message: User's input message (expected to be English)
 
         Returns:
             Agent's response message
@@ -381,8 +483,17 @@ class BaseAgent(ABC):
         llm_calls = []
         tool_executions = []
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
-        
+
         try:
+            # [NEW] Translation barrier validation
+            # Check if message is English (safety check)
+            if not self._is_likely_english(user_message):
+                logger.warning(
+                    f"Non-English message detected in {self.agent_name} agent: {user_message[:50]}..."
+                )
+                # Attempt emergency translation
+                user_message = await self._emergency_translate(session_id, user_message)
+
             # Initialize conversation history if needed
             if session_id not in self.conversation_history:
                 self.conversation_history[session_id] = []

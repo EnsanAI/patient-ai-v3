@@ -12,6 +12,7 @@ Coordinates:
 import logging
 import time
 from contextlib import nullcontext
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from patient_ai_service.core import (
@@ -25,7 +26,7 @@ from patient_ai_service.core.conversation_memory import get_conversation_memory_
 from patient_ai_service.core.observability import get_observability_logger, clear_observability_logger
 from patient_ai_service.models.messages import Topics, ChatResponse
 from patient_ai_service.models.enums import UrgencyLevel
-from patient_ai_service.models.validation import ExecutionLog
+from patient_ai_service.models.validation import ExecutionLog, ValidationResult
 from patient_ai_service.agents import (
     AppointmentManagerAgent,
     MedicalInquiryAgent,
@@ -129,18 +130,73 @@ class Orchestrator:
             # Step 2: Translation (input)
             with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
                 translation_agent = self.agents["translation"]
-                english_message, detected_lang = await translation_agent.process_input(
+
+                # Detect language and dialect
+                detected_lang, detected_dialect = await translation_agent.detect_language_and_dialect(message)
+
+                # Get current language context
+                global_state = self.state_manager.get_global_state(session_id)
+                language_context = global_state.language_context
+
+                # Check if language switched
+                if language_context.current_language != detected_lang:
+                    logger.info(
+                        f"Language switch detected: {language_context.get_full_language_code()} "
+                        f"→ {detected_lang}-{detected_dialect or 'unknown'}"
+                    )
+                    language_context.record_language_switch(
+                        detected_lang,
+                        detected_dialect,
+                        language_context.turn_count
+                    )
+                else:
+                    # Update current dialect if detected
+                    language_context.current_language = detected_lang
+                    language_context.current_dialect = detected_dialect
+                    language_context.last_detected_at = datetime.utcnow()
+
+                language_context.turn_count += 1
+
+                # Translate to English if needed
+                if detected_lang != "en":
+                    english_message = await translation_agent.translate_to_english_with_dialect(
+                        message,
+                        detected_lang,
+                        detected_dialect
+                    )
+                else:
+                    english_message = message
+
+                # Validate translation succeeded
+                if not english_message or len(english_message.strip()) == 0:
+                    logger.error(f"Translation failed for session {session_id}")
+                    language_context.translation_failures += 1
+                    language_context.last_translation_error = "Empty translation result"
+                    english_message = message  # Fallback to original
+
+                # Update global state with new language context
+                self.state_manager.update_global_state(
                     session_id,
-                    message
+                    language_context=language_context
                 )
+
+                logger.info(
+                    f"Language: {language_context.get_full_language_code()} | "
+                    f"Message: '{message[:50]}...' → '{english_message[:50]}...'"
+                )
+
                 if obs_logger:
                     obs_logger.record_pipeline_step(
                         2, "translation_input", "translation",
                         inputs={"message": message[:100]},
-                        outputs={"english_message": english_message[:100], "detected_lang": detected_lang}
+                        outputs={
+                            "english_message": english_message[:100],
+                            "detected_lang": detected_lang,
+                            "detected_dialect": detected_dialect
+                        }
                     )
 
-            logger.info(f"Detected language: {detected_lang}")
+            logger.info(f"Detected language: {language_context.get_full_language_code()}")
 
             # Step 3: Add user message to conversation memory
             with obs_logger.pipeline_step(3, "add_to_memory", "memory_manager", {"message": english_message[:100]}) if obs_logger else nullcontext():
@@ -180,6 +236,27 @@ class Orchestrator:
                 f"urgency={reasoning.routing.urgency}, "
                 f"sentiment={reasoning.understanding.sentiment}"
             )
+            
+            # Print reasoning output summary in orchestrator
+            import json
+            logger.info("=" * 80)
+            logger.info("ORCHESTRATOR: Reasoning Output Received")
+            logger.info("=" * 80)
+            logger.info(f"Session: {session_id}")
+            logger.info(f"User Message: {english_message[:200]}...")
+            logger.info(f"Routing Decision: {reasoning.routing.agent} -> {reasoning.routing.action} (urgency: {reasoning.routing.urgency})")
+            logger.info(f"Understanding: {reasoning.understanding.what_user_means}")
+            logger.info(f"Sentiment: {reasoning.understanding.sentiment}, Continuation: {reasoning.understanding.is_continuation}")
+            logger.info(f"Memory Updates:")
+            logger.info(f"  - system_action: {reasoning.memory_updates.system_action or '(empty)'}")
+            logger.info(f"  - awaiting: {reasoning.memory_updates.awaiting or '(empty)'}")
+            if reasoning.memory_updates.new_facts:
+                logger.info(f"  - new_facts: {json.dumps(reasoning.memory_updates.new_facts, indent=2)}")
+            if reasoning.response_guidance.minimal_context:
+                logger.info(f"Response Guidance: {json.dumps(reasoning.response_guidance.minimal_context, indent=2)}")
+            if reasoning.response_guidance.plan:
+                logger.info(f"Agent Plan: {reasoning.response_guidance.plan}")
+            logger.info("=" * 80)
 
             # Step 5: Handle conversation restart if detected
             if reasoning.understanding.is_conversation_restart:
@@ -255,34 +332,47 @@ class Orchestrator:
                             f"(monitoring for potential issues)"
                         )
 
-            # Step 8: Validate response (CLOSED-LOOP)
-            with obs_logger.pipeline_step(9, "validation", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
-                validation = await self.reasoning_engine.validate_response(
-                    session_id=session_id,
-                    original_reasoning=reasoning,
-                    agent_response=english_response,
-                    execution_log=execution_log
-                )
-                if obs_logger:
-                    obs_logger.record_pipeline_step(
-                        9, "validation", "reasoning_engine",
-                        inputs={"response_preview": english_response[:100]},
-                        outputs={
-                            "is_valid": validation.is_valid,
-                            "decision": validation.decision,
-                            "confidence": validation.confidence
-                        }
+            # Step 8: Validate response (CLOSED-LOOP) - ONLY IF ENABLED
+
+            if config_settings.enable_validation:
+                with obs_logger.pipeline_step(9, "validation", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                    validation = await self.reasoning_engine.validate_response(
+                        session_id=session_id,
+                        original_reasoning=reasoning,
+                        agent_response=english_response,
+                        execution_log=execution_log
                     )
+                    if obs_logger:
+                        obs_logger.record_pipeline_step(
+                            9, "validation", "reasoning_engine",
+                            inputs={"response_preview": english_response[:100]},
+                            outputs={
+                                "is_valid": validation.is_valid,
+                                "decision": validation.decision,
+                                "confidence": validation.confidence
+                            }
+                        )
 
-            logger.info(f"Validation result: valid={validation.is_valid}, "
-                       f"decision={validation.decision}, "
-                       f"confidence={validation.confidence}")
+                logger.info(f"Validation result: valid={validation.is_valid}, "
+                           f"decision={validation.decision}, "
+                           f"confidence={validation.confidence}")
+            else:
+                # Validation disabled - create a pass-through validation result
+                logger.info("Validation layer DISABLED - skipping validation")
+                validation = ValidationResult(
+                    is_valid=True,
+                    confidence=1.0,
+                    decision="send",
+                    issues=[],
+                    reasoning=["Validation layer disabled in config"]
+                )
 
-            # Step 9: Handle validation result (retry loop)
-            max_retries = 1  # Single retry to minimize latency
+            # Step 9: Handle validation result (retry loop) - ONLY IF VALIDATION ENABLED
+
+            max_retries = config_settings.validation_max_retries if config_settings.enable_validation else 0
             retry_count = 0
 
-            while not validation.is_valid and retry_count < max_retries:
+            while not validation.is_valid and retry_count < max_retries and config_settings.enable_validation:
                 if validation.decision == "retry":
                     # Store tool count before retry for validation
                     tools_before_retry = len(execution_log.tools_used)
@@ -334,8 +424,8 @@ class Orchestrator:
                 else:
                     break
 
-            # LAYER 2: Finalization (final quality check)
-            if getattr(config_settings, 'enable_finalization', True):
+            # LAYER 2: Finalization (final quality check) - ONLY IF ENABLED
+            if config_settings.enable_finalization:
                 with obs_logger.pipeline_step(11, "finalization", "reasoning_engine", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                     finalization = await self.reasoning_engine.finalize_response(
                         session_id=session_id,
@@ -369,23 +459,26 @@ class Orchestrator:
                 else:
                     logger.info("Finalization approved agent's response")
             else:
-                # Finalization disabled - use validation fallback if needed
+                # Finalization disabled - skip
+                logger.info("Finalization layer DISABLED - using agent response as-is")
                 finalization = None
-                if not validation.is_valid and validation.confidence < 0.5:
-                    logger.error(f"Validation failed after retries: {validation.issues}")
-                    english_response = self._get_validation_fallback(validation.issues)
 
             # Step 12: Add assistant response to conversation memory
             with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                 self.memory_manager.add_assistant_turn(session_id, english_response)
 
             # Step 13: Translation (output)
-            if detected_lang != "en":
+            # Get current language context for translation
+            language_context = global_state.language_context
+
+            if language_context.current_language != "en":
                 with obs_logger.pipeline_step(13, "translation_output", "translation", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                    # process_output now uses dialect-aware translation internally
                     translated_response = await translation_agent.process_output(
                         session_id,
                         english_response
                     )
+                    logger.info(f"Translated response to {language_context.get_full_language_code()}")
             else:
                 translated_response = english_response
 
@@ -394,13 +487,19 @@ class Orchestrator:
                 response = ChatResponse(
                     response=translated_response,
                     session_id=session_id,
-                    detected_language=detected_lang,
+                    detected_language=language_context.get_full_language_code(),
                     intent=reasoning.understanding.what_user_means,
                     urgency=reasoning.routing.urgency,
                     metadata={
                         "agent": agent_name,
                         "sentiment": reasoning.understanding.sentiment,
                         "reasoning_summary": reasoning.reasoning_chain[0] if reasoning.reasoning_chain else "",
+                        "language_context": {
+                            "language": language_context.current_language,
+                            "dialect": language_context.current_dialect,
+                            "full_code": language_context.get_full_language_code(),
+                            "switched": len(language_context.language_history) > 0
+                        },
                         "validation": {
                             "passed": validation.is_valid,
                             "retries": retry_count,

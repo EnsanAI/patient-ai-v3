@@ -394,18 +394,20 @@ async def websocket_endpoint(websocket: WebSocket):
         "data": {...}
     }
     """
+    import asyncio
+    
     await websocket.accept()
     session_id: str = None
 
     try:
-        # Try to get session_id from query parameters
+        # Get session_id from query parameters
         query_params = dict(websocket.query_params)
         session_id = query_params.get("session_id")
         
         if session_id:
-            # Register session immediately on connection
             websocket_connections[session_id] = websocket
-            logger.info(f"WebSocket connection established with session_id from query: {session_id}")
+            logger.info(f"WebSocket connection established: {session_id}")
+            
             # Send registration confirmation
             await websocket.send_json({
                 "type": "registered",
@@ -413,90 +415,103 @@ async def websocket_endpoint(websocket: WebSocket):
                 "message": "Session registered successfully"
             })
         else:
-            logger.info("WebSocket connection established (no session_id in query)")
+            logger.info("WebSocket connection established (no session_id)")
 
+        # Keep connection alive with proper timeout handling
         while True:
-            # Receive message
-            data = await websocket.receive_json()
-
-            message_type = data.get("type")
-            content = data.get("content")
-            
-            # Get session_id from message if not already set
-            message_session_id = data.get("session_id")
-            if message_session_id:
-                session_id = message_session_id
-                # Store connection when session_id is provided in message
-                websocket_connections[session_id] = websocket
-
-            if not session_id:
-                await websocket.send_json({
-                    "type": "error",
-                    "content": "session_id required"
-                })
-                continue
-
-            if message_type == "register":
-                # Handle explicit registration message
-                websocket_connections[session_id] = websocket
-                logger.info(f"Session registered via register message: {session_id}")
-                await websocket.send_json({
-                    "type": "registered",
-                    "session_id": session_id,
-                    "message": "Session registered successfully"
-                })
-                continue
-
-            if message_type == "message":
-                # Send typing indicator
-                await websocket.send_json({
-                    "type": "typing",
-                    "session_id": session_id,
-                    "is_typing": True
-                })
-
-                # Process message
-                response = await orchestrator.process_message(
-                    session_id=session_id,
-                    message=content,
-                    language=data.get("language")
+            try:
+                # Wait for message with timeout
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=300.0  # 5 minute timeout for idle connections
                 )
 
-                # Send response
-                await websocket.send_json({
-                    "type": "response",
-                    "session_id": session_id,
-                    "content": response.response,
-                    "data": {
-                        "intent": response.intent,
-                        "urgency": response.urgency,
-                        "detected_language": response.detected_language,
-                        "metadata": response.metadata
-                    }
-                })
+                message_type = data.get("type")
+                content = data.get("content")
+                message_session_id = data.get("session_id")
+                
+                if message_session_id:
+                    session_id = message_session_id
+                    websocket_connections[session_id] = websocket
 
-                # Stop typing
-                await websocket.send_json({
-                    "type": "typing",
-                    "session_id": session_id,
-                    "is_typing": False
-                })
+                if not session_id:
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": "session_id required"
+                    })
+                    continue
 
-            elif message_type == "ping":
-                # Heartbeat
-                await websocket.send_json({
-                    "type": "pong",
-                    "session_id": session_id
-                })
+                if message_type == "register":
+                    websocket_connections[session_id] = websocket
+                    logger.info(f"Session registered: {session_id}")
+                    await websocket.send_json({
+                        "type": "registered",
+                        "session_id": session_id,
+                        "message": "Session registered successfully"
+                    })
+                    continue
 
-            else:
-                logger.warning(f"Unknown message type: {message_type}")
+                if message_type == "message":
+                    # Send typing indicator
+                    await websocket.send_json({
+                        "type": "typing",
+                        "session_id": session_id,
+                        "is_typing": True
+                    })
+
+                    try:
+                        # Process message with extended timeout
+                        response = await asyncio.wait_for(
+                            orchestrator.process_message(
+                                session_id=session_id,
+                                message=content,
+                                language=data.get("language")
+                            ),
+                            timeout=90.0  # 90 second timeout for processing
+                        )
+
+                        # Send response
+                        await websocket.send_json({
+                            "type": "response",
+                            "session_id": session_id,
+                            "content": response.response,
+                            "data": {
+                                "intent": response.intent,
+                                "urgency": response.urgency,
+                                "detected_language": response.detected_language,
+                                "metadata": response.metadata
+                            }
+                        })
+                    except asyncio.TimeoutError:
+                        await websocket.send_json({
+                            "type": "error",
+                            "session_id": session_id,
+                            "content": "Request timeout. Please try again with a shorter message."
+                        })
+                    finally:
+                        # Stop typing
+                        await websocket.send_json({
+                            "type": "typing",
+                            "session_id": session_id,
+                            "is_typing": False
+                        })
+
+                elif message_type == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "session_id": session_id
+                    })
+
+                else:
+                    logger.warning(f"Unknown message type: {message_type}")
+
+            except asyncio.TimeoutError:
+                # Idle timeout - close connection gracefully
+                logger.info(f"WebSocket idle timeout: {session_id}")
+                break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {session_id}")
-        if session_id and session_id in websocket_connections:
-            del websocket_connections[session_id]
-
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
         try:
@@ -507,9 +522,14 @@ async def websocket_endpoint(websocket: WebSocket):
             })
         except:
             pass
-        finally:
-            if session_id and session_id in websocket_connections:
-                del websocket_connections[session_id]
+    finally:
+        if session_id and session_id in websocket_connections:
+            del websocket_connections[session_id]
+        # Close with proper code (1000 = normal closure)
+        try:
+            await websocket.close(code=1000)
+        except:
+            pass
 
 
 # ============================================================================

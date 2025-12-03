@@ -58,7 +58,7 @@ class Settings(BaseSettings):
 
     # Validation (Closed-Loop)
     enable_validation: bool = Field(
-        default=True,
+        default=False,  # DISABLED: Causes hallucinations and loops
         description="Enable closed-loop validation of agent responses"
     )
     validation_max_retries: int = Field(
@@ -76,7 +76,7 @@ class Settings(BaseSettings):
 
     # Finalization (Two-Layer Quality Control)
     enable_finalization: bool = Field(
-        default=True,
+        default=False,  # DISABLED: Causes hallucinations and loops
         description="Enable finalization layer (final quality check before sending)"
     )
     finalization_temperature: float = Field(
