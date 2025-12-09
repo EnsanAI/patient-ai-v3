@@ -1275,7 +1275,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "success": False,
                     "result_type": ToolResultType.RECOVERABLE.value,
                     "error": "Invalid doctor_id format",
-                    "error_message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID.",
+                    "error_message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use list_doctors first to get the correct doctor ID.",
                     "recovery_action": "list_doctors",
                     "suggested_response": "I couldn't find that doctor. Let me show you our available doctors."
                 }
@@ -1316,7 +1316,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                         "alternatives": [],
                         "next_available_date": next_date,
                         "blocks_criteria": "appointment booked",
-                        "suggested_response": f"Dr. {doctor_id} is fully booked on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
+                        "suggested_response": f"Dr. {doctor_id} is not available on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
                     }
                 else:
                     return {
@@ -1430,7 +1430,6 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "success": False,
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
-                "should_retry": True
             }
 
     async def _execute_booking_workflow(
@@ -1970,7 +1969,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     # Time conflict or slot unavailable
                     elif 'TIME_CONFLICT' in error_code or 'SLOT_CONFLICT' in error_code or 'TIME_NO_LONGER_AVAILABLE' in error_code or 'conflict' in error.lower() or 'unavailable' in error.lower():
                         result['result_type'] = ToolResultType.USER_INPUT_NEEDED.value
-                        result['blocks_criteria'] = f"{reason or 'appointment'} booked"
+                        result['suggested_response'] = "'m sorry, that time was just taken. What other time would work do you?"
                         # Try to get alternatives if not already present
                         if 'alternatives' not in result:
                             try:
@@ -2526,7 +2525,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "success": False,
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
-                "should_retry": True
+                "should_retry": True,
+                "message": "system error"
             }
 
     def tool_cancel_appointment(
@@ -2550,9 +2550,22 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             appointment = None
             try:
                 appointment = self.db_client.get_appointment_by_id(appointment_id)
-            except:
-                appointment = None
-
+            except Exception as e:
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": str(e),
+                    "error_message": f"Error retrieving appointment {appointment_id}: {e}",
+                    "should_retry": True,
+                    "message": "system error while fetching appointment"
+                }
+                logger.error(f"Error fetching appointment: {e}", exc_info=True)
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
+                
             if appointment is None:
                 duration_ms = (time_module.time() - start_time) * 1000
                 output = {
@@ -2648,6 +2661,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "success": False,
                     "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "cancellation_failed",
+                    "recovery_action": "tool_cancel_appointment",
                     "should_retry": True,
                     "message": "Failed to cancel appointment"
                 }

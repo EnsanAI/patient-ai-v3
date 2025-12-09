@@ -165,6 +165,10 @@ class ExecutionContext:
         self.retry_count: int = 0
         self.max_retries: int = 2
         
+        # Recovery tracking
+        self.recovery_attempts: Dict[str, Dict[str, Any]] = {}  # Key: error_signature, Value: recovery info
+        self.recovery_executed: bool = False  # Track if we're currently executing a recovery
+        
         # Metrics
         self.tool_calls: int = 0
         self.llm_calls: int = 0
@@ -660,9 +664,100 @@ class BaseAgent(ABC):
                 )
                 
                 if override:
+                    # Handle EXECUTE_RECOVERY immediately (don't wait for next iteration)
+                    if override == AgentDecision.EXECUTE_RECOVERY:
+                        # Find the most recent recovery attempt
+                        recovery_info = None
+                        for sig, info in exec_context.recovery_attempts.items():
+                            if info.get("attempted"):
+                                if not recovery_info or info.get("iteration", 0) > recovery_info.get("iteration", 0):
+                                    recovery_info = info
+                        
+                        if recovery_info and recovery_info.get("recovery_action"):
+                            recovery_tool = recovery_info["recovery_action"]
+                            recovery_message = recovery_info.get("recovery_message")
+                            
+                            logger.info(
+                                f"[{self.agent_name}] 🔧 Executing recovery action: {recovery_tool}"
+                                + (f" ({recovery_message})" if recovery_message else "")
+                            )
+                            
+                            # Execute recovery tool
+                            recovery_input = {"session_id": session_id}
+                            recovery_result = await self._execute_tool(recovery_tool, recovery_input, execution_log)
+                            
+                            logger.info(
+                                f"[{self.agent_name}] Recovery result: "
+                                f"success={recovery_result.get('success')}, "
+                                f"result_type={recovery_result.get('result_type')}"
+                            )
+                            
+                            # Process recovery result - may override again
+                            recovery_override = await self._process_tool_result(
+                                session_id, recovery_tool, recovery_result, exec_context
+                            )
+                            
+                            if recovery_override:
+                                response = self._handle_override(recovery_override, exec_context)
+                                if response:
+                                    return response, execution_log
+                            
+                            # Recovery executed, continue loop
+                            exec_context.recovery_executed = False
+                            continue
+                    
+                    # Handle other overrides normally
                     response = self._handle_override(override, exec_context)
                     if response:
                         return response, execution_log
+            
+            elif thinking.decision == AgentDecision.EXECUTE_RECOVERY:
+                # Execute recovery action automatically
+                # Find the most recent recovery attempt
+                recovery_info = None
+                for sig, info in exec_context.recovery_attempts.items():
+                    if info.get("attempted"):
+                        if not recovery_info or info.get("iteration", 0) > recovery_info.get("iteration", 0):
+                            recovery_info = info
+                
+                if recovery_info and recovery_info.get("recovery_action"):
+                    recovery_tool = recovery_info["recovery_action"]
+                    recovery_message = recovery_info.get("recovery_message")
+                    
+                    logger.info(
+                        f"[{self.agent_name}] 🔧 Executing recovery action: {recovery_tool}"
+                        + (f" ({recovery_message})" if recovery_message else "")
+                    )
+                    
+                    # Execute recovery tool with session_id
+                    recovery_input = {"session_id": session_id}
+                    # Could pass original error context if needed in future
+                    
+                    recovery_result = await self._execute_tool(recovery_tool, recovery_input, execution_log)
+                    
+                    logger.info(
+                        f"[{self.agent_name}] Recovery result: "
+                        f"success={recovery_result.get('success')}, "
+                        f"result_type={recovery_result.get('result_type')}"
+                    )
+                    
+                    # Process recovery result - may override next action
+                    override = await self._process_tool_result(
+                        session_id, recovery_tool, recovery_result, exec_context
+                    )
+                    
+                    if override:
+                        response = self._handle_override(override, exec_context)
+                        if response:
+                            return response, execution_log
+                    
+                    # Recovery executed, continue loop to see if it helped
+                    exec_context.recovery_executed = False  # Reset flag
+                    continue
+                else:
+                    # No recovery info found - shouldn't happen, but fallback to continue
+                    logger.warning(f"[{self.agent_name}] EXECUTE_RECOVERY but no recovery_info found")
+                    continue
             
             elif thinking.decision == AgentDecision.RESPOND:
                 # Agent wants to respond - verify completion first
@@ -723,7 +818,10 @@ class BaseAgent(ABC):
             
             elif thinking.decision == AgentDecision.RETRY:
                 logger.info(f"[{self.agent_name}] Retrying last action")
-                exec_context.retry_count += 1
+                # Don't increment if we just executed recovery (recovery has its own tracking)
+                if not exec_context.recovery_executed:
+                    exec_context.retry_count += 1
+                exec_context.recovery_executed = False  # Reset flag
                 continue
         
         # =====================================================================
@@ -1895,7 +1993,8 @@ DECISION RULES:
                 "RESPOND_COMPLETE": AgentDecision.RESPOND_COMPLETE,
                 "RESPOND_IMPOSSIBLE": AgentDecision.RESPOND_IMPOSSIBLE,
                 "CLARIFY": AgentDecision.CLARIFY,
-                "RETRY": AgentDecision.RETRY
+                "RETRY": AgentDecision.RETRY,
+                "EXECUTE_RECOVERY": AgentDecision.EXECUTE_RECOVERY
             }
             decision = decision_map.get(decision_str, AgentDecision.RESPOND)
             
@@ -1989,6 +2088,19 @@ DECISION RULES:
             return ToolResultType.PARTIAL.value
         
         return ToolResultType.PARTIAL.value  # Default
+
+    def _create_error_signature(self, tool_name: str, error: str) -> str:
+        """Create normalized error signature for tracking recovery attempts."""
+        import re
+        # Normalize error: take first 100 chars, lowercase, remove variable parts
+        normalized = str(error)[:100].lower().strip()
+        # Remove UUIDs
+        normalized = re.sub(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', '<uuid>', normalized)
+        # Remove dates
+        normalized = re.sub(r'\d{4}-\d{2}-\d{2}', '<date>', normalized)
+        # Remove timestamps
+        normalized = re.sub(r'\d{2}:\d{2}:\d{2}', '<time>', normalized)
+        return f"{tool_name}:{normalized}"
 
     # ==================== NEW AGENTIC EXECUTION METHODS ====================
 
@@ -2252,10 +2364,50 @@ DECISION RULES:
             return AgentDecision.RESPOND_IMPOSSIBLE
         
         elif result_type == ToolResultType.SYSTEM_ERROR:
-            if exec_context.retry_count < exec_context.max_retries:
+            # Check if recovery_action is provided
+            recovery_action = tool_result.get("recovery_action")
+            recovery_message = tool_result.get("recovery_message")
+            error_msg = tool_result.get("error", "")
+            
+            # Create error signature for tracking
+            error_signature = self._create_error_signature(tool_name, error_msg)
+            
+            # Check if we've already tried recovery for this error
+            recovery_info = exec_context.recovery_attempts.get(error_signature)
+            has_tried_recovery = recovery_info and recovery_info.get("attempted", False)
+            
+            if recovery_action and not has_tried_recovery:
+                # First time seeing this error with recovery_action - try recovery
+                exec_context.recovery_attempts[error_signature] = {
+                    "attempted": True,
+                    "recovery_action": recovery_action,
+                    "recovery_message": recovery_message,
+                    "original_tool": tool_name,
+                    "original_error": error_msg,
+                    "iteration": exec_context.iteration
+                }
+                exec_context.recovery_executed = True
+                logger.info(
+                    f"System error detected with recovery_action. Will execute: {recovery_action} "
+                    f"(error_signature: {error_signature[:50]}...)"
+                )
+                return AgentDecision.EXECUTE_RECOVERY
+            
+            elif has_tried_recovery:
+                # Same error after recovery attempt - give up immediately
+                logger.error(
+                    f"System error persisted after recovery attempt. "
+                    f"Error: {error_signature[:50]}... Recovery: {recovery_info.get('recovery_action')}"
+                )
+                exec_context.fatal_error = tool_result
+                return AgentDecision.RESPOND_IMPOSSIBLE
+            
+            elif exec_context.retry_count < exec_context.max_retries:
+                # No recovery_action, use standard retry logic
                 logger.info(f"System error, will retry ({exec_context.retry_count + 1}/{exec_context.max_retries})")
                 return AgentDecision.RETRY
             else:
+                # Max retries exceeded
                 logger.error(f"System error after max retries")
                 exec_context.fatal_error = tool_result
                 return AgentDecision.RESPOND_IMPOSSIBLE
@@ -2277,6 +2429,9 @@ DECISION RULES:
         
         elif override == AgentDecision.RETRY:
             return None  # Continue loop
+        
+        elif override == AgentDecision.EXECUTE_RECOVERY:
+            return None  # Continue loop (handled in main loop)
         
         return None
 
