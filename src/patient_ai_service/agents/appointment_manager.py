@@ -599,7 +599,6 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         """Get list of available doctors."""
         import time as time_module
         start_time = time_module.time()
-        
         logger.info("=" * 80)
         logger.info("APPOINTMENT_MANAGER: tool_list_doctors() CALLED")
         logger.info("=" * 80)
@@ -652,25 +651,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     if search_name_lower in full_name:
                         matching_doctors.append(doc)
                 doctors = matching_doctors
-                
-                if not doctors:
-                    # Name search failed - suggest listing all
-                    duration_ms = (time_module.time() - start_time) * 1000
-                    logger.info(f"Output: No doctor found matching '{search_name}'")
-                    logger.info(f"Time taken: {duration_ms:.2f}ms")
-                    logger.info("=" * 80)
-                    return {
-                        "success": True,  # Query succeeded, just no results
-                        "result_type": ToolResultType.RECOVERABLE.value,
-                        "doctors": [],
-                        "count": 0,
-                        "error": f"No doctor found matching '{search_name}'",
-                        "recovery_action": "list_doctors",  # Call without search
-                        "recovery_message": "Try listing all doctors instead",
-                        "suggested_response": f"I couldn't find a doctor named '{search_name}'. Let me show you our available doctors."
-                    }
 
-            # Format doctor list
+            # Format filtered doctor list
             doctor_list = []
             for doc in doctors:
                 doctor_list.append({
@@ -680,6 +662,24 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "languages": doc.get("languages", ["en"]),
                     "next_available": doc.get("next_available")  # If available from DB
                 })
+
+            # Check if filtering resulted in no doctors AND there was a search parameter
+            if len(doctor_list) == 0 and (search_name or specialty):
+                duration_ms = (time_module.time() - start_time) * 1000
+                error_msg = f"No doctor found matching '{search_name}'" if search_name else f"No doctors found in specialty '{specialty}'"
+                logger.info(f"Output: {error_msg}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return {
+                    "success": True,  # Query succeeded, just no results
+                    "result_type": ToolResultType.RECOVERABLE.value,
+                    "doctors": [],
+                    "count": 0,
+                    "error": error_msg,
+                    "recovery_action": "list_doctors",  # Call without search
+                    "recovery_message": "Try listing all doctors instead without search only using session_id",
+                    "suggested_response": f"I couldn't find a doctor matching your search. Let me show you our available doctors." if search_name else f"I couldn't find any doctors in that specialty. Let me show you our available doctors."
+                }
 
             duration_ms = (time_module.time() - start_time) * 1000
             result = {
@@ -1275,7 +1275,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "success": False,
                     "result_type": ToolResultType.RECOVERABLE.value,
                     "error": "Invalid doctor_id format",
-                    "error_message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use find_doctor_by_name first to get the correct doctor ID.",
+                    "error_message": f"doctor_id must be a UUID, not a name. Got: {doctor_id}. Please use list_doctors first to get the correct doctor ID.",
                     "recovery_action": "list_doctors",
                     "suggested_response": "I couldn't find that doctor. Let me show you our available doctors."
                 }
@@ -1316,7 +1316,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                         "alternatives": [],
                         "next_available_date": next_date,
                         "blocks_criteria": "appointment booked",
-                        "suggested_response": f"Dr. {doctor_id} is fully booked on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
+                        "suggested_response": f"Dr. {doctor_id} is not available on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
                     }
                 else:
                     return {
@@ -1430,7 +1430,6 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "success": False,
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
-                "should_retry": True
             }
 
     async def _execute_booking_workflow(
@@ -1515,6 +1514,17 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                 except:
                                     alternatives = []
                                 
+                                # Extract doctor name from nested doctor object
+                                doctor_name_conflict = None
+                                if existing.get("doctor_name"):
+                                    doctor_name_conflict = existing.get("doctor_name")
+                                elif isinstance(existing.get("doctor"), dict):
+                                    doctor = existing.get("doctor", {})
+                                    title = doctor.get("title", "Dr.")
+                                    first_name = doctor.get("first_name", "")
+                                    last_name = doctor.get("last_name", "")
+                                    doctor_name_conflict = f"{title} {first_name} {last_name}".strip() if (first_name or last_name) else None
+                                
                                 return {
                                     "success": False,
                                     "result_type": ToolResultType.USER_INPUT_NEEDED.value,
@@ -1523,7 +1533,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                     "error_message": f"You already have an appointment at {time}",
                                     "conflicting_appointment": {
                                         "id": existing.get("id"),
-                                        "doctor": existing.get("doctor_name") or existing.get("doctor", {}).get("name") if isinstance(existing.get("doctor"), dict) else None,
+                                        "doctor": doctor_name_conflict,
                                         "time": existing_time_normalized,
                                         "reason": existing.get("reason")
                                     },
@@ -1943,7 +1953,18 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 if 'result_type' not in result:
                     appointment_id = result.get('appointment_id')
                     appointment = result.get('appointment', {})
-                    doctor_name = appointment.get('doctor_name') or f"Dr. {appointment.get('doctor', {}).get('last_name', '')}" if isinstance(appointment, dict) else "Dr. [name]"
+                    # Extract doctor name from nested doctor object
+                    doctor_name = None
+                    if appointment.get('doctor_name'):
+                        doctor_name = appointment.get('doctor_name')
+                    elif isinstance(appointment.get('doctor'), dict):
+                        doctor = appointment.get('doctor', {})
+                        title = doctor.get("title", "Dr.")
+                        first_name = doctor.get("first_name", "")
+                        last_name = doctor.get("last_name", "")
+                        doctor_name = f"{title} {first_name} {last_name}".strip() if (first_name or last_name) else "Dr. [name]"
+                    else:
+                        doctor_name = "Dr. [name]"
                     procedure_str = reason or "appointment"
                     
                     result['result_type'] = ToolResultType.SUCCESS.value
@@ -1970,7 +1991,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     # Time conflict or slot unavailable
                     elif 'TIME_CONFLICT' in error_code or 'SLOT_CONFLICT' in error_code or 'TIME_NO_LONGER_AVAILABLE' in error_code or 'conflict' in error.lower() or 'unavailable' in error.lower():
                         result['result_type'] = ToolResultType.USER_INPUT_NEEDED.value
-                        result['blocks_criteria'] = f"{reason or 'appointment'} booked"
+                        result['suggested_response'] = "I'm sorry, that time was just taken. What other time would work do you?"
                         # Try to get alternatives if not already present
                         if 'alternatives' not in result:
                             try:
@@ -2482,11 +2503,22 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             # Format appointments
             formatted = []
             for apt in appointments:
+                # Extract doctor name from nested doctor object
+                doctor_name = None
+                if apt.get("doctor_name"):
+                    doctor_name = apt.get("doctor_name")
+                elif isinstance(apt.get("doctor"), dict):
+                    doctor = apt.get("doctor", {})
+                    title = doctor.get("title", "Dr.")
+                    first_name = doctor.get("first_name", "")
+                    last_name = doctor.get("last_name", "")
+                    doctor_name = f"{title} {first_name} {last_name}".strip() if (first_name or last_name) else None
+                
                 formatted.append({
                     "id": apt.get("id"),
                     "date": apt.get("date") or apt.get("appointment_date"),
                     "time": apt.get("time") or apt.get("start_time"),
-                    "doctor_name": apt.get("doctor_name") or (apt.get("doctor", {}).get("name") if isinstance(apt.get("doctor"), dict) else None),
+                    "doctor_name": doctor_name,
                     "reason": apt.get("reason"),
                     "status": apt.get("status")
                 })
@@ -2526,7 +2558,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "success": False,
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
-                "should_retry": True
+                "should_retry": True,
+                "message": "system error"
             }
 
     def tool_cancel_appointment(
@@ -2550,9 +2583,22 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             appointment = None
             try:
                 appointment = self.db_client.get_appointment_by_id(appointment_id)
-            except:
-                appointment = None
-
+            except Exception as e:
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": str(e),
+                    "error_message": f"Error retrieving appointment {appointment_id}: {e}",
+                    "should_retry": True,
+                    "message": "system error while fetching appointment"
+                }
+                logger.error(f"Error fetching appointment: {e}", exc_info=True)
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
+                
             if appointment is None:
                 duration_ms = (time_module.time() - start_time) * 1000
                 output = {
@@ -2575,11 +2621,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     duration_ms = (time_module.time() - start_time) * 1000
                     output = {
                         "success": True,
-                        "result_type": ToolResultType.SUCCESS.value,
                         "appointment_id": appointment_id,
                         "already_cancelled": True,
-                        "message": "This appointment was already cancelled",
-                        "suggested_response": "That appointment has already been cancelled. Is there anything else I can help with?"
+                        "message": "This 1 appointment was already cancelled",
                     }
                     logger.info(f"Output: {output}")
                     logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2648,6 +2692,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "success": False,
                     "result_type": ToolResultType.SYSTEM_ERROR.value,
                     "error": "cancellation_failed",
+                    "recovery_action": "tool_cancel_appointment",
                     "should_retry": True,
                     "message": "Failed to cancel appointment"
                 }

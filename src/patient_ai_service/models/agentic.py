@@ -57,6 +57,7 @@ class AgentDecision(str, Enum):
     RESPOND_WITH_OPTIONS = "respond_options"    # Present alternatives to user
     RESPOND_COMPLETE = "respond_complete"       # Task fully completed
     RESPOND_IMPOSSIBLE = "respond_impossible"   # Task cannot be done
+    EXECUTE_RECOVERY = "execute_recovery"       # Execute recovery_action automatically
 
 
 # =============================================================================

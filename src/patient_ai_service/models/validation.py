@@ -16,7 +16,7 @@ class ToolExecution(BaseModel):
     outputs: Dict[str, Any]
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     success: bool = True
-    duration_ms: Optional[float] = None
+    duration_seconds: Optional[float] = None  # Changed from duration_ms to duration_seconds
     error: Optional[str] = None
 
 

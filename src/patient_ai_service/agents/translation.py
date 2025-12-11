@@ -109,9 +109,136 @@ Language code:"""
             logger.error(f"Error detecting language: {e}")
             return "en"  # Default to English
 
+    async def detect_and_translate(self, text: str, session_id: Optional[str] = None) -> Tuple[str, str, Optional[str], bool]:
+        """
+        OPTIMIZED: Single LLM call for language detection AND translation.
+
+        This is the preferred method for the translation layer - combines detection
+        and translation into one fast call to reduce latency.
+
+        Args:
+            text: Input text to analyze and translate
+            session_id: Optional session ID for observability tracking
+
+        Returns:
+            Tuple of (english_text, language_code, dialect_code, translation_succeeded)
+            - english_text: Translated text (or original if already English)
+            - language_code: ISO 639-1 code (e.g., "ar", "en", "es")
+            - dialect_code: Region code (e.g., "EG", "SA", "MX") or None
+            - translation_succeeded: True if translation worked, False if fallback used
+        """
+        import json
+        import re
+        import time
+        from patient_ai_service.core.observability import get_observability_logger
+        from patient_ai_service.models.observability import TokenUsage
+
+        try:
+            prompt = f"""Analyze this text and perform detection + translation in ONE response.
+
+Text: "{text}"
+
+Tasks:
+1. Detect the language (ISO 639-1 code: en, ar, es, fr, hi, zh, pt, ru)
+2. Detect the regional dialect if identifiable (e.g., EG for Egyptian Arabic, SA for Gulf Arabic, MX for Mexican Spanish)
+3. If NOT English, translate to English while preserving medical/dental terminology
+
+Respond with ONLY a JSON object:
+{{
+    "language": "ISO 639-1 code",
+    "dialect": "region code or null",
+    "is_english": true/false,
+    "english_text": "the English translation OR original text if already English",
+    "confidence": "high/medium/low"
+}}
+
+Examples:
+- "I want to book an appointment" → {{"language": "en", "dialect": "US", "is_english": true, "english_text": "I want to book an appointment", "confidence": "high"}}
+- "عايز احجز ميعاد" → {{"language": "ar", "dialect": "EG", "is_english": false, "english_text": "I want to book an appointment", "confidence": "high"}}
+- "Quiero reservar una cita" → {{"language": "es", "dialect": "MX", "is_english": false, "english_text": "I want to book an appointment", "confidence": "high"}}
+
+Response:"""
+
+            # Track LLM call with token usage
+            llm_start_time = time.time()
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=self._get_system_prompt("detection_and_translation"),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=settings.translation_temperature
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=self._get_system_prompt("detection_and_translation"),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=settings.translation_temperature
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Record LLM call for observability
+            if session_id and settings.enable_observability:
+                obs_logger = get_observability_logger(session_id)
+                if obs_logger:
+                    obs_logger.record_llm_call(
+                        component="translation.detect_and_translate",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_seconds=llm_duration_seconds,
+                        system_prompt_length=len(self._get_system_prompt("detection_and_translation")),
+                        messages_count=1,
+                        temperature=settings.translation_temperature,
+                        max_tokens=settings.llm_max_tokens
+                    )
+
+            # Parse JSON response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                logger.error(f"No JSON found in detect_and_translate response: {response[:200]}")
+                return text, "en", None, False  # Fallback: assume English, mark as failed
+
+            result = json.loads(json_match.group())
+
+            language = result.get("language", "en")
+            dialect = result.get("dialect")
+            english_text = result.get("english_text", text)
+            is_english = result.get("is_english", True)
+
+            # Validate language is supported
+            if language not in self.SUPPORTED_LANGUAGES:
+                logger.warning(f"Unsupported language '{language}', defaulting to 'en'")
+                language = "en"
+                dialect = None
+                english_text = text
+
+            # Validate we got a translation if needed
+            if not is_english and (not english_text or english_text.strip() == ""):
+                logger.error(f"Translation returned empty for non-English text")
+                return text, language, dialect, False  # Return original, mark as failed
+
+            logger.info(
+                f"[FAST] Detected: {language}-{dialect or 'unknown'}, "
+                f"translated: {not is_english}, "
+                f"confidence: {result.get('confidence', 'unknown')}"
+            )
+
+            return english_text, language, dialect, True
+
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error in detect_and_translate: {e}")
+            return text, "en", None, False
+        except Exception as e:
+            logger.error(f"Error in detect_and_translate: {e}")
+            return text, "en", None, False  # Fallback: return original, mark as failed
+
     async def detect_language_and_dialect(self, text: str) -> Tuple[str, Optional[str]]:
         """
         Detect language AND dialect of input text.
+
+        NOTE: For better performance, consider using detect_and_translate() which
+        combines detection and translation into a single LLM call.
 
         Args:
             text: Input text to analyze
@@ -134,7 +261,7 @@ Respond with ONLY a JSON object in this format:
 
 Examples:
 - "I want to book an appointment" → {{"language": "en", "dialect": "US", "confidence": "high"}}
-- "أريد حجز موعد" (Egyptian accent) → {{"language": "ar", "dialect": "EG", "confidence": "medium"}}
+- "عايز احجز ميعاد" (Egyptian accent) → {{"language": "ar", "dialect": "EG", "confidence": "medium"}}
 - "Quiero reservar una cita" (Mexican) → {{"language": "es", "dialect": "MX", "confidence": "medium"}}
 - "مرحبا، كيف حالك؟" (Gulf accent) → {{"language": "ar", "dialect": "SA", "confidence": "medium"}}
 
@@ -310,7 +437,8 @@ Translation:"""
         self,
         text: str,
         target_lang: str,
-        target_dialect: Optional[str] = None
+        target_dialect: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> str:
         """
         Translate text from English to target language with dialect awareness.
@@ -319,6 +447,7 @@ Translation:"""
             text: English text to translate
             target_lang: Target language code
             target_dialect: Optional dialect code (e.g., "EG", "SA", "MX")
+            session_id: Optional session ID for observability tracking
 
         Returns:
             Translated text
@@ -327,6 +456,10 @@ Translation:"""
             return text  # Already English
 
         try:
+            import time
+            from patient_ai_service.core.observability import get_observability_logger
+            from patient_ai_service.models.observability import TokenUsage
+
             dialect_note = ""
             if target_dialect:
                 dialect_note = f" ({target_dialect} dialect)"
@@ -344,11 +477,39 @@ Text: "{text}"
 
 Translation:"""
 
-            response = self.llm_client.create_message(
-                system=self._get_system_prompt("translation"),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=settings.translation_temperature
-            )
+            # Track LLM call with token usage
+            llm_start_time = time.time()
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=self._get_system_prompt("translation"),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=settings.translation_temperature
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=self._get_system_prompt("translation"),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=settings.translation_temperature
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Record LLM call for observability
+            if session_id and settings.enable_observability:
+                obs_logger = get_observability_logger(session_id)
+                if obs_logger:
+                    obs_logger.record_llm_call(
+                        component="translation.translate_from_english",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_seconds=llm_duration_seconds,
+                        system_prompt_length=len(self._get_system_prompt("translation")),
+                        messages_count=1,
+                        temperature=settings.translation_temperature,
+                        max_tokens=settings.llm_max_tokens
+                    )
 
             translated = response.strip()
             logger.info(f"Translated from English to {target_lang}-{target_dialect or 'unknown'}")
@@ -433,7 +594,8 @@ Translation:"""
             translated = await self.translate_from_english_with_dialect(
                 message,
                 target_lang,
-                target_dialect
+                target_dialect,
+                session_id
             )
             return translated
         else:

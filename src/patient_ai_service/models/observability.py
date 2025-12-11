@@ -53,7 +53,7 @@ class LLMCall(BaseModel):
     max_tokens: Optional[int] = None
     tokens: TokenUsage = Field(default_factory=TokenUsage)
     cost: CostInfo = Field(default_factory=CostInfo)
-    duration_ms: float = 0.0
+    duration_seconds: float = 0.0  # Changed from duration_ms to duration_seconds
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     error: Optional[str] = None
 
@@ -63,7 +63,7 @@ class ToolExecutionDetail(BaseModel):
     tool_name: str
     inputs: Dict[str, Any]
     outputs: Dict[str, Any]
-    duration_ms: float
+    duration_seconds: float  # Changed from duration_ms to duration_seconds
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     success: bool = True
     error: Optional[str] = None
@@ -104,7 +104,7 @@ class PipelineStep(BaseModel):
     component: str  # "orchestrator", "translation", "reasoning", "agent", etc.
     inputs: Dict[str, Any] = Field(default_factory=dict)
     outputs: Dict[str, Any] = Field(default_factory=dict)
-    duration_ms: float = 0.0
+    duration_seconds: float = 0.0  # Changed from duration_ms to duration_seconds
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     error: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -118,7 +118,7 @@ class AgentExecutionDetails(BaseModel):
     tool_executions: List[ToolExecutionDetail] = Field(default_factory=list)
     total_tokens: TokenUsage = Field(default_factory=TokenUsage)
     total_cost: CostInfo = Field(default_factory=CostInfo)
-    duration_ms: float = 0.0
+    duration_seconds: float = 0.0  # Changed from duration_ms to duration_seconds
     response_preview: str = ""  # First 200 chars of response
 
 
@@ -156,7 +156,8 @@ class SessionObservability(BaseModel):
     finalization: Optional[FinalizationDetails] = None
     total_tokens: TokenUsage = Field(default_factory=TokenUsage)
     total_cost: CostInfo = Field(default_factory=CostInfo)
-    total_duration_ms: float = 0.0
+    total_duration_seconds: float = 0.0  # Changed from total_duration_ms to total_duration_seconds
+    accumulative_cost: Optional[CostInfo] = None  # Accumulative cost since service start
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -180,6 +181,17 @@ class SessionObservability(BaseModel):
                 "model": self.total_cost.model,
                 "provider": self.total_cost.provider
             },
-            "total_duration_ms": self.total_duration_ms
+            "total_duration_seconds": self.total_duration_seconds,
+            "accumulative_cost": {
+                "input_cost_usd": self.accumulative_cost.input_cost_usd if self.accumulative_cost else 0.0,
+                "output_cost_usd": self.accumulative_cost.output_cost_usd if self.accumulative_cost else 0.0,
+                "total_cost_usd": self.accumulative_cost.total_cost_usd if self.accumulative_cost else 0.0,
+                "model": self.accumulative_cost.model if self.accumulative_cost else "",
+                "provider": self.accumulative_cost.provider if self.accumulative_cost else ""
+            } if self.accumulative_cost else None
         }
+
+
+
+
 

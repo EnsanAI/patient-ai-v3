@@ -457,7 +457,7 @@ class ReasoningEngine:
                 )
                 tokens = TokenUsage()
 
-            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            llm_duration_seconds = time.time() - llm_start_time
 
             # Record LLM call
             if obs_logger:
@@ -466,7 +466,7 @@ class ReasoningEngine:
                     provider=settings.llm_provider.value,
                     model=settings.get_llm_model(),
                     tokens=tokens,
-                    duration_ms=llm_duration_ms,
+                    duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(self._get_system_prompt()),
                     messages_count=1,
                     temperature=reasoning_temp,
@@ -594,7 +594,94 @@ class ReasoningEngine:
 
         except Exception as e:
             logger.error(f"Error in reasoning engine: {e}", exc_info=True)
-            return self._fallback_reasoning(user_message, memory, patient_info or {})
+            # Use smart fallback with full context
+            return self._smart_fallback_reasoning(
+                user_message, 
+                memory, 
+                patient_info or {},
+                continuation_context=continuation_context,
+                continuation_detection=continuation_detection
+            )
+
+    def _extract_json_from_response(self, response: str) -> Optional[str]:
+        """
+        Extract JSON from LLM response using multiple strategies.
+        
+        Handles:
+        - Raw JSON
+        - JSON wrapped in markdown code blocks
+        - JSON with extra text before/after
+        - Multiple JSON objects (takes the first complete one)
+        """
+        if not response or not response.strip():
+            logger.warning("Empty response received from LLM")
+            return None
+        
+        # Strategy 1: Check if response is already clean JSON
+        stripped = response.strip()
+        if stripped.startswith('{') and stripped.endswith('}'):
+            return stripped
+        
+        # Strategy 2: Extract from markdown code blocks
+        # Pattern: ```json ... ``` or ``` ... ```
+        code_block_patterns = [
+            r'```json\s*\n?(.*?)\n?```',  # ```json ... ```
+            r'```\s*\n?(.*?)\n?```',       # ``` ... ```
+        ]
+        for pattern in code_block_patterns:
+            match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
+            if match:
+                extracted = match.group(1).strip()
+                if extracted.startswith('{'):
+                    logger.debug("Extracted JSON from markdown code block")
+                    return extracted
+        
+        # Strategy 3: Find JSON object boundaries
+        # Look for first { and matching last }
+        first_brace = response.find('{')
+        if first_brace == -1:
+            logger.warning("No opening brace found in response")
+            return None
+        
+        # Find the matching closing brace by counting
+        brace_count = 0
+        last_brace = -1
+        in_string = False
+        escape_next = False
+        
+        for i, char in enumerate(response[first_brace:], start=first_brace):
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    last_brace = i
+                    break
+        
+        if last_brace > first_brace:
+            extracted = response[first_brace:last_brace + 1]
+            logger.debug(f"Extracted JSON using brace matching (chars {first_brace}-{last_brace})")
+            return extracted
+        
+        # Strategy 4: Fallback to simple regex
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            logger.debug("Extracted JSON using simple regex fallback")
+            return json_match.group()
+        
+        logger.warning("Could not extract JSON from response")
+        return None
 
     def _get_system_prompt(self) -> str:
         """Get system prompt for reasoning engine."""
@@ -605,8 +692,13 @@ Your job is to THINK through each user message and understand:
 2. What they actually need
 3. How best to help them
 
-You analyze conversations holistically, reading between the lines to provide
-natural, context-aware assistance.
+CRITICAL JSON OUTPUT RULES:
+- You MUST output ONLY valid JSON - nothing else
+- NO comments (no // or # inside JSON)
+- NO trailing commas
+- Use lowercase: true, false, null (NOT True, False, None)
+- All strings must use double quotes "like this"
+- Empty values: use "" for strings, {} for objects, [] for arrays, null for missing
 
 IMPORTANT PRINCIPLES:
 - Short responses like "yeah", "ok", "sure" are usually responses to what the system said
@@ -616,7 +708,10 @@ IMPORTANT PRINCIPLES:
 - Emergency situations take priority (severe pain, bleeding, knocked out teeth)
 - The goal is to HELP, not to categorize
 
-Always respond with your reasoning in the specified JSON format."""
+VALID JSON EXAMPLE:
+{"understanding":{"what_user_means":"User wants to cancel appointments","is_continuation":false,"continuation_type":null,"selected_option":null,"sentiment":"neutral","is_conversation_restart":false},"routing":{"agent":"appointment_manager","action":"cancel_appointments","urgency":"routine"},"memory_updates":{"new_facts":{},"system_action":"","awaiting":""},"response_guidance":{"tone":"helpful","task_context":{"user_intent":"cancel appointments","entities":{},"success_criteria":[],"constraints":[],"prior_context":null,"is_continuation":false,"continuation_type":null,"selected_option":null,"continuation_context":{}},"minimal_context":{"user_wants":"cancel appointments","action":"cancel"},"plan":"1. Get appointments, 2. Cancel them"},"reasoning_chain":["User wants to cancel","Route to appointment_manager"]}
+
+Output ONLY the JSON object. No markdown, no explanation, just JSON."""
 
     def _build_reasoning_prompt(
         self,
@@ -721,12 +816,12 @@ PLAN GENERATION (for response_guidance.plan):
   * "1. Get appointment by ID, 2. Update status to cancelled with reason"
 - For other agents, plan can be brief or empty
 
-JSON STRUCTURE:
+JSON STRUCTURE (IMPORTANT: No comments allowed in JSON output):
 
 {{
     "understanding": {{
         "what_user_means": "Plain English explanation of what user actually wants",
-        "is_continuation": true/false,  # Is this continuing previous topic?
+        "is_continuation": "Is this continuing previous topic? RESPOND WITH bool true/false",
         "continuation_type": "selection/confirmation/rejection/new_request/null",
         "selected_option": "value user selected or null",
         "sentiment": "affirmative/negative/neutral/unclear",
@@ -738,25 +833,21 @@ JSON STRUCTURE:
         "urgency": "routine/urgent/emergency"
     }},
     "memory_updates": {{
-        "new_facts": {{}},  # NEW facts only (don't repeat existing user_facts)
+        "new_facts": {{}},
         "system_action": "What the system/agent DID so far in this conversation. Examples: 'asked_for_date', 'provided_doctor_list', 'checked_availability', 'proposed_registration', 'showed_appointments', 'asked_for_confirmation'. Use past tense. REQUIRED - always provide this.",
         "awaiting": "What the system is waiting for from the user. Examples: 'date_selection', 'time_confirmation', 'doctor_choice', 'user_info', 'confirmation', 'appointment_id'. Use empty string '' if not waiting for anything. REQUIRED - always provide this (even if empty)."
     }},
     "response_guidance": {{
-        "tone": "helpful/empathetic/urgent/professional",
+        "tone": "decide based on user tone",
         "task_context": {{
             "user_intent": "What user wants (incorporate continuation context if resuming)",
-            "success_criteria": [
-                // Same criteria as before if resuming blocked flow
-            ],
+            "success_criteria": [],
             "constraints": [],
             "prior_context": "Relevant context including previous options",
             "is_continuation": true/false,
             "continuation_type": "selection/confirmation/rejection/null",
             "selected_option": "The option user selected",
-            "continuation_context": {{
-                // Copy from continuation_context if resuming
-            }}
+            "continuation_context": {{}}
         }},
         "minimal_context": {{
             "user_wants": "Brief what user wants",
@@ -771,6 +862,16 @@ JSON STRUCTURE:
         "Step 3: Therefore..."
     ]
 }}
+
+FIELD VALUES GUIDE:
+- understanding.is_continuation: true if continuing previous topic, else false
+- understanding.continuation_type: "selection", "confirmation", "rejection", "new_request", or null
+- understanding.sentiment: "affirmative", "negative", "neutral", or "unclear"
+- routing.agent: "appointment_manager", "registration", "general_assistant", "medical_inquiry", or "emergency_response"
+- routing.urgency: "routine", "urgent", or "emergency"
+- memory_updates.system_action: Past tense action like "showed_appointments", "asked_for_date", etc.
+- memory_updates.awaiting: What system waits for like "confirmation", "date_selection", or "" if nothing
+- response_guidance.tone: "helpful", "empathetic", "urgent", or "professional"
 
 KEY RULES:
 1. If system proposed action (check "Last Action") and user said "yeah/ok/sure/yes" → is_continuation=true, sentiment=affirmative
@@ -793,12 +894,10 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
         """Parse LLM response into structured reasoning output with continuation awareness."""
 
         try:
-            # Extract JSON from response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
+            # Extract JSON from response - handle multiple formats
+            json_str = self._extract_json_from_response(response)
+            if not json_str:
                 raise ValueError("No JSON found in response")
-
-            json_str = json_match.group()
 
             # Try direct parse first
             try:
@@ -806,36 +905,16 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             except json.JSONDecodeError as e:
                 logger.warning(f"Initial JSON parse failed: {e}")
                 
-                # Apply repairs
-                repaired = json_str
+                # LAYER 1: Comprehensive JSON Repair (multiple passes)
+                data = self._robust_json_repair(json_str, user_message, memory, continuation_context)
                 
-                # Remove // comments
-                repaired = re.sub(r'//[^\n]*', '', repaired)
-                
-                # Remove # comments  
-                repaired = re.sub(r'#[^\n]*', '', repaired)
-                
-                # Fix Python-style booleans/None
-                repaired = re.sub(r'\bTrue\b', 'true', repaired)
-                repaired = re.sub(r'\bFalse\b', 'false', repaired)
-                repaired = re.sub(r'\bNone\b', 'null', repaired)
-                
-                # Fix trailing commas
-                repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
-                
-                # Fix missing commas
-                repaired = re.sub(r'"\s*\n\s*"', '",\n"', repaired)
-                repaired = re.sub(r'(\}})\s*\n\s*"', r'}},\n"', repaired)
-                repaired = re.sub(r'(\])\s*\n\s*"', r'],\n"', repaired)
-                
-                try:
-                    data = json.loads(repaired)
-                    logger.info("Successfully repaired JSON")
-                except json.JSONDecodeError as e2:
-                    logger.error(f"JSON repair failed: {e2}")
-                    # Use fallback instead of raising
-                    logger.warning(f"Using fallback reasoning for: {user_message[:50]}")
-                    return self._fallback_reasoning(user_message, memory, {})
+                if data is None:
+                    # LAYER 2: Smart keyword-based fallback
+                    logger.warning(f"JSON repair exhausted, using smart fallback for: {user_message[:50]}")
+                    return self._smart_fallback_reasoning(
+                        user_message, memory, {}, 
+                        continuation_context, continuation_detection
+                    )
 
             # Parse nested structures
             understanding_data = data.get("understanding", {})
@@ -953,13 +1032,609 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
             logger.debug(f"Response was: {response}")
             raise
 
+    def _robust_json_repair(
+        self,
+        json_str: str,
+        user_message: str,
+        memory: Any,
+        continuation_context: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        LAYER 1: Comprehensive JSON repair with multiple strategies.
+        
+        Attempts multiple repair passes before giving up.
+        Returns parsed dict on success, None on failure.
+        """
+        repair_strategies = [
+            ("basic_cleanup", self._repair_basic_cleanup),
+            ("fix_structure", self._repair_fix_structure),
+            ("aggressive_repair", self._repair_aggressive),
+            ("extract_partial", self._repair_extract_partial),
+        ]
+        
+        logger.info(f"🔧 Starting JSON repair for message: {user_message[:50]}...")
+        logger.debug(f"🔧 Raw JSON string (first 500 chars): {json_str[:500]}")
+        
+        for strategy_name, repair_func in repair_strategies:
+            try:
+                logger.debug(f"🔧 Trying repair strategy: {strategy_name}")
+                repaired = repair_func(json_str)
+                if repaired:
+                    data = json.loads(repaired)
+                    logger.info(f"✅ JSON repair succeeded with strategy: {strategy_name}")
+                    # Log what was recovered
+                    routing = data.get("routing", {})
+                    logger.info(f"✅ Recovered routing: agent={routing.get('agent')}, action={routing.get('action')}")
+                    return data
+            except json.JSONDecodeError as e:
+                logger.debug(f"Repair strategy '{strategy_name}' failed: {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"Repair strategy '{strategy_name}' error: {e}")
+                continue
+        
+        # Log the failed JSON for debugging
+        logger.error(f"❌ All JSON repair strategies exhausted for message: {user_message[:50]}")
+        logger.error(f"❌ Raw JSON that failed to parse (first 1000 chars):\n{json_str[:1000]}")
+        
+        # Try to identify the specific issue location
+        try:
+            json.loads(json_str)
+        except json.JSONDecodeError as final_error:
+            logger.error(f"❌ Final JSON error details: {final_error}")
+            logger.error(f"❌ Error at line {final_error.lineno}, column {final_error.colno}")
+            # Try to show context around the error
+            lines = json_str.split('\n')
+            if final_error.lineno <= len(lines):
+                start_line = max(0, final_error.lineno - 3)
+                end_line = min(len(lines), final_error.lineno + 2)
+                context_lines = lines[start_line:end_line]
+                logger.error(f"❌ Context around error (lines {start_line+1}-{end_line}):")
+                for i, line in enumerate(context_lines, start=start_line+1):
+                    marker = ">>>" if i == final_error.lineno else "   "
+                    logger.error(f"   {marker} {i}: {line}")
+        
+        return None
+    
+    def _repair_basic_cleanup(self, json_str: str) -> str:
+        """Basic cleanup: comments, Python literals, trailing commas."""
+        repaired = json_str
+        
+        # Remove // comments (but not inside strings)
+        repaired = re.sub(r'(?<!["\'])//[^\n]*', '', repaired)
+        
+        # Remove # comments
+        repaired = re.sub(r'(?<!["\'])#[^\n]*', '', repaired)
+        
+        # Fix Python-style booleans/None (word boundaries)
+        repaired = re.sub(r'\bTrue\b', 'true', repaired)
+        repaired = re.sub(r'\bFalse\b', 'false', repaired)
+        repaired = re.sub(r'\bNone\b', 'null', repaired)
+        
+        # Fix trailing commas before } or ]
+        repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+        
+        return repaired
+    
+    def _repair_fix_structure(self, json_str: str) -> str:
+        """Fix structural issues: missing commas, brackets."""
+        repaired = self._repair_basic_cleanup(json_str)
+        
+        # Fix missing commas between key-value pairs
+        # Pattern: "value"\n"key" or "value" "key"
+        repaired = re.sub(r'(")\s*\n\s*(")', r'\1,\n\2', repaired)
+        
+        # Fix missing comma after } before "
+        repaired = re.sub(r'(\})\s*\n?\s*(")', r'\1,\n\2', repaired)
+        
+        # Fix missing comma after ] before "
+        repaired = re.sub(r'(\])\s*\n?\s*(")', r'\1,\n\2', repaired)
+        
+        # Fix missing comma after true/false/null before "
+        repaired = re.sub(r'(true|false|null)\s*\n?\s*(")', r'\1,\n\2', repaired)
+        
+        # Fix missing comma after numbers before "
+        repaired = re.sub(r'(\d)\s*\n?\s*(")', r'\1,\n\2', repaired)
+        
+        # Remove any multiple consecutive commas
+        repaired = re.sub(r',\s*,+', ',', repaired)
+        
+        return repaired
+    
+    def _repair_aggressive(self, json_str: str) -> str:
+        """Aggressive repair: handle edge cases and malformed structures."""
+        repaired = self._repair_fix_structure(json_str)
+        
+        # Remove any text before the first {
+        first_brace = repaired.find('{')
+        if first_brace > 0:
+            repaired = repaired[first_brace:]
+        
+        # Remove any text after the last }
+        last_brace = repaired.rfind('}')
+        if last_brace > 0 and last_brace < len(repaired) - 1:
+            repaired = repaired[:last_brace + 1]
+        
+        # Fix single quotes to double quotes (for string values)
+        # Only outside of already double-quoted strings
+        repaired = re.sub(r"(?<![\"\\])'([^']*)'(?![\"\\])", r'"\1"', repaired)
+        
+        # Fix unquoted string values after colons
+        # Pattern: : unquoted_value (not number, bool, null, object, array)
+        repaired = re.sub(
+            r':\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}\]])',
+            lambda m: f': "{m.group(1)}"{m.group(2)}' if m.group(1) not in ['true', 'false', 'null'] else m.group(0),
+            repaired
+        )
+        
+        # Balance brackets - count and fix
+        open_braces = repaired.count('{')
+        close_braces = repaired.count('}')
+        open_brackets = repaired.count('[')
+        close_brackets = repaired.count(']')
+        
+        # Add missing closing braces/brackets
+        if open_braces > close_braces:
+            repaired += '}' * (open_braces - close_braces)
+        if open_brackets > close_brackets:
+            repaired += ']' * (open_brackets - close_brackets)
+        
+        return repaired
+    
+    def _repair_extract_partial(self, json_str: str) -> str:
+        """Extract and repair partial JSON - find valid subsections."""
+        # Try to find the main required sections
+        sections = {
+            "understanding": None,
+            "routing": None,
+            "memory_updates": None,
+            "response_guidance": None,
+            "reasoning_chain": None
+        }
+        
+        # Extract each section using regex
+        for section_name in sections:
+            pattern = rf'"{section_name}"\s*:\s*(\{{[^}}]*\}}|\[[^\]]*\])'
+            match = re.search(pattern, json_str, re.DOTALL)
+            if match:
+                try:
+                    # Try to parse the section
+                    section_json = match.group(1)
+                    # Clean it up
+                    section_json = self._repair_basic_cleanup(section_json)
+                    json.loads(section_json)  # Validate
+                    sections[section_name] = section_json
+                except:
+                    pass
+        
+        # Build a minimal valid JSON from extracted sections
+        # At minimum we need understanding and routing
+        if sections["understanding"] or sections["routing"]:
+            built_json = "{"
+            parts = []
+            
+            # Add understanding with defaults if missing
+            if sections["understanding"]:
+                parts.append(f'"understanding": {sections["understanding"]}')
+            else:
+                parts.append('"understanding": {"what_user_means": "Unable to parse", "is_continuation": false, "sentiment": "neutral"}')
+            
+            # Add routing with defaults if missing
+            if sections["routing"]:
+                parts.append(f'"routing": {sections["routing"]}')
+            else:
+                parts.append('"routing": {"agent": "general_assistant", "action": "understand_and_respond", "urgency": "routine"}')
+            
+            # Add optional sections
+            if sections["memory_updates"]:
+                parts.append(f'"memory_updates": {sections["memory_updates"]}')
+            else:
+                parts.append('"memory_updates": {"new_facts": {}, "system_action": "", "awaiting": ""}')
+            
+            if sections["response_guidance"]:
+                parts.append(f'"response_guidance": {sections["response_guidance"]}')
+            else:
+                parts.append('"response_guidance": {"tone": "helpful", "minimal_context": {}}')
+            
+            if sections["reasoning_chain"]:
+                parts.append(f'"reasoning_chain": {sections["reasoning_chain"]}')
+            else:
+                parts.append('"reasoning_chain": ["Partial JSON recovery"]')
+            
+            built_json += ", ".join(parts) + "}"
+            return built_json
+        
+        # Can't extract anything useful
+        return None
+    
+    def _smart_fallback_reasoning(
+        self,
+        user_message: str,
+        memory: Any,
+        patient_info: Dict[str, Any],
+        continuation_context: Optional[Dict[str, Any]] = None,
+        continuation_detection: Optional[Dict[str, Any]] = None
+    ) -> ReasoningOutput:
+        """
+        LAYER 2: Smart keyword-based fallback with context awareness.
+        
+        Analyzes user message and context to determine appropriate routing
+        when JSON parsing completely fails.
+        """
+        message_lower = user_message.lower().strip()
+        
+        logger.info(f"🔄 Smart fallback analyzing: '{user_message[:100]}'")
+        
+        # === EMERGENCY CHECK (highest priority) ===
+        emergency_keywords = [
+            "emergency", "urgent", "severe bleeding", "can't breathe",
+            "knocked out", "broken jaw", "severe pain", "911", "ambulance",
+            "heart attack", "dying", "help me"
+        ]
+        if any(kw in message_lower for kw in emergency_keywords):
+            logger.info("🚨 Smart fallback: Emergency detected")
+            return self._create_emergency_response(user_message)
+        
+        # === APPOINTMENT KEYWORDS (common case) ===
+        appointment_keywords = [
+            "appointment", "book", "schedule", "reschedule", "cancel",
+            "my appointments", "upcoming", "when is my", "change my",
+            "move my", "postpone", "available", "availability",
+            "slot", "time slot", "doctor", "dentist", "visit"
+        ]
+        appointment_action_keywords = {
+            "book": ["book", "schedule", "make", "create", "new appointment", "want to see"],
+            "cancel": ["cancel", "remove", "delete", "stop", "don't want", "cancel all", "cancel them"],
+            "reschedule": ["reschedule", "move", "change", "postpone", "different time", "another day"],
+            "view": ["my appointments", "upcoming", "when is", "list", "show", "what appointments", "check my"]
+        }
+        
+        is_appointment_related = any(kw in message_lower for kw in appointment_keywords)
+        
+        # Check continuation context for appointment flow
+        if continuation_context:
+            awaiting = continuation_context.get("awaiting", "").lower()
+            if any(apt_term in awaiting for apt_term in ["appointment", "time", "doctor", "date", "slot", "cancel"]):
+                is_appointment_related = True
+                logger.info(f"🔄 Continuation context suggests appointment flow: awaiting={awaiting}")
+        
+        if is_appointment_related:
+            # Determine specific action
+            action = "handle_request"
+            for act, keywords in appointment_action_keywords.items():
+                if any(kw in message_lower for kw in keywords):
+                    action = f"{act}_appointment"
+                    break
+            
+            logger.info(f"📅 Smart fallback: Appointment request detected, action={action}")
+            return ReasoningOutput(
+                understanding=UnderstandingResult(
+                    what_user_means=f"User wants to {action.replace('_', ' ')}",
+                    is_continuation=bool(continuation_context),
+                    continuation_type=continuation_detection.get("continuation_type") if continuation_detection else None,
+                    selected_option=continuation_detection.get("selected_option") if continuation_detection else None,
+                    sentiment="neutral",
+                    is_conversation_restart=False
+                ),
+                routing=RoutingResult(
+                    agent="appointment_manager",
+                    action=action,
+                    urgency="routine"
+                ),
+                memory_updates=MemoryUpdate(
+                    system_action="routing_to_appointment_manager",
+                    awaiting="action_completion"
+                ),
+                response_guidance=ResponseGuidance(
+                    tone="helpful",
+                    task_context=TaskContext(
+                        user_intent=f"User wants to manage appointments: {user_message}",
+                        is_continuation=bool(continuation_context),
+                        continuation_context=continuation_context or {}
+                    ),
+                    minimal_context={
+                        "user_wants": action.replace("_", " "),
+                        "action": action,
+                        "original_message": user_message
+                    }
+                ),
+                reasoning_chain=[
+                    "JSON parsing failed, using smart fallback",
+                    f"Appointment keywords detected: {action}",
+                    "Routing to appointment_manager agent"
+                ]
+            )
+        
+        # === REGISTRATION KEYWORDS ===
+        registration_keywords = [
+            "register", "sign up", "new patient", "first time",
+            "create account", "my name is", "i'm new"
+        ]
+        if any(kw in message_lower for kw in registration_keywords):
+            logger.info("📝 Smart fallback: Registration request detected")
+            return ReasoningOutput(
+                understanding=UnderstandingResult(
+                    what_user_means="User wants to register",
+                    is_continuation=False,
+                    sentiment="neutral",
+                    is_conversation_restart=False
+                ),
+                routing=RoutingResult(
+                    agent="registration",
+                    action="start_registration",
+                    urgency="routine"
+                ),
+                memory_updates=MemoryUpdate(
+                    system_action="starting_registration",
+                    awaiting="user_info"
+                ),
+                response_guidance=ResponseGuidance(
+                    tone="helpful",
+                    minimal_context={"user_wants": "register", "action": "collect_info"}
+                ),
+                reasoning_chain=[
+                    "JSON parsing failed, using smart fallback",
+                    "Registration keywords detected",
+                    "Routing to registration agent"
+                ]
+            )
+        
+        # === MEDICAL INQUIRY KEYWORDS ===
+        medical_keywords = [
+            "pain", "hurt", "ache", "tooth", "gum", "bleeding",
+            "swollen", "sensitive", "cavity", "filling", "crown",
+            "root canal", "extraction", "wisdom", "braces", "cleaning"
+        ]
+        if any(kw in message_lower for kw in medical_keywords) and not is_appointment_related:
+            logger.info("🏥 Smart fallback: Medical inquiry detected")
+            return ReasoningOutput(
+                understanding=UnderstandingResult(
+                    what_user_means="User has a dental/medical question",
+                    is_continuation=False,
+                    sentiment="neutral",
+                    is_conversation_restart=False
+                ),
+                routing=RoutingResult(
+                    agent="medical_inquiry",
+                    action="answer_question",
+                    urgency="routine"
+                ),
+                memory_updates=MemoryUpdate(
+                    system_action="answering_medical_inquiry",
+                    awaiting=""
+                ),
+                response_guidance=ResponseGuidance(
+                    tone="empathetic",
+                    minimal_context={"user_wants": "medical information", "action": "provide_info"}
+                ),
+                reasoning_chain=[
+                    "JSON parsing failed, using smart fallback",
+                    "Medical keywords detected",
+                    "Routing to medical_inquiry agent"
+                ]
+            )
+        
+        # === AFFIRMATIVE RESPONSE CHECK ===
+        affirmatives = ["yes", "yeah", "yep", "sure", "okay", "ok", "alright", "please", "go ahead", "do it", "confirm"]
+        is_affirmative = any(aff in message_lower.split() or message_lower == aff for aff in affirmatives)
+        
+        if is_affirmative and memory and memory.last_action:
+            last_action = memory.last_action.lower()
+            # Route based on what was last proposed
+            if "registration" in last_action or "register" in last_action:
+                logger.info("✅ Smart fallback: Affirmative to registration proposal")
+                return ReasoningOutput(
+                    understanding=UnderstandingResult(
+                        what_user_means="User confirms registration",
+                        is_continuation=True,
+                        continuation_type="confirmation",
+                        sentiment="affirmative",
+                        is_conversation_restart=False
+                    ),
+                    routing=RoutingResult(
+                        agent="registration",
+                        action="start_registration",
+                        urgency="routine"
+                    ),
+                    memory_updates=MemoryUpdate(
+                        system_action="starting_registration",
+                        awaiting="user_info"
+                    ),
+                    response_guidance=ResponseGuidance(
+                        tone="helpful",
+                        minimal_context={"user_wants": "register", "action": "collect_info"}
+                    ),
+                    reasoning_chain=[
+                        "JSON parsing failed, using smart fallback",
+                        "Affirmative response to registration proposal",
+                        "Routing to registration agent"
+                    ]
+                )
+            elif "appointment" in last_action or "book" in last_action or "cancel" in last_action:
+                logger.info("✅ Smart fallback: Affirmative to appointment action")
+                return ReasoningOutput(
+                    understanding=UnderstandingResult(
+                        what_user_means="User confirms appointment action",
+                        is_continuation=True,
+                        continuation_type="confirmation",
+                        sentiment="affirmative",
+                        is_conversation_restart=False
+                    ),
+                    routing=RoutingResult(
+                        agent="appointment_manager",
+                        action="continue_appointment_flow",
+                        urgency="routine"
+                    ),
+                    memory_updates=MemoryUpdate(
+                        system_action="continuing_appointment_flow",
+                        awaiting="action_completion"
+                    ),
+                    response_guidance=ResponseGuidance(
+                        tone="helpful",
+                        task_context=TaskContext(
+                            user_intent="User confirms previous appointment action",
+                            is_continuation=True,
+                            continuation_type="confirmation",
+                            continuation_context=continuation_context or {}
+                        ),
+                        minimal_context={
+                            "user_wants": "confirm action",
+                            "action": "continue_flow",
+                            "prior_context": last_action
+                        }
+                    ),
+                    reasoning_chain=[
+                        "JSON parsing failed, using smart fallback",
+                        f"Affirmative response to: {last_action}",
+                        "Routing to appointment_manager to continue"
+                    ]
+                )
+        
+        # === CONTINUATION CONTEXT ROUTING ===
+        if continuation_context:
+            awaiting = continuation_context.get("awaiting", "").lower()
+            original_agent = continuation_context.get("agent", "general_assistant")
+            
+            logger.info(f"🔄 Smart fallback: Using continuation context, awaiting={awaiting}, agent={original_agent}")
+            
+            return ReasoningOutput(
+                understanding=UnderstandingResult(
+                    what_user_means=f"User responding to: {awaiting}",
+                    is_continuation=True,
+                    continuation_type=continuation_detection.get("continuation_type") if continuation_detection else "clarification",
+                    selected_option=continuation_detection.get("selected_option") if continuation_detection else None,
+                    sentiment="neutral",
+                    is_conversation_restart=False
+                ),
+                routing=RoutingResult(
+                    agent=original_agent if original_agent else "general_assistant",
+                    action="handle_continuation",
+                    urgency="routine"
+                ),
+                memory_updates=MemoryUpdate(
+                    system_action="handling_continuation",
+                    awaiting=""
+                ),
+                response_guidance=ResponseGuidance(
+                    tone="helpful",
+                    task_context=TaskContext(
+                        user_intent=f"Continuation of previous flow: {user_message}",
+                        is_continuation=True,
+                        continuation_context=continuation_context
+                    ),
+                    minimal_context={
+                        "user_wants": "continue previous action",
+                        "action": "handle_continuation",
+                        "prior_context": awaiting
+                    }
+                ),
+                reasoning_chain=[
+                    "JSON parsing failed, using smart fallback",
+                    f"Continuation context available: awaiting {awaiting}",
+                    f"Routing to {original_agent} to handle continuation"
+                ]
+            )
+        
+        # === LAYER 3: EMERGENCY FINAL FALLBACK ===
+        logger.warning(f"⚠️ Smart fallback exhausted, using emergency fallback for: {user_message[:50]}")
+        return self._emergency_fallback_reasoning(user_message, memory)
+    
+    def _create_emergency_response(self, user_message: str) -> ReasoningOutput:
+        """Create standardized emergency response."""
+        return ReasoningOutput(
+            understanding=UnderstandingResult(
+                what_user_means="User has a dental emergency",
+                is_continuation=False,
+                sentiment="urgent",
+                is_conversation_restart=False
+            ),
+            routing=RoutingResult(
+                agent="emergency_response",
+                action="assess_and_respond",
+                urgency="emergency"
+            ),
+            memory_updates=MemoryUpdate(
+                system_action="responding_to_emergency",
+                awaiting=""
+            ),
+            response_guidance=ResponseGuidance(
+                tone="urgent",
+                minimal_context={"user_wants": "emergency help", "action": "assess_emergency"}
+            ),
+            reasoning_chain=["Emergency keywords detected", "Route to emergency response"]
+        )
+    
+    def _emergency_fallback_reasoning(
+        self,
+        user_message: str,
+        memory: Any
+    ) -> ReasoningOutput:
+        """
+        LAYER 3: Emergency final fallback - NEVER fails.
+        
+        This is the absolute last resort. Returns a safe, generic response
+        that routes to general_assistant with full context for debugging.
+        """
+        logger.error(f"🆘 EMERGENCY FALLBACK ACTIVATED for message: {user_message}")
+        
+        # Log diagnostic information
+        logger.error(f"  Memory state: last_action={getattr(memory, 'last_action', 'N/A')}, "
+                    f"awaiting={getattr(memory, 'awaiting', 'N/A')}")
+        
+        return ReasoningOutput(
+            understanding=UnderstandingResult(
+                what_user_means=user_message,  # Pass through raw message
+                is_continuation=False,
+                sentiment="neutral",
+                is_conversation_restart=False
+            ),
+            routing=RoutingResult(
+                agent="general_assistant",
+                action="understand_and_respond",
+                urgency="routine"
+            ),
+            memory_updates=MemoryUpdate(
+                system_action="emergency_fallback_used",
+                awaiting=""
+            ),
+            response_guidance=ResponseGuidance(
+                tone="helpful",
+                task_context=TaskContext(
+                    user_intent=user_message,
+                    prior_context="Reasoning fallback was used - treat message with care"
+                ),
+                minimal_context={
+                    "user_wants": "assistance",
+                    "action": "help_user",
+                    "fallback_reason": "reasoning_parse_failure",
+                    "original_message": user_message
+                }
+            ),
+            reasoning_chain=[
+                "All parsing and smart fallback strategies exhausted",
+                "Emergency fallback activated",
+                "Routing to general_assistant for safe handling"
+            ]
+        )
+
     def _fallback_reasoning(
         self,
         user_message: str,
         memory: Any,
         patient_info: Dict[str, Any]
     ) -> ReasoningOutput:
-        """Fallback reasoning when LLM fails."""
+        """Legacy fallback reasoning - now delegates to smart fallback."""
+        # This method is kept for backward compatibility
+        # It now delegates to the smarter fallback system
+        return self._smart_fallback_reasoning(user_message, memory, patient_info, None, None)
+
+    def _legacy_fallback_reasoning(
+        self,
+        user_message: str,
+        memory: Any,
+        patient_info: Dict[str, Any]
+    ) -> ReasoningOutput:
+        """Original fallback reasoning (preserved for reference)."""
 
         message_lower = user_message.lower().strip()
 
@@ -1096,7 +1771,7 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
                 )
                 tokens = TokenUsage()
             
-            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            llm_duration_seconds = time.time() - llm_start_time
             
             # Record LLM call
             llm_call = None
@@ -1106,7 +1781,7 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
                     provider=settings.llm_provider.value,
                     model=settings.get_llm_model(),
                     tokens=tokens,
-                    duration_ms=llm_duration_ms,
+                    duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(self._get_validation_system_prompt()),
                     messages_count=1,
                     temperature=0.2,
@@ -1212,7 +1887,7 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
                 )
                 tokens = TokenUsage()
             
-            llm_duration_ms = (time.time() - llm_start_time) * 1000
+            llm_duration_seconds = time.time() - llm_start_time
             
             # Record LLM call
             llm_call = None
@@ -1222,7 +1897,7 @@ RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
                     provider=settings.llm_provider.value,
                     model=settings.get_llm_model(),
                     tokens=tokens,
-                    duration_ms=llm_duration_ms,
+                    duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(self._get_finalization_system_prompt()),
                     messages_count=1,
                     temperature=finalization_temp,

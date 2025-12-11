@@ -15,3 +15,7 @@ sleep 1
 echo "Starting Patient AI Service..."
 python run.py
 
+
+
+
+

@@ -174,7 +174,7 @@ class ToolExecutionTracker:
         tool_name: str,
         inputs: Dict[str, Any],
         outputs: Dict[str, Any],
-        duration_ms: float,
+        duration_seconds: float,
         success: bool = True,
         error: Optional[str] = None
     ):
@@ -183,7 +183,7 @@ class ToolExecutionTracker:
             tool_name=tool_name,
             inputs=inputs,
             outputs=outputs,
-            duration_ms=duration_ms,
+            duration_seconds=duration_seconds,
             success=success,
             error=error
         )
@@ -220,6 +220,33 @@ class ObservabilityLogger:
         self._enabled = settings.enable_observability
         self._broadcaster = get_observability_broadcaster() if settings.enable_observability else None
     
+    def reset(self):
+        """
+        Reset observability logger for a new request.
+        
+        This clears all per-request data (tokens, steps, LLM calls, etc.)
+        but preserves the logger instance for the session.
+        Accumulative cost is tracked globally and not reset.
+        """
+        # Reset all trackers
+        self.token_tracker.reset()
+        self.agent_flow_tracker.reset()
+        self.reasoning_tracker.reset()
+        self.tool_tracker.reset()
+        
+        # Clear all per-request data
+        self._pipeline_steps.clear()
+        self._llm_calls.clear()
+        self._agent_execution = None
+        self._validation_details = None
+        self._finalization_details = None
+        self._custom_metrics.clear()
+        
+        # Reset start time for new request
+        self._start_time = time.time()
+        
+        logger.debug(f"Reset observability logger for session {self.session_id}")
+    
     def is_enabled(self) -> bool:
         """Check if observability is enabled."""
         return self._enabled
@@ -231,7 +258,7 @@ class ObservabilityLogger:
         component: str,
         inputs: Dict[str, Any] = None,
         outputs: Dict[str, Any] = None,
-        duration_ms: float = 0.0,
+        duration_seconds: float = 0.0,
         error: Optional[str] = None,
         metadata: Dict[str, Any] = None
     ):
@@ -245,7 +272,7 @@ class ObservabilityLogger:
             component=component,
             inputs=inputs or {},
             outputs=outputs or {},
-            duration_ms=duration_ms,
+            duration_seconds=duration_seconds,
             error=error,
             metadata=metadata or {}
         )
@@ -289,13 +316,13 @@ class ObservabilityLogger:
             error = str(e)
             raise
         finally:
-            duration_ms = (time.time() - start_time) * 1000
+            duration_seconds = time.time() - start_time
             self.record_pipeline_step(
                 step_number=step_number,
                 step_name=step_name,
                 component=component,
                 inputs=inputs or {},
-                duration_ms=duration_ms,
+                duration_seconds=duration_seconds,
                 error=error,
                 metadata=metadata or {}
             )
@@ -306,7 +333,7 @@ class ObservabilityLogger:
         provider: str,
         model: str,
         tokens: TokenUsage,
-        duration_ms: float,
+        duration_seconds: float,
         system_prompt_length: int = 0,
         messages_count: int = 0,
         temperature: Optional[float] = None,
@@ -333,7 +360,7 @@ class ObservabilityLogger:
             max_tokens=max_tokens,
             tokens=tokens,
             cost=cost,
-            duration_ms=duration_ms,
+            duration_seconds=duration_seconds,
             error=error
         )
         
@@ -388,7 +415,7 @@ class ObservabilityLogger:
         tool_name: str,
         inputs: Dict[str, Any],
         outputs: Dict[str, Any],
-        duration_ms: float,
+        duration_seconds: float,
         success: bool = True,
         error: Optional[str] = None
     ):
@@ -400,7 +427,7 @@ class ObservabilityLogger:
             tool_name=tool_name,
             inputs=inputs,
             outputs=outputs,
-            duration_ms=duration_ms,
+            duration_seconds=duration_seconds,
             success=success,
             error=error
         )
@@ -413,7 +440,7 @@ class ObservabilityLogger:
                     "tool_name": tool_name,
                     "inputs": inputs,
                     "outputs": outputs,
-                    "duration_ms": duration_ms,
+                    "duration_seconds": duration_seconds,
                     "success": success,
                     "error": error,
                     "timestamp": datetime.utcnow().isoformat()
@@ -496,15 +523,18 @@ class ObservabilityLogger:
         if not self._enabled:
             return None
         
-        # Calculate totals
+        # Calculate totals for THIS REQUEST
         total_tokens = self.token_tracker.get_total_tokens()
         total_cost = CostInfo()
         
-        # Sum costs from all LLM calls
+        # Sum costs from all LLM calls in this request
         for llm_call in self._llm_calls:
             total_cost += llm_call.cost
         
-        total_duration_ms = (time.time() - self._start_time) * 1000
+        total_duration_seconds = time.time() - self._start_time
+        
+        # Get accumulative cost (global across all requests)
+        accumulative_cost = get_accumulative_cost()
         
         # Build pipeline summary
         pipeline_summary = {
@@ -519,7 +549,7 @@ class ObservabilityLogger:
                 "output_cost_usd": total_cost.output_cost_usd,
                 "total_cost_usd": total_cost.total_cost_usd
             },
-            "duration_ms": total_duration_ms,
+            "duration_seconds": total_duration_seconds,
             "custom_metrics": self._custom_metrics
         }
         
@@ -532,28 +562,175 @@ class ObservabilityLogger:
             finalization=self._finalization_details,
             total_tokens=total_tokens,
             total_cost=total_cost,
-            total_duration_ms=total_duration_ms
+            total_duration_seconds=total_duration_seconds,
+            accumulative_cost=accumulative_cost
         )
     
+    def _format_duration(self, seconds: float) -> str:
+        """
+        Format duration in human-readable format (minutes and seconds).
+
+        Args:
+            seconds: Duration in seconds
+
+        Returns:
+            Formatted string (e.g., "1m 23.5s" or "0.456s")
+        """
+        if seconds < 60:
+            return f"{seconds:.3f}s"
+
+        minutes = int(seconds // 60)
+        remaining_seconds = seconds % 60
+        return f"{minutes}m {remaining_seconds:.1f}s"
+
+    def _log_pipeline_cost_breakdown(self, observability: SessionObservability):
+        """
+        Log detailed per-step cost breakdown mapping LLM calls to pipeline steps.
+
+        This provides a clear view of which orchestrator steps cost what, including
+        per-iteration breakdown for agentic loops.
+        """
+        # Map component names to step numbers and names
+        step_mapping = {
+            "translation.detect_and_translate": (2, "Translation (Input) [OPTIMIZED]"),
+            "memory.summarize": (3, "Add to Memory"),
+            "reasoning": (4, "Reasoning"),
+            "agent.": (8, "Agent Execution"),  # Prefix match for all agent calls
+            "validation": (9, "Validation"),
+            "finalization": (11, "Finalization"),
+            "translation.translate_from_english": (13, "Translation (Output)")
+        }
+
+        # Group LLM calls by step
+        step_costs = {}  # step_number -> {name, llm_calls, total_cost, total_tokens, duration}
+        agent_calls = []  # Special handling for agent calls
+
+        for llm_call in self._llm_calls:
+            component = llm_call.component
+            matched = False
+
+            # Find matching step
+            for prefix, (step_num, step_name) in step_mapping.items():
+                if prefix == "agent." and component.startswith(prefix):
+                    agent_calls.append(llm_call)
+                    matched = True
+                    break
+                elif component == prefix:
+                    if step_num not in step_costs:
+                        step_costs[step_num] = {
+                            "name": step_name,
+                            "llm_calls": [],
+                            "total_cost": 0.0,
+                            "total_tokens": 0,
+                            "duration": 0.0
+                        }
+                    step_costs[step_num]["llm_calls"].append(llm_call)
+                    step_costs[step_num]["total_cost"] += llm_call.cost.total_cost_usd
+                    step_costs[step_num]["total_tokens"] += llm_call.tokens.total_tokens
+                    step_costs[step_num]["duration"] += llm_call.duration_seconds
+                    matched = True
+                    break
+
+        # Get pipeline steps for duration info
+        pipeline_steps = {step['step_number']: step for step in observability.pipeline.get('steps', [])}
+
+        # Log each step with costs
+        for step_num in sorted(step_costs.keys()):
+            step_data = step_costs[step_num]
+            pipeline_step = pipeline_steps.get(step_num, {})
+            step_duration = pipeline_step.get('duration_seconds', step_data['duration'])
+
+            logger.info(f"\nStep {step_num}: {step_data['name']}")
+            logger.info(f"  Duration: {self._format_duration(step_duration)}")
+            logger.info(f"  LLM Calls: {len(step_data['llm_calls'])}")
+
+            for llm_call in step_data['llm_calls']:
+                logger.info(f"    - {llm_call.component}")
+                logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
+                           f"(total: {llm_call.tokens.total_tokens})")
+                if settings.cost_tracking_enabled:
+                    logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+
+            if settings.cost_tracking_enabled:
+                logger.info(f"  Step Total Cost: ${step_data['total_cost']:.6f}")
+
+        # Special handling for agent execution with iteration breakdown
+        if agent_calls:
+            agent_step = pipeline_steps.get(8, {})
+            logger.info(f"\nStep 7-8: Agent Activation & Execution")
+            if observability.agent:
+                logger.info(f"  Agent: {observability.agent.agent_name}")
+            logger.info(f"  Duration: {self._format_duration(agent_step.get('duration_seconds', 0))}")
+            logger.info(f"\n  AGENTIC LOOP BREAKDOWN:")
+
+            # Group agent calls by type (think vs response generation)
+            think_calls = [c for c in agent_calls if ".think" in c.component]
+            response_calls = [c for c in agent_calls if "generate" in c.component or "response" in c.component]
+            other_calls = [c for c in agent_calls if c not in think_calls and c not in response_calls]
+
+            # Log iterations
+            if think_calls:
+                logger.info(f"\n  Thinking Iterations: {len(think_calls)}")
+                for idx, llm_call in enumerate(think_calls, 1):
+                    logger.info(f"\n    Iteration {idx}:")
+                    logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
+                    logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
+                               f"(total: {llm_call.tokens.total_tokens})")
+                    if settings.cost_tracking_enabled:
+                        logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+
+            # Log response generation
+            if response_calls:
+                logger.info(f"\n  Final Response Generation:")
+                for llm_call in response_calls:
+                    logger.info(f"    Component: {llm_call.component}")
+                    logger.info(f"    Duration: {self._format_duration(llm_call.duration_seconds)}")
+                    logger.info(f"    Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
+                               f"(total: {llm_call.tokens.total_tokens})")
+                    if settings.cost_tracking_enabled:
+                        logger.info(f"    Cost: ${llm_call.cost.total_cost_usd:.6f}")
+
+            # Other agent calls (verify, etc.)
+            if other_calls:
+                logger.info(f"\n  Other Agent Operations:")
+                for llm_call in other_calls:
+                    logger.info(f"    {llm_call.component}")
+                    logger.info(f"      Tokens: {llm_call.tokens.total_tokens}")
+                    if settings.cost_tracking_enabled:
+                        logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+
+            # Agent total
+            if observability.agent and settings.cost_tracking_enabled:
+                logger.info(f"\n  Agent Total Cost: ${observability.agent.total_cost.total_cost_usd:.6f}")
+
+        # Steps with no LLM calls (just show duration)
+        for step_num, step in sorted(pipeline_steps.items()):
+            if step_num not in step_costs and step_num != 8:  # Skip agent execution (handled above)
+                logger.info(f"\nStep {step_num}: {step['step_name']}")
+                logger.info(f"  Duration: {self._format_duration(step['duration_seconds'])}")
+                logger.info(f"  LLM Calls: 0")
+                if settings.cost_tracking_enabled:
+                    logger.info(f"  Cost: $0.000000")
+
     def log_summary(self):
         """Log a summary of the session."""
         if not self._enabled:
             return
-        
+
         observability = self.get_session_observability()
         if not observability:
             return
-        
+
         # Format based on output format setting
         output_format = settings.observability_output_format
-        
+
         if output_format == "json":
             self._log_json(observability)
         elif output_format == "structured":
             self._log_structured(observability)
         else:  # detailed
             self._log_detailed(observability)
-        
+
         # Broadcast summary to WebSocket clients (fire and forget)
         if self._broadcaster:
             try:
@@ -603,7 +780,7 @@ class ObservabilityLogger:
             logger.info(f"   Tokens: {llm_call.tokens.total_tokens} "
                        f"(Input: {llm_call.tokens.input_tokens}, "
                        f"Output: {llm_call.tokens.output_tokens})")
-            logger.info(f"   Duration: {llm_call.duration_ms:.2f}ms")
+            logger.info(f"   Duration: {self._format_duration(llm_call.duration_seconds)}")
             if settings.cost_tracking_enabled:
                 logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
             logger.info(f"   Reasoning Steps: {len(observability.reasoning.reasoning_chain)}")
@@ -616,16 +793,16 @@ class ObservabilityLogger:
                 logger.info(f"      Tokens: {llm_call.tokens.total_tokens} "
                            f"(Input: {llm_call.tokens.input_tokens}, "
                            f"Output: {llm_call.tokens.output_tokens})")
-                logger.info(f"      Duration: {llm_call.duration_ms:.2f}ms")
+                logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
                 if settings.cost_tracking_enabled:
                     logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
-        
+
         # 3. Agent Tool Executions (individual requests)
         if observability.agent and observability.agent.tool_executions:
             logger.info(f"\n3. AGENT TOOL EXECUTIONS ({len(observability.agent.tool_executions)} requests):")
             for idx, tool in enumerate(observability.agent.tool_executions, 1):
                 logger.info(f"   {idx}. {tool.tool_name}")
-                logger.info(f"      Duration: {tool.duration_ms:.2f}ms")
+                logger.info(f"      Duration: {self._format_duration(tool.duration_seconds)}")
                 logger.info(f"      Status: {'✓ Success' if tool.success else '✗ Failed'}")
                 if tool.error:
                     logger.info(f"      Error: {tool.error}")
@@ -640,10 +817,10 @@ class ObservabilityLogger:
                 llm_call = observability.validation.llm_call
                 logger.info(f"   Model: {llm_call.model}")
                 logger.info(f"   Tokens: {llm_call.tokens.total_tokens}")
-                logger.info(f"   Duration: {llm_call.duration_ms:.2f}ms")
+                logger.info(f"   Duration: {self._format_duration(llm_call.duration_seconds)}")
                 if settings.cost_tracking_enabled:
                     logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
-        
+
         # 5. Finalization Request
         if observability.finalization:
             logger.info(f"\n5. FINALIZATION REQUEST:")
@@ -654,27 +831,34 @@ class ObservabilityLogger:
                 llm_call = observability.finalization.llm_call
                 logger.info(f"   Model: {llm_call.model}")
                 logger.info(f"   Tokens: {llm_call.tokens.total_tokens}")
-                logger.info(f"   Duration: {llm_call.duration_ms:.2f}ms")
+                logger.info(f"   Duration: {self._format_duration(llm_call.duration_seconds)}")
                 if settings.cost_tracking_enabled:
                     logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
-        
-        # ACCUMULATED TOTALS
+
+        # PIPELINE COST BREAKDOWN (Per Step)
         logger.info("\n" + "=" * 80)
-        logger.info("💰 ACCUMULATED TOTALS:")
+        logger.info("💵 PIPELINE COST BREAKDOWN (Per Step):")
         logger.info("=" * 80)
-        
+
+        self._log_pipeline_cost_breakdown(observability)
+
+        # PER-REQUEST TOTALS (This Request Only)
+        logger.info("\n" + "=" * 80)
+        logger.info("📊 PER-REQUEST TOTALS (This Request Only):")
+        logger.info("=" * 80)
+
         # Pipeline summary
         logger.info(f"Pipeline Steps: {len(observability.pipeline.get('steps', []))}")
-        logger.info(f"Total Duration: {observability.total_duration_ms:.2f}ms")
+        logger.info(f"Total Duration: {self._format_duration(observability.total_duration_seconds)}")
         
-        # Token usage totals
-        logger.info(f"Total Tokens: {observability.total_tokens.total_tokens} "
+        # Token usage totals (this request)
+        logger.info(f"Total Tokens (This Request): {observability.total_tokens.total_tokens} "
                    f"(Input: {observability.total_tokens.input_tokens}, "
                    f"Output: {observability.total_tokens.output_tokens})")
         
-        # Cost totals
+        # Cost totals (this request)
         if settings.cost_tracking_enabled:
-            logger.info(f"Total Cost: ${observability.total_cost.total_cost_usd:.6f}")
+            logger.info(f"Request Cost: ${observability.total_cost.total_cost_usd:.6f}")
             logger.info(f"  - Input Cost: ${observability.total_cost.input_cost_usd:.6f}")
             logger.info(f"  - Output Cost: ${observability.total_cost.output_cost_usd:.6f}")
             logger.info(f"  - Model: {observability.total_cost.model}")
@@ -690,6 +874,17 @@ class ObservabilityLogger:
             if settings.cost_tracking_enabled:
                 logger.info(f"  Agent Cost: ${observability.agent.total_cost.total_cost_usd:.6f}")
         
+        # ACCUMULATIVE COST (Since Service Start)
+        if settings.cost_tracking_enabled and observability.accumulative_cost:
+            logger.info("\n" + "=" * 80)
+            logger.info("💰 ACCUMULATIVE COST (Since Service Start):")
+            logger.info("=" * 80)
+            logger.info(f"Total Accumulative Cost: ${observability.accumulative_cost.total_cost_usd:.6f}")
+            logger.info(f"  - Input Cost: ${observability.accumulative_cost.input_cost_usd:.6f}")
+            logger.info(f"  - Output Cost: ${observability.accumulative_cost.output_cost_usd:.6f}")
+            logger.info(f"  - Model: {observability.accumulative_cost.model}")
+            logger.info(f"  - Provider: {observability.accumulative_cost.provider}")
+        
         logger.info("=" * 80)
     
     def _log_detailed(self, observability: SessionObservability):
@@ -703,22 +898,22 @@ class ObservabilityLogger:
         logger.info("\nPipeline Steps:")
         for step in observability.pipeline.get('steps', []):
             logger.info(f"  {step['step_number']}. {step['step_name']} ({step['component']}) - "
-                       f"{step['duration_ms']:.2f}ms")
-        
+                       f"{self._format_duration(step['duration_seconds'])}")
+
         # LLM calls
         logger.info("\nLLM Calls:")
         for llm_call in self._llm_calls:
             logger.info(f"  {llm_call.component}: {llm_call.model} - "
                        f"{llm_call.tokens.total_tokens} tokens, "
-                       f"{llm_call.duration_ms:.2f}ms")
+                       f"{self._format_duration(llm_call.duration_seconds)}")
             if settings.cost_tracking_enabled:
                 logger.info(f"    Cost: ${llm_call.cost.total_cost_usd:.6f}")
-        
+
         # Tool executions
         if observability.agent and observability.agent.tool_executions:
             logger.info("\nTool Executions:")
             for tool in observability.agent.tool_executions:
-                logger.info(f"  {tool.tool_name} - {tool.duration_ms:.2f}ms "
+                logger.info(f"  {tool.tool_name} - {self._format_duration(tool.duration_seconds)} "
                            f"({'success' if tool.success else 'failed'})")
         
         logger.info("")
@@ -726,6 +921,21 @@ class ObservabilityLogger:
 
 # Global session observability loggers
 _session_loggers: Dict[str, ObservabilityLogger] = {}
+
+# Global accumulative cost tracker (persists across all requests)
+_accumulative_cost: CostInfo = CostInfo()
+_accumulative_cost_lock = None  # Will be initialized if threading is needed
+
+
+def get_accumulative_cost() -> CostInfo:
+    """Get accumulative cost across all requests since service start."""
+    return _accumulative_cost
+
+
+def _add_to_accumulative_cost(cost: CostInfo):
+    """Add cost to global accumulative tracker."""
+    global _accumulative_cost
+    _accumulative_cost += cost
 
 
 def get_observability_logger(session_id: str) -> ObservabilityLogger:
@@ -736,7 +946,23 @@ def get_observability_logger(session_id: str) -> ObservabilityLogger:
 
 
 def clear_observability_logger(session_id: str):
-    """Clear observability logger for a session."""
+    """Clear observability logger for a session (resets per-request data)."""
     if session_id in _session_loggers:
-        del _session_loggers[session_id]
+        # Get the logger before deleting
+        logger = _session_loggers[session_id]
+        
+        # Add this request's cost to accumulative before resetting
+        if logger._enabled:
+            request_cost = CostInfo()
+            for llm_call in logger._llm_calls:
+                request_cost += llm_call.cost
+            if request_cost.total_cost_usd > 0:
+                _add_to_accumulative_cost(request_cost)
+        
+        # Reset the logger (clears tokens, steps, etc. but keeps accumulative cost)
+        logger.reset()
+        
+        # Optionally delete the logger (or keep it for session continuity)
+        # For now, we'll keep it but reset it
+        # del _session_loggers[session_id]
 

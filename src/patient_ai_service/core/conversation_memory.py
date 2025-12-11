@@ -289,11 +289,44 @@ IMPORTANT:
 Write the summary in third person (e.g., "The user wants to book an appointment...")"""
 
         try:
-            new_summary = self.llm_client.create_message(
-                system="You are a conversation summarizer. Create concise, informative summaries.",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
+            import time
+            from patient_ai_service.core.observability import get_observability_logger
+            from patient_ai_service.models.observability import TokenUsage
+            from patient_ai_service.core.config import settings
+
+            # Track LLM call with token usage
+            llm_start_time = time.time()
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                new_summary, tokens = self.llm_client.create_message_with_usage(
+                    system="You are a conversation summarizer. Create concise, informative summaries.",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+            else:
+                new_summary = self.llm_client.create_message(
+                    system="You are a conversation summarizer. Create concise, informative summaries.",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Record LLM call for observability
+            if settings.enable_observability:
+                obs_logger = get_observability_logger(session_id)
+                if obs_logger:
+                    obs_logger.record_llm_call(
+                        component="memory.summarize",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_seconds=llm_duration_seconds,
+                        system_prompt_length=len("You are a conversation summarizer. Create concise, informative summaries."),
+                        messages_count=1,
+                        temperature=0.3,
+                        max_tokens=settings.llm_max_tokens
+                    )
 
             memory.summary = new_summary.strip()
             # Keep only the last max_recent_turns

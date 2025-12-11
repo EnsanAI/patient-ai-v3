@@ -142,10 +142,11 @@ class ExecutionContext:
     - Metrics and debugging info
     """
     
-    def __init__(self, session_id: str, max_iterations: int = 15):
+    def __init__(self, session_id: str, max_iterations: int = 15, user_request: str = ""):
         self.session_id = session_id
         self.max_iterations = max_iterations
         self.iteration = 0
+        self.user_request = user_request  # Store user's original message
         
         # Observations
         self.observations: List[Observation] = []
@@ -164,6 +165,10 @@ class ExecutionContext:
         self.fatal_error: Optional[Dict[str, Any]] = None
         self.retry_count: int = 0
         self.max_retries: int = 2
+        
+        # Recovery tracking
+        self.recovery_attempts: Dict[str, Dict[str, Any]] = {}  # Key: error_signature, Value: recovery info
+        self.recovery_executed: bool = False  # Track if we're currently executing a recovery
         
         # Metrics
         self.tool_calls: int = 0
@@ -360,11 +365,13 @@ class ExecutionContext:
     
     def check_completion(self) -> CompletionCheck:
         """Check if all criteria are met or if we're blocked."""
+        logger.info(f"✓ [ExecutionContext] Checking completion status...")
         result = CompletionCheck(is_complete=False)
         
         for criterion in self.criteria.values():
             if criterion.state == CriterionState.COMPLETE:
                 result.completed_criteria.append(criterion.description)
+                logger.info(f"✓ [ExecutionContext]   ✅ COMPLETE: {criterion.description}")
             
             elif criterion.state == CriterionState.BLOCKED:
                 result.blocked_criteria.append(criterion.description)
@@ -373,13 +380,16 @@ class ExecutionContext:
                     result.blocked_options[criterion.description] = criterion.blocked_options
                 if criterion.blocked_reason:
                     result.blocked_reasons[criterion.description] = criterion.blocked_reason
+                logger.info(f"✓ [ExecutionContext]   ⏸️  BLOCKED: {criterion.description} (reason: {criterion.blocked_reason})")
             
             elif criterion.state == CriterionState.FAILED:
                 result.failed_criteria.append(criterion.description)
                 result.has_failed = True
+                logger.info(f"✓ [ExecutionContext]   ❌ FAILED: {criterion.description} (reason: {criterion.failed_reason})")
             
             else:  # PENDING or IN_PROGRESS
                 result.pending_criteria.append(criterion.description)
+                logger.info(f"✓ [ExecutionContext]   ○ PENDING: {criterion.description}")
         
         # Complete if all criteria are complete (none pending, blocked, or failed)
         result.is_complete = (
@@ -388,6 +398,13 @@ class ExecutionContext:
             len(result.failed_criteria) == 0 and
             len(result.completed_criteria) > 0
         )
+        
+        logger.info(f"✓ [ExecutionContext] Summary:")
+        logger.info(f"✓ [ExecutionContext]   → Completed: {len(result.completed_criteria)}")
+        logger.info(f"✓ [ExecutionContext]   → Pending: {len(result.pending_criteria)}")
+        logger.info(f"✓ [ExecutionContext]   → Blocked: {len(result.blocked_criteria)}")
+        logger.info(f"✓ [ExecutionContext]   → Failed: {len(result.failed_criteria)}")
+        logger.info(f"✓ [ExecutionContext]   → Is Complete: {result.is_complete}")
         
         return result
     
@@ -596,7 +613,7 @@ class BaseAgent(ABC):
         
         # Initialize execution context
         context = self._context.get(session_id, {})
-        exec_context = ExecutionContext(session_id, self.max_iterations)
+        exec_context = ExecutionContext(session_id, self.max_iterations, user_request=message)
         
         # Initialize criteria from context
         success_criteria = context.get("success_criteria", [])
@@ -660,17 +677,109 @@ class BaseAgent(ABC):
                 )
                 
                 if override:
+                    # Handle EXECUTE_RECOVERY immediately (don't wait for next iteration)
+                    if override == AgentDecision.EXECUTE_RECOVERY:
+                        # Find the most recent recovery attempt
+                        recovery_info = None
+                        for sig, info in exec_context.recovery_attempts.items():
+                            if info.get("attempted"):
+                                if not recovery_info or info.get("iteration", 0) > recovery_info.get("iteration", 0):
+                                    recovery_info = info
+                        
+                        if recovery_info and recovery_info.get("recovery_action"):
+                            recovery_tool = recovery_info["recovery_action"]
+                            recovery_message = recovery_info.get("recovery_message")
+                            
+                            logger.info(
+                                f"[{self.agent_name}] 🔧 Executing recovery action: {recovery_tool}"
+                                + (f" ({recovery_message})" if recovery_message else "")
+                            )
+                            
+                            # Execute recovery tool
+                            recovery_input = {"session_id": session_id}
+                            recovery_result = await self._execute_tool(recovery_tool, recovery_input, execution_log)
+                            
+                            logger.info(
+                                f"[{self.agent_name}] Recovery result: "
+                                f"success={recovery_result.get('success')}, "
+                                f"result_type={recovery_result.get('result_type')}"
+                            )
+                            
+                            # Process recovery result - may override again
+                            recovery_override = await self._process_tool_result(
+                                session_id, recovery_tool, recovery_result, exec_context
+                            )
+                            
+                            if recovery_override:
+                                response = self._handle_override(recovery_override, exec_context)
+                                if response:
+                                    return response, execution_log
+                            
+                            # Recovery executed, continue loop
+                            exec_context.recovery_executed = False
+                            continue
+                    
+                    # Handle other overrides normally
                     response = self._handle_override(override, exec_context)
                     if response:
                         return response, execution_log
+            
+            elif thinking.decision == AgentDecision.EXECUTE_RECOVERY:
+                # Execute recovery action automatically
+                # Find the most recent recovery attempt
+                recovery_info = None
+                for sig, info in exec_context.recovery_attempts.items():
+                    if info.get("attempted"):
+                        if not recovery_info or info.get("iteration", 0) > recovery_info.get("iteration", 0):
+                            recovery_info = info
+                
+                if recovery_info and recovery_info.get("recovery_action"):
+                    recovery_tool = recovery_info["recovery_action"]
+                    recovery_message = recovery_info.get("recovery_message")
+                    
+                    logger.info(
+                        f"[{self.agent_name}] 🔧 Executing recovery action: {recovery_tool}"
+                        + (f" ({recovery_message})" if recovery_message else "")
+                    )
+                    
+                    # Execute recovery tool with session_id
+                    recovery_input = {"session_id": session_id}
+                    # Could pass original error context if needed in future
+                    
+                    recovery_result = await self._execute_tool(recovery_tool, recovery_input, execution_log)
+                    
+                    logger.info(
+                        f"[{self.agent_name}] Recovery result: "
+                        f"success={recovery_result.get('success')}, "
+                        f"result_type={recovery_result.get('result_type')}"
+                    )
+                    
+                    # Process recovery result - may override next action
+                    override = await self._process_tool_result(
+                        session_id, recovery_tool, recovery_result, exec_context
+                    )
+                    
+                    if override:
+                        response = self._handle_override(override, exec_context)
+                        if response:
+                            return response, execution_log
+                    
+                    # Recovery executed, continue loop to see if it helped
+                    exec_context.recovery_executed = False  # Reset flag
+                    continue
+                else:
+                    # No recovery info found - shouldn't happen, but fallback to continue
+                    logger.warning(f"[{self.agent_name}] EXECUTE_RECOVERY but no recovery_info found")
+                    continue
             
             elif thinking.decision == AgentDecision.RESPOND:
                 # Agent wants to respond - verify completion first
                 completion = exec_context.check_completion()
                 
                 if completion.is_complete:
-                    logger.info(f"[{self.agent_name}] ✅ Task complete! Generating response.")
-                    return thinking.response_text, execution_log
+                    logger.info(f"[{self.agent_name}] ✅ Task complete! Generating focused response.")
+                    response = await self._generate_focused_response(session_id, exec_context)
+                    return response, execution_log
                 
                 elif completion.has_blocked:
                     logger.info(f"[{self.agent_name}] ⏸️ Criteria blocked - presenting options")
@@ -685,9 +794,10 @@ class BaseAgent(ABC):
                 else:
                     # Not complete but agent thinks it is
                     if thinking.is_task_complete:
-                        # Agent explicitly marked complete - trust it
-                        logger.info(f"[{self.agent_name}] Agent marked complete - trusting")
-                        return thinking.response_text, execution_log
+                        # Agent explicitly marked complete - trust it and generate focused response
+                        logger.info(f"[{self.agent_name}] Agent marked complete - generating focused response")
+                        response = await self._generate_focused_response(session_id, exec_context)
+                        return response, execution_log
                     else:
                         # Force continue
                         logger.warning(
@@ -705,16 +815,17 @@ class BaseAgent(ABC):
             
             elif thinking.decision == AgentDecision.RESPOND_WITH_OPTIONS:
                 logger.info(f"[{self.agent_name}] Responding with options")
-                response = thinking.response_text or self._generate_options_response(exec_context)
+                response = self._generate_options_response(exec_context)
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_COMPLETE:
-                logger.info(f"[{self.agent_name}] Task complete")
-                return thinking.response_text, execution_log
+                logger.info(f"[{self.agent_name}] Task complete - generating focused response")
+                response = await self._generate_focused_response(session_id, exec_context)
+                return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_IMPOSSIBLE:
                 logger.info(f"[{self.agent_name}] Task impossible")
-                response = thinking.response_text or self._generate_failure_response(exec_context)
+                response = self._generate_failure_response(exec_context)
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.CLARIFY:
@@ -723,7 +834,10 @@ class BaseAgent(ABC):
             
             elif thinking.decision == AgentDecision.RETRY:
                 logger.info(f"[{self.agent_name}] Retrying last action")
-                exec_context.retry_count += 1
+                # Don't increment if we just executed recovery (recovery has its own tracking)
+                if not exec_context.recovery_executed:
+                    exec_context.retry_count += 1
+                exec_context.recovery_executed = False  # Reset flag
                 continue
         
         # =====================================================================
@@ -927,17 +1041,65 @@ class BaseAgent(ABC):
         # Build messages with execution context
         messages = self._build_thinking_messages(session_id, execution_context)
 
+        # Get observability logger
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        llm_start_time = time.time()
+        thinking_temperature = 0.2  # Lower temperature for more consistent reasoning
+
         try:
-            response = self.llm_client.create_message(
-                system=system_prompt,
-                messages=messages,
-                temperature=0.2  # Lower temperature for more consistent reasoning
-            )
+            # Try to get token usage if available
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=system_prompt,
+                    messages=messages,
+                    temperature=thinking_temperature
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=system_prompt,
+                    messages=messages,
+                    temperature=thinking_temperature
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Record LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.think.legacy",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=len(messages),
+                    temperature=thinking_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=None
+                )
 
             # Parse the thinking response
             return self._parse_thinking_response(response, execution_context)
 
         except Exception as e:
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            # Record failed LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.think.legacy",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=TokenUsage(),
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=len(messages),
+                    temperature=thinking_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=str(e)
+                )
+            
             logger.error(f"Error in thinking step: {e}", exc_info=True)
             # On error, try to respond with what we have
             return ThinkingResult(
@@ -1255,12 +1417,43 @@ Respond with JSON:
 
 """
 
+        # Get observability logger
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        llm_start_time = time.time()
+        verification_temperature = 0.1
+
         try:
-            response = self.llm_client.create_message(
-                system=system_prompt,
-                messages=[{"role": "user", "content": "Verify task completion."}],
-                temperature=0.1
-            )
+            # Try to get token usage if available
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": "Verify task completion."}],
+                    temperature=verification_temperature
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": "Verify task completion."}],
+                    temperature=verification_temperature
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Record LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.verify_completion",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=1,
+                    temperature=verification_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=None
+                )
 
             # Parse response
             import re
@@ -1275,6 +1468,23 @@ Respond with JSON:
                 )
 
         except Exception as e:
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            # Record failed LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.verify_completion",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=TokenUsage(),
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=1,
+                    temperature=verification_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=str(e)
+                )
+            
             logger.error(f"Error in completion verification: {e}")
 
         # Default: assume incomplete
@@ -1293,7 +1503,11 @@ Respond with JSON:
         execution_context: 'ExecutionContext'
     ) -> str:
         """
-        Generate the final response to the user based on execution results.
+        [DEPRECATED] Generate the final response to the user based on execution results.
+
+        This method is only used by process_message_legacy() for backward compatibility.
+        New code should use _generate_focused_response() instead, which includes
+        user_wants and tone from the reasoning engine.
 
         This is called ONLY after all tools have been executed.
 
@@ -1336,19 +1550,72 @@ FORBIDDEN:
 
 """
 
+        # Get observability logger
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        llm_start_time = time.time()
+        response_temperature = 0.5
+
         try:
-            response = self.llm_client.create_message(
-                system=system_prompt,
-                messages=[{
-                    "role": "user",
-                    "content": f"Generate a response for: {execution_context.user_request}"
-                }],
-                temperature=0.5
-            )
+            user_message = f"Generate a response for: {execution_context.user_request}"
+            
+            # Try to get token usage if available
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=system_prompt,
+                    messages=[{
+                        "role": "user",
+                        "content": user_message
+                    }],
+                    temperature=response_temperature
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=system_prompt,
+                    messages=[{
+                        "role": "user",
+                        "content": user_message
+                    }],
+                    temperature=response_temperature
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Record LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.generate_response",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=1,
+                    temperature=response_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=None
+                )
 
             return response
 
         except Exception as e:
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            # Record failed LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.generate_response",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=TokenUsage(),
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=1,
+                    temperature=response_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=str(e)
+                )
+            
             logger.error(f"Error generating final response: {e}")
             return "I apologize, but I encountered an issue processing your request. Please try again."
 
@@ -1381,7 +1648,7 @@ FORBIDDEN:
                 result = tool_function(**tool_input)
 
             logger.info(f"Tool '{tool_name}' executed successfully")
-            tool_duration_ms = (time.time() - tool_start_time) * 1000
+            tool_duration_seconds = time.time() - tool_start_time
             result_dict = result if isinstance(result, dict) else {"result": result}
 
             # Log to observability
@@ -1390,7 +1657,7 @@ FORBIDDEN:
                     tool_name=tool_name,
                     inputs=tool_input,
                     outputs=result_dict,
-                    duration_ms=tool_duration_ms,
+                    duration_seconds=tool_duration_seconds,
                     success=True
                 )
 
@@ -1415,7 +1682,7 @@ FORBIDDEN:
                     tool_name=tool_name,
                     inputs=tool_input,
                     outputs=error_result,
-                    duration_ms=(time.time() - tool_start_time) * 1000,
+                    duration_seconds=time.time() - tool_start_time,
                     success=False,
                     error=str(e)
                 )
@@ -1591,26 +1858,48 @@ RETRY:
         exec_context: ExecutionContext
     ) -> str:
         """Build the prompt for the thinking phase with FULL context from reasoning engine."""
+        logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
+        logger.info(f"📝 [{self.agent_name}] BUILDING THINKING PROMPT")
+        logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
         
         # Get tools description
+        logger.info(f"📝 [{self.agent_name}] Step 1: Getting tools description...")
         tools_desc = self._get_tools_description()
+        logger.info(f"📝 [{self.agent_name}]   ✅ Tools description length: {len(tools_desc)} chars")
+        logger.debug(f"📝 [{self.agent_name}]   → Tools description:\n{tools_desc}")
         
         # Extract key context fields with safe defaults
+        logger.info(f"📝 [{self.agent_name}] Step 2: Extracting context fields...")
         user_intent = context.get('user_intent', context.get('user_wants', 'Not specified'))
         entities = context.get('entities', {})
         constraints = context.get('constraints', [])
         prior_context = context.get('prior_context', 'None')
         routing_action = context.get('routing_action', context.get('action', 'Not specified'))
         
+        logger.info(f"📝 [{self.agent_name}]   → User intent: {user_intent}")
+        logger.info(f"📝 [{self.agent_name}]   → Routing action: {routing_action}")
+        logger.info(f"📝 [{self.agent_name}]   → Prior context: {prior_context}")
+        logger.info(f"📝 [{self.agent_name}]   → Entities: {list(entities.keys()) if entities else 'None'}")
+        logger.info(f"📝 [{self.agent_name}]   → Constraints: {len(constraints)} constraint(s)")
+        
         # Check for continuation
+        logger.info(f"📝 [{self.agent_name}] Step 3: Checking for continuation context...")
         is_continuation = context.get('is_continuation', False)
         continuation_type = context.get('continuation_type')
         selected_option = context.get('selected_option')
         continuation_context = context.get('continuation_context', {})
         
+        logger.info(f"📝 [{self.agent_name}]   → Is continuation: {is_continuation}")
+        if is_continuation:
+            logger.info(f"📝 [{self.agent_name}]   → Continuation type: {continuation_type}")
+            logger.info(f"📝 [{self.agent_name}]   → Selected option: {selected_option}")
+            logger.info(f"📝 [{self.agent_name}]   → Continuation context keys: {list(continuation_context.keys())}")
+            logger.debug(f"📝 [{self.agent_name}]   → Continuation context:\n{json.dumps(continuation_context, indent=4, default=str)}")
+        
         # Build continuation section if applicable
         continuation_section = ""
         if is_continuation:
+            logger.info(f"📝 [{self.agent_name}] Step 4: Building continuation section...")
             continuation_section = f"""
 ═══════════════════════════════════════════════════════════════════════════════
 🔄 CONTINUATION CONTEXT (Resuming Previous Flow)
@@ -1625,8 +1914,25 @@ Previous State:
 This is a CONTINUATION - the user is responding to previous options/questions.
 DO NOT start from scratch. BUILD ON what was already resolved.
 """
+            logger.info(f"📝 [{self.agent_name}]   ✅ Continuation section built ({len(continuation_section)} chars)")
+        else:
+            logger.info(f"📝 [{self.agent_name}] Step 4: No continuation - skipping continuation section")
         
-        return f"""
+        # Get criteria and observations
+        logger.info(f"📝 [{self.agent_name}] Step 5: Getting criteria display...")
+        criteria_display = exec_context.get_criteria_display()
+        logger.info(f"📝 [{self.agent_name}]   ✅ Criteria display ({len(criteria_display)} chars)")
+        logger.debug(f"📝 [{self.agent_name}]   → Criteria:\n{criteria_display}")
+        
+        logger.info(f"📝 [{self.agent_name}] Step 6: Getting observations summary...")
+        observations_summary = exec_context.get_observations_summary()
+        logger.info(f"📝 [{self.agent_name}]   ✅ Observations summary ({len(observations_summary)} chars)")
+        logger.debug(f"📝 [{self.agent_name}]   → Observations:\n{observations_summary}")
+        
+        # Build the final prompt
+        logger.info(f"📝 [{self.agent_name}] Step 7: Assembling final prompt...")
+        
+        prompt = f"""
 ═══════════════════════════════════════════════════════════════════════════════
 🎯 REASONING ENGINE ANALYSIS (Your Instructions)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1655,19 +1961,17 @@ Constraints:
 
 User's Literal Message: {message}
 
-Current Language: {context.get('current_language', 'en')}-{context.get('current_dialect', 'unknown')}
-
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ SUCCESS CRITERIA (What You Must Accomplish, if you can)
 ═══════════════════════════════════════════════════════════════════════════════
 
-{exec_context.get_criteria_display()}
+{criteria_display}
 
 ═══════════════════════════════════════════════════════════════════════════════
 📊 EXECUTION HISTORY (Iteration {exec_context.iteration})
 ═══════════════════════════════════════════════════════════════════════════════
 
-{exec_context.get_observations_summary()}
+{observations_summary}
 
 ═══════════════════════════════════════════════════════════════════════════════
 🛠️  AVAILABLE TOOLS
@@ -1706,9 +2010,6 @@ Respond with JSON:
     "tool_name": "name of tool to call",
     "tool_input": {{}},
     
-    // If RESPOND or RESPOND_WITH_OPTIONS or RESPOND_IMPOSSIBLE:
-    "response": "The response to send to user",
-    
     // If CLARIFY:
     "clarification_question": "The specific question to ask"
 }}
@@ -1720,6 +2021,15 @@ DECISION RULES:
 4. If task impossible → RESPOND_IMPOSSIBLE
 5. Only CLARIFY if execution reveals missing CRITICAL data not in context
 """
+            
+        logger.info(f"📝 [{self.agent_name}]   ✅ Final prompt assembled")
+        logger.info(f"📝 [{self.agent_name}]   → Total prompt length: {len(prompt)} chars")
+        logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
+        logger.info(f"📝 [{self.agent_name}] PROMPT BUILDING COMPLETE")
+        logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
+        logger.debug(f"📝 [{self.agent_name}] Full prompt content:\n{prompt}")
+        
+        return prompt
 
     def _parse_thinking_response(
         self,
@@ -1727,17 +2037,38 @@ DECISION RULES:
         exec_context: ExecutionContext
     ) -> ThinkingResult:
         """Parse the LLM's thinking response."""
+        logger.info(f"🔍 [{self.agent_name}] ─────────────────────────────────────────")
+        logger.info(f"🔍 [{self.agent_name}] PARSING THINKING RESPONSE")
+        logger.info(f"🔍 [{self.agent_name}] ─────────────────────────────────────────")
+        
         try:
             # Extract JSON
             import re
+            logger.info(f"🔍 [{self.agent_name}] Step 1: Extracting JSON from response...")
+            logger.info(f"🔍 [{self.agent_name}]   → Response preview: {response[:300]}...")
+            
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if not json_match:
+                logger.error(f"🔍 [{self.agent_name}]   ❌ No JSON found in response!")
+                logger.error(f"🔍 [{self.agent_name}]   → Full response: {response}")
                 raise ValueError("No JSON found in response")
             
-            data = json.loads(json_match.group())
+            json_str = json_match.group()
+            logger.info(f"🔍 [{self.agent_name}]   ✅ JSON extracted successfully")
+            logger.info(f"🔍 [{self.agent_name}]   → JSON length: {len(json_str)} chars")
+            logger.debug(f"🔍 [{self.agent_name}]   → Extracted JSON:\n{json_str}")
+            
+            # Parse JSON
+            logger.info(f"🔍 [{self.agent_name}] Step 2: Parsing JSON...")
+            data = json.loads(json_str)
+            logger.info(f"🔍 [{self.agent_name}]   ✅ JSON parsed successfully")
+            logger.info(f"🔍 [{self.agent_name}]   → Top-level keys: {list(data.keys())}")
             
             # Parse decision
+            logger.info(f"🔍 [{self.agent_name}] Step 3: Extracting decision...")
             decision_str = data.get("decision", "RESPOND").upper()
+            logger.info(f"🔍 [{self.agent_name}]   → Raw decision string: '{decision_str}'")
+            
             decision_map = {
                 "CALL_TOOL": AgentDecision.CALL_TOOL,
                 "RESPOND": AgentDecision.RESPOND,
@@ -1746,32 +2077,125 @@ DECISION RULES:
                 "RESPOND_COMPLETE": AgentDecision.RESPOND_COMPLETE,
                 "RESPOND_IMPOSSIBLE": AgentDecision.RESPOND_IMPOSSIBLE,
                 "CLARIFY": AgentDecision.CLARIFY,
-                "RETRY": AgentDecision.RETRY
+                "RETRY": AgentDecision.RETRY,
+                "EXECUTE_RECOVERY": AgentDecision.EXECUTE_RECOVERY
             }
             decision = decision_map.get(decision_str, AgentDecision.RESPOND)
+            logger.info(f"🔍 [{self.agent_name}]   → Mapped to: {decision.value}")
+            
+            if decision_str not in decision_map:
+                logger.warning(f"🔍 [{self.agent_name}]   ⚠️  Unknown decision '{decision_str}', defaulting to RESPOND")
+            
+            # Extract other fields
+            logger.info(f"🔍 [{self.agent_name}] Step 4: Extracting additional fields...")
+            
+            analysis = data.get("analysis", "")
+            logger.info(f"🔍 [{self.agent_name}]   → Analysis: {analysis[:150]}{'...' if len(analysis) > 150 else ''}")
+            
+            reasoning = data.get("reasoning", "")
+            logger.info(f"🔍 [{self.agent_name}]   → Reasoning: {reasoning[:150]}{'...' if len(reasoning) > 150 else ''}")
+            
+            is_task_complete = data.get("is_task_complete", False)
+            logger.info(f"🔍 [{self.agent_name}]   → Is task complete: {is_task_complete}")
             
             # Update criteria based on assessment
+            logger.info(f"🔍 [{self.agent_name}] Step 5: Processing criteria assessment...")
             assessment = data.get("criteria_assessment", {})
-            for completed in assessment.get("complete", []):
-                exec_context.mark_criterion_complete(completed)
+            logger.info(f"🔍 [{self.agent_name}]   → Assessment keys: {list(assessment.keys()) if assessment else 'None'}")
             
-            return ThinkingResult(
-                analysis=data.get("analysis", ""),
+            completed_criteria = assessment.get("complete", [])
+            if completed_criteria:
+                logger.info(f"🔍 [{self.agent_name}]   → Criteria marked complete: {completed_criteria}")
+                for completed in completed_criteria:
+                    logger.info(f"🔍 [{self.agent_name}]       • Marking '{completed}' as complete...")
+                    exec_context.mark_criterion_complete(completed)
+                    logger.info(f"🔍 [{self.agent_name}]         ✅ Marked")
+            else:
+                logger.info(f"🔍 [{self.agent_name}]   → No criteria marked complete")
+            
+            pending_criteria = assessment.get("pending", [])
+            if pending_criteria:
+                logger.info(f"🔍 [{self.agent_name}]   → Criteria still pending: {pending_criteria}")
+            
+            blocked_criteria = assessment.get("blocked", [])
+            if blocked_criteria:
+                logger.info(f"🔍 [{self.agent_name}]   → Criteria blocked: {blocked_criteria}")
+            
+            # Extract last result analysis
+            logger.info(f"🔍 [{self.agent_name}] Step 6: Processing last result analysis...")
+            last_result = data.get("last_result_analysis", {})
+            if last_result:
+                logger.info(f"🔍 [{self.agent_name}]   → Last tool: {last_result.get('tool', 'N/A')}")
+                logger.info(f"🔍 [{self.agent_name}]   → Result type: {last_result.get('result_type', 'N/A')}")
+                logger.info(f"🔍 [{self.agent_name}]   → Interpretation: {last_result.get('interpretation', 'N/A')[:100]}...")
+            
+            # Extract decision-specific data
+            logger.info(f"🔍 [{self.agent_name}] Step 7: Extracting decision-specific data...")
+            tool_name = None
+            tool_input = None
+            clarification_question = None
+            
+            if decision == AgentDecision.CALL_TOOL:
+                tool_name = data.get("tool_name")
+                tool_input = data.get("tool_input")
+                logger.info(f"🔍 [{self.agent_name}]   → Tool to call: {tool_name}")
+                logger.info(f"🔍 [{self.agent_name}]   → Tool input: {json.dumps(tool_input, indent=6, default=str) if tool_input else 'None'}")
+                
+                if not tool_name:
+                    logger.warning(f"🔍 [{self.agent_name}]   ⚠️  CALL_TOOL decision but no tool_name provided!")
+                
+            elif decision == AgentDecision.CLARIFY:
+                clarification_question = data.get("clarification_question")
+                logger.info(f"🔍 [{self.agent_name}]   → Clarification question: {clarification_question}")
+                
+                if not clarification_question:
+                    logger.warning(f"🔍 [{self.agent_name}]   ⚠️  CLARIFY decision but no clarification_question provided!")
+            
+            # Build result
+            logger.info(f"🔍 [{self.agent_name}] Step 8: Building ThinkingResult object...")
+            result = ThinkingResult(
+                analysis=analysis,
                 task_status=assessment,
                 decision=decision,
-                reasoning=data.get("reasoning", ""),
-                tool_name=data.get("tool_name"),
-                tool_input=data.get("tool_input"),
-                response_text=data.get("response"),
-                clarification_question=data.get("clarification_question"),
-                is_task_complete=data.get("is_task_complete", False)
+                reasoning=reasoning,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                response_text=None,  # No longer extracted from thinking - generated after decision
+                clarification_question=clarification_question,
+                is_task_complete=is_task_complete
+            )
+            
+            logger.info(f"🔍 [{self.agent_name}]   ✅ ThinkingResult created successfully")
+            logger.info(f"🔍 [{self.agent_name}] ─────────────────────────────────────────")
+            logger.info(f"🔍 [{self.agent_name}] PARSING COMPLETE - Decision: {decision.value}")
+            logger.info(f"🔍 [{self.agent_name}] ─────────────────────────────────────────")
+            
+            return result
+        
+        except json.JSONDecodeError as e:
+            logger.error(f"🔍 [{self.agent_name}]   ❌ JSON parsing failed!")
+            logger.error(f"🔍 [{self.agent_name}]   → Error: {str(e)}")
+            logger.error(f"🔍 [{self.agent_name}]   → Error location: line {e.lineno}, col {e.colno}")
+            logger.error(f"🔍 [{self.agent_name}]   → Response preview: {response[:500]}")
+            logger.debug(f"🔍 [{self.agent_name}]   → Full response: {response}")
+            
+            # Default to asking for clarification on parse error
+            logger.info(f"🔍 [{self.agent_name}]   → Returning fallback CLARIFY decision")
+            return ThinkingResult(
+                decision=AgentDecision.CLARIFY,
+                reasoning=f"JSON parse error: {e}",
+                clarification_question="I'm having trouble understanding. Could you please rephrase your request?"
             )
         
         except Exception as e:
-            logger.error(f"Error parsing thinking response: {e}")
-            logger.debug(f"Response was: {response[:500]}")
+            logger.error(f"🔍 [{self.agent_name}]   ❌ Unexpected error during parsing!")
+            logger.error(f"🔍 [{self.agent_name}]   → Error type: {type(e).__name__}")
+            logger.error(f"🔍 [{self.agent_name}]   → Error message: {str(e)}")
+            logger.error(f"🔍 [{self.agent_name}]   → Stack trace:", exc_info=True)
+            logger.debug(f"🔍 [{self.agent_name}]   → Response was: {response[:500]}")
             
             # Default to asking for clarification on parse error
+            logger.info(f"🔍 [{self.agent_name}]   → Returning fallback CLARIFY decision")
             return ThinkingResult(
                 decision=AgentDecision.CLARIFY,
                 reasoning=f"Parse error: {e}",
@@ -1841,6 +2265,19 @@ DECISION RULES:
         
         return ToolResultType.PARTIAL.value  # Default
 
+    def _create_error_signature(self, tool_name: str, error: str) -> str:
+        """Create normalized error signature for tracking recovery attempts."""
+        import re
+        # Normalize error: take first 100 chars, lowercase, remove variable parts
+        normalized = str(error)[:100].lower().strip()
+        # Remove UUIDs
+        normalized = re.sub(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', '<uuid>', normalized)
+        # Remove dates
+        normalized = re.sub(r'\d{4}-\d{2}-\d{2}', '<date>', normalized)
+        # Remove timestamps
+        normalized = re.sub(r'\d{2}:\d{2}:\d{2}', '<time>', normalized)
+        return f"{tool_name}:{normalized}"
+
     # ==================== NEW AGENTIC EXECUTION METHODS ====================
 
     async def _think(
@@ -1857,19 +2294,195 @@ DECISION RULES:
         - What remains to do (criteria)
         - What to do next (decision)
         """
+        logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        logger.info(f"🧠 [{self.agent_name}] ENTERING _think() - Iteration {exec_context.iteration}")
+        logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        
+        # ═════════════════════════════════════════════════════════════════════
+        # STEP 1: GATHER INPUT CONTEXT
+        # ═════════════════════════════════════════════════════════════════════
+        logger.info(f"🧠 [{self.agent_name}] [STEP 1/5] Gathering input context...")
+        
         context = self._context.get(session_id, {})
+        logger.info(f"🧠 [{self.agent_name}]   → Session context keys: {list(context.keys())}")
+        logger.info(f"🧠 [{self.agent_name}]   → User message: '{message[:100]}{'...' if len(message) > 100 else ''}'")
+        logger.info(f"🧠 [{self.agent_name}]   → User intent: {context.get('user_intent', context.get('user_wants', 'N/A'))}")
+        logger.info(f"🧠 [{self.agent_name}]   → Routing action: {context.get('routing_action', context.get('action', 'N/A'))}")
+        logger.info(f"🧠 [{self.agent_name}]   → Is continuation: {context.get('is_continuation', False)}")
+        if context.get('is_continuation'):
+            logger.info(f"🧠 [{self.agent_name}]   → Continuation type: {context.get('continuation_type')}")
+            logger.info(f"🧠 [{self.agent_name}]   → Selected option: {context.get('selected_option')}")
+        
+        # Log entities and constraints
+        entities = context.get('entities', {})
+        if entities:
+            logger.info(f"🧠 [{self.agent_name}]   → Entities: {json.dumps(entities, indent=6, default=str)}")
+        constraints = context.get('constraints', [])
+        if constraints:
+            logger.info(f"🧠 [{self.agent_name}]   → Constraints: {constraints}")
+        
+        # Log current criteria state
+        logger.info(f"🧠 [{self.agent_name}]   → Success criteria ({len(exec_context.criteria)}):")
+        for crit_id, crit in exec_context.criteria.items():
+            logger.info(f"🧠 [{self.agent_name}]       • [{crit.state.value.upper()}] {crit.description}")
+            if crit.state == CriterionState.COMPLETE:
+                logger.info(f"🧠 [{self.agent_name}]         Evidence: {crit.completion_evidence}")
+            elif crit.state == CriterionState.BLOCKED:
+                logger.info(f"🧠 [{self.agent_name}]         Reason: {crit.blocked_reason}")
+                if crit.blocked_options:
+                    logger.info(f"🧠 [{self.agent_name}]         Options: {crit.blocked_options[:3]}{'...' if len(crit.blocked_options) > 3 else ''}")
+            elif crit.state == CriterionState.FAILED:
+                logger.info(f"🧠 [{self.agent_name}]         Reason: {crit.failed_reason}")
+        
+        # Log observations (tool results so far)
+        logger.info(f"🧠 [{self.agent_name}]   → Observations so far ({len(exec_context.observations)}):")
+        for i, obs in enumerate(exec_context.observations, 1):
+            status = "✅" if obs.is_success() else "❌"
+            logger.info(f"🧠 [{self.agent_name}]       {i}. {status} [{obs.result_type.value if obs.result_type else 'unknown'}] {obs.type}:{obs.name}")
+            # Log result summary (first 200 chars)
+            result_str = json.dumps(obs.result, default=str)[:200]
+            logger.info(f"🧠 [{self.agent_name}]          Result: {result_str}{'...' if len(json.dumps(obs.result, default=str)) > 200 else ''}")
+        
+        # ═════════════════════════════════════════════════════════════════════
+        # STEP 2: BUILD THINKING PROMPT
+        # ═════════════════════════════════════════════════════════════════════
+        logger.info(f"🧠 [{self.agent_name}] [STEP 2/5] Building thinking prompt...")
+        
         prompt = self._build_thinking_prompt(message, context, exec_context)
+        logger.info(f"🧠 [{self.agent_name}]   → Prompt length: {len(prompt)} chars")
+        logger.debug(f"🧠 [{self.agent_name}]   → Full prompt:\n{prompt}")
+        
+        # ═════════════════════════════════════════════════════════════════════
+        # STEP 3: PREPARE LLM CALL
+        # ═════════════════════════════════════════════════════════════════════
+        logger.info(f"🧠 [{self.agent_name}] [STEP 3/5] Preparing LLM call...")
+        
+        # Get observability logger
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
         
         # Call LLM (use default temperature, can be overridden)
         thinking_temperature = getattr(self, 'thinking_temperature', 0.3)
-        response = self.llm_client.create_message(
-            system=self._get_thinking_system_prompt(),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=thinking_temperature
-        )
+        system_prompt = self._get_thinking_system_prompt()
+        logger.info(f"🧠 [{self.agent_name}]   → Model: {settings.get_llm_model()}")
+        logger.info(f"🧠 [{self.agent_name}]   → Provider: {settings.llm_provider.value}")
+        logger.info(f"🧠 [{self.agent_name}]   → Temperature: {thinking_temperature}")
+        logger.info(f"🧠 [{self.agent_name}]   → System prompt length: {len(system_prompt)} chars")
+        logger.debug(f"🧠 [{self.agent_name}]   → System prompt:\n{system_prompt}")
         
-        # Parse response
-        return self._parse_thinking_response(response, exec_context)
+        llm_start_time = time.time()
+        logger.info(f"🧠 [{self.agent_name}]   → Calling LLM at {datetime.utcnow().isoformat()}...")
+        
+        try:
+            # ═════════════════════════════════════════════════════════════════
+            # STEP 4: EXECUTE LLM CALL
+            # ═════════════════════════════════════════════════════════════════
+            logger.info(f"🧠 [{self.agent_name}] [STEP 4/5] Executing LLM call...")
+            
+            # Try to get token usage if available
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                logger.info(f"🧠 [{self.agent_name}]   → Using create_message_with_usage (token tracking enabled)")
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=thinking_temperature
+                )
+            else:
+                logger.info(f"🧠 [{self.agent_name}]   → Using create_message (no token tracking)")
+                response = self.llm_client.create_message(
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=thinking_temperature
+                )
+                tokens = TokenUsage()
+            
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            logger.info(f"🧠 [{self.agent_name}]   ✅ LLM call completed in {llm_duration_seconds:.3f}s")
+            logger.info(f"🧠 [{self.agent_name}]   → Token usage:")
+            logger.info(f"🧠 [{self.agent_name}]       • Input tokens: {tokens.input_tokens if hasattr(tokens, 'input_tokens') else 'N/A'}")
+            logger.info(f"🧠 [{self.agent_name}]       • Output tokens: {tokens.output_tokens if hasattr(tokens, 'output_tokens') else 'N/A'}")
+            logger.info(f"🧠 [{self.agent_name}]       • Total tokens: {tokens.total_tokens if hasattr(tokens, 'total_tokens') else 'N/A'}")
+            logger.info(f"🧠 [{self.agent_name}]   → Response length: {len(response)} chars")
+            logger.info(f"🧠 [{self.agent_name}]   → Raw response:\n{response}")
+            
+            # Record LLM call with iteration context
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.think",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=tokens,
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=1,
+                    temperature=thinking_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=None
+                )
+            
+            # ═════════════════════════════════════════════════════════════════
+            # STEP 5: PARSE RESPONSE
+            # ═════════════════════════════════════════════════════════════════
+            logger.info(f"🧠 [{self.agent_name}] [STEP 5/5] Parsing LLM response...")
+            
+            thinking_result = self._parse_thinking_response(response, exec_context)
+            
+            logger.info(f"🧠 [{self.agent_name}]   ✅ Parsing completed successfully")
+            logger.info(f"🧠 [{self.agent_name}]   → Decision: {thinking_result.decision.value if thinking_result.decision else 'N/A'}")
+            logger.info(f"🧠 [{self.agent_name}]   → Reasoning: {thinking_result.reasoning[:200]}{'...' if len(thinking_result.reasoning) > 200 else ''}")
+            logger.info(f"🧠 [{self.agent_name}]   → Is task complete: {thinking_result.is_task_complete}")
+            
+            if thinking_result.analysis:
+                logger.info(f"🧠 [{self.agent_name}]   → Analysis: {thinking_result.analysis[:200]}{'...' if len(thinking_result.analysis) > 200 else ''}")
+            
+            if thinking_result.decision == AgentDecision.CALL_TOOL:
+                logger.info(f"🧠 [{self.agent_name}]   → Tool to call: {thinking_result.tool_name}")
+                logger.info(f"🧠 [{self.agent_name}]   → Tool input: {json.dumps(thinking_result.tool_input, indent=6, default=str) if thinking_result.tool_input else 'None'}")
+            
+            if thinking_result.decision == AgentDecision.CLARIFY:
+                logger.info(f"🧠 [{self.agent_name}]   → Clarification question: {thinking_result.clarification_question}")
+            
+            if thinking_result.task_status:
+                logger.info(f"🧠 [{self.agent_name}]   → Task status assessment:")
+                logger.info(f"🧠 [{self.agent_name}]       • Complete: {thinking_result.task_status.get('complete', [])}")
+                logger.info(f"🧠 [{self.agent_name}]       • Pending: {thinking_result.task_status.get('pending', [])}")
+                logger.info(f"🧠 [{self.agent_name}]       • Blocked: {thinking_result.task_status.get('blocked', [])}")
+            
+            logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+            logger.info(f"🧠 [{self.agent_name}] EXITING _think() - Decision: {thinking_result.decision.value if thinking_result.decision else 'N/A'}")
+            logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+            
+            return thinking_result
+        
+        except Exception as e:
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            logger.error(f"🧠 [{self.agent_name}]   ❌ LLM call FAILED after {llm_duration_seconds:.3f}s")
+            logger.error(f"🧠 [{self.agent_name}]   → Error type: {type(e).__name__}")
+            logger.error(f"🧠 [{self.agent_name}]   → Error message: {str(e)}")
+            logger.error(f"🧠 [{self.agent_name}]   → Stack trace:", exc_info=True)
+            
+            # Record failed LLM call
+            if obs_logger:
+                obs_logger.record_llm_call(
+                    component=f"agent.{self.agent_name}.think",
+                    provider=settings.llm_provider.value,
+                    model=settings.get_llm_model(),
+                    tokens=TokenUsage(),
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=len(system_prompt),
+                    messages_count=1,
+                    temperature=thinking_temperature,
+                    max_tokens=settings.llm_max_tokens,
+                    error=str(e)
+                )
+            
+            logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+            logger.info(f"🧠 [{self.agent_name}] EXITING _think() - ERROR")
+            logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+            
+            # Re-raise the exception
+            raise
 
     async def _execute_tool(
         self,
@@ -1878,50 +2491,104 @@ DECISION RULES:
         execution_log: ExecutionLog
     ) -> Dict[str, Any]:
         """Execute a tool and return the result."""
+        logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
+        logger.info(f"🛠️  [{self.agent_name}] EXECUTING TOOL: {tool_name}")
+        logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
         
+        # Check if tool exists
+        logger.info(f"🛠️  [{self.agent_name}] Step 1: Validating tool...")
         if not hasattr(self, '_tools') or tool_name not in self._tools:
-            return {
+            logger.error(f"🛠️  [{self.agent_name}]   ❌ Unknown tool: {tool_name}")
+            available = list(self._tools.keys()) if hasattr(self, '_tools') and self._tools else []
+            logger.error(f"🛠️  [{self.agent_name}]   → Available tools: {available}")
+            
+            error_result = {
                 "success": False,
                 "result_type": ToolResultType.FATAL.value,
                 "error": f"Unknown tool: {tool_name}",
-                "available_tools": list(self._tools.keys()) if hasattr(self, '_tools') and self._tools else []
+                "available_tools": available
             }
-    
+            logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
+            return error_result
+        
+        logger.info(f"🛠️  [{self.agent_name}]   ✅ Tool found in registry")
+        
+        # Log inputs
+        logger.info(f"🛠️  [{self.agent_name}] Step 2: Tool inputs...")
+        logger.info(f"🛠️  [{self.agent_name}]   → Input keys: {list(tool_input.keys())}")
+        logger.info(f"🛠️  [{self.agent_name}]   → Full inputs:")
+        for key, value in tool_input.items():
+            value_str = str(value)
+            if len(value_str) > 100:
+                value_str = value_str[:100] + "..."
+            logger.info(f"🛠️  [{self.agent_name}]       • {key}: {value_str}")
+        logger.debug(f"🛠️  [{self.agent_name}]   → Full inputs (debug):\n{json.dumps(tool_input, indent=4, default=str)}")
         
         tool_method = self._tools[tool_name]
         start_time = time.time()
+        logger.info(f"🛠️  [{self.agent_name}] Step 3: Calling tool method at {datetime.utcnow().isoformat()}...")
         
         try:
             # Call tool (may be sync or async)
             import asyncio
             if asyncio.iscoroutinefunction(tool_method):
+                logger.info(f"🛠️  [{self.agent_name}]   → Tool is async, awaiting...")
                 result = await tool_method(**tool_input)
             else:
+                logger.info(f"🛠️  [{self.agent_name}]   → Tool is sync, calling directly...")
                 result = tool_method(**tool_input)
             
+            duration_seconds = time.time() - start_time
+            logger.info(f"🛠️  [{self.agent_name}]   ✅ Tool executed in {duration_seconds:.3f}s")
+            
             # Ensure result is a dict
+            logger.info(f"🛠️  [{self.agent_name}] Step 4: Processing result...")
+            logger.info(f"🛠️  [{self.agent_name}]   → Result type: {type(result).__name__}")
+            
             if not isinstance(result, dict):
+                logger.info(f"🛠️  [{self.agent_name}]   → Converting non-dict result to dict...")
                 result = {"success": True, "data": result}
+            
+            logger.info(f"🛠️  [{self.agent_name}]   → Result keys: {list(result.keys())}")
+            logger.info(f"🛠️  [{self.agent_name}]   → Success: {result.get('success', 'N/A')}")
             
             # Ensure result_type is set
             if "result_type" not in result:
-                result["result_type"] = self._infer_result_type(result)
+                logger.info(f"🛠️  [{self.agent_name}]   → No result_type set, inferring...")
+                inferred = self._infer_result_type(result)
+                result["result_type"] = inferred
+                logger.info(f"🛠️  [{self.agent_name}]       • Inferred: {inferred}")
+            else:
+                logger.info(f"🛠️  [{self.agent_name}]   → Result type: {result['result_type']}")
             
-            duration_ms = (time.time() - start_time) * 1000
+            # Log result details
+            logger.info(f"🛠️  [{self.agent_name}]   → Result summary:")
+            result_preview = json.dumps(result, default=str)[:500]
+            logger.info(f"🛠️  [{self.agent_name}]       {result_preview}{'...' if len(json.dumps(result, default=str)) > 500 else ''}")
+            logger.debug(f"🛠️  [{self.agent_name}]   → Full result:\n{json.dumps(result, indent=4, default=str)}")
             
             # Log to execution log
+            logger.info(f"🛠️  [{self.agent_name}] Step 5: Recording to execution log...")
             execution_log.tools_used.append(ToolExecution(
                 tool_name=tool_name,
                 inputs=tool_input,
                 outputs=result,
                 success=result.get("success", True),
-                duration_ms=duration_ms
+                duration_seconds=duration_seconds
             ))
+            logger.info(f"🛠️  [{self.agent_name}]   ✅ Recorded (total tools: {len(execution_log.tools_used)})")
             
+            logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
+            logger.info(f"🛠️  [{self.agent_name}] TOOL EXECUTION COMPLETE: {tool_name} ✅")
+            logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
             return result
         
         except Exception as e:
-            logger.error(f"Tool {tool_name} failed: {e}", exc_info=True)
+            duration_seconds = time.time() - start_time
+            logger.error(f"🛠️  [{self.agent_name}]   ❌ Tool execution FAILED after {duration_seconds:.3f}s")
+            logger.error(f"🛠️  [{self.agent_name}]   → Error type: {type(e).__name__}")
+            logger.error(f"🛠️  [{self.agent_name}]   → Error message: {str(e)}")
+            logger.error(f"🛠️  [{self.agent_name}]   → Stack trace:", exc_info=True)
             
             error_result = {
                 "success": False,
@@ -1930,6 +2597,7 @@ DECISION RULES:
                 "should_retry": True
             }
             
+            logger.info(f"🛠️  [{self.agent_name}] Recording error to execution log...")
             execution_log.tools_used.append(ToolExecution(
                 tool_name=tool_name,
                 inputs=tool_input,
@@ -1938,6 +2606,9 @@ DECISION RULES:
                 error=str(e)
             ))
             
+            logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
+            logger.info(f"🛠️  [{self.agent_name}] TOOL EXECUTION FAILED: {tool_name} ❌")
+            logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
             return error_result
 
     async def _process_tool_result(
@@ -1953,110 +2624,263 @@ DECISION RULES:
         Returns:
             AgentDecision if we should override normal flow, None to continue
         """
+        logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        logger.info(f"🔧 [{self.agent_name}] PROCESSING TOOL RESULT: {tool_name}")
+        logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        
+        # Step 1: Determine result type
+        logger.info(f"🔧 [{self.agent_name}] Step 1: Determining result type...")
         result_type_str = tool_result.get("result_type", "partial")
+        logger.info(f"🔧 [{self.agent_name}]   → Raw result_type: '{result_type_str}'")
+        
         try:
             result_type = ToolResultType(result_type_str)
+            logger.info(f"🔧 [{self.agent_name}]   ✅ Mapped to: {result_type.value}")
         except ValueError:
+            logger.warning(f"🔧 [{self.agent_name}]   ⚠️  Unknown result_type '{result_type_str}', defaulting to PARTIAL")
             result_type = ToolResultType.PARTIAL
         
-        # Add observation
+        # Log tool result details
+        logger.info(f"🔧 [{self.agent_name}]   → Success: {tool_result.get('success', 'N/A')}")
+        logger.info(f"🔧 [{self.agent_name}]   → Error: {tool_result.get('error', 'None')}")
+        logger.info(f"🔧 [{self.agent_name}]   → Result keys: {list(tool_result.keys())}")
+        logger.debug(f"🔧 [{self.agent_name}]   → Full result:\n{json.dumps(tool_result, indent=4, default=str)}")
+        
+        # Step 2: Add observation
+        logger.info(f"🔧 [{self.agent_name}] Step 2: Adding observation to execution context...")
         exec_context.add_observation(
             obs_type="tool",
             name=tool_name,
             result=tool_result,
             result_type=result_type
         )
+        logger.info(f"🔧 [{self.agent_name}]   ✅ Observation added (total: {len(exec_context.observations)})")
         
-        # Handle based on result type
+        # Step 3: Handle based on result type
+        logger.info(f"🔧 [{self.agent_name}] Step 3: Handling result based on type: {result_type.value}")
+        
         if result_type == ToolResultType.SUCCESS:
+            logger.info(f"🔧 [{self.agent_name}]   → Result type: SUCCESS ✅")
+            
             # Check if this satisfies any criteria
             satisfied = tool_result.get("satisfies_criteria", [])
-            for criterion in satisfied:
-                exec_context.mark_criterion_complete(criterion, evidence=str(tool_result))
+            if satisfied:
+                logger.info(f"🔧 [{self.agent_name}]   → Tool explicitly satisfies criteria: {satisfied}")
+                for criterion in satisfied:
+                    logger.info(f"🔧 [{self.agent_name}]       • Marking '{criterion}' as complete...")
+                    exec_context.mark_criterion_complete(criterion, evidence=str(tool_result))
+            else:
+                logger.info(f"🔧 [{self.agent_name}]   → No explicit satisfies_criteria field")
             
             # Auto-detect criteria satisfaction
             if tool_result.get("appointment_id"):
+                logger.info(f"🔧 [{self.agent_name}]   → Detected appointment_id: {tool_result['appointment_id']}")
+                logger.info(f"🔧 [{self.agent_name}]   → Auto-detecting booking-related criteria...")
                 # Look for booking-related criteria
+                found_booking_criteria = False
                 for crit in exec_context.criteria.values():
                     if "booked" in crit.description.lower() and crit.state == CriterionState.PENDING:
+                        logger.info(f"🔧 [{self.agent_name}]       • Found booking criterion: '{crit.description}'")
+                        logger.info(f"🔧 [{self.agent_name}]       • Marking as complete...")
                         exec_context.mark_criterion_complete(
                             crit.id,
                             evidence=f"appointment_id: {tool_result['appointment_id']}"
                         )
+                        found_booking_criteria = True
+                if not found_booking_criteria:
+                    logger.info(f"🔧 [{self.agent_name}]       • No pending booking criteria found")
             
+            logger.info(f"🔧 [{self.agent_name}]   → Decision: Continue normally (no override)")
+            logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
             return None  # Continue normally
         
         elif result_type == ToolResultType.PARTIAL:
+            logger.info(f"🔧 [{self.agent_name}]   → Result type: PARTIAL ⏳")
+            logger.info(f"🔧 [{self.agent_name}]   → Tool made progress but more steps needed")
+            logger.info(f"🔧 [{self.agent_name}]   → Decision: Continue normally (no override)")
+            logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
             return None  # Continue normally
         
         elif result_type == ToolResultType.USER_INPUT_NEEDED:
-            logger.info(f"Tool {tool_name} requires user input")
+            logger.info(f"🔧 [{self.agent_name}]   → Result type: USER_INPUT_NEEDED 🔄")
+            logger.info(f"🔧 [{self.agent_name}]   → Tool requires user decision before proceeding")
             
             # Mark relevant criteria as blocked
             blocked_criteria = tool_result.get("blocks_criteria")
             alternatives = tool_result.get("alternatives", [])
             reason = tool_result.get("reason", "awaiting_user_input")
             
+            logger.info(f"🔧 [{self.agent_name}]   → Blocked criteria: {blocked_criteria}")
+            logger.info(f"🔧 [{self.agent_name}]   → Alternatives: {alternatives[:3]}{'...' if len(alternatives) > 3 else ''} ({len(alternatives)} total)")
+            logger.info(f"🔧 [{self.agent_name}]   → Reason: {reason}")
+            
             if blocked_criteria:
+                logger.info(f"🔧 [{self.agent_name}]   → Marking specific criterion as blocked: '{blocked_criteria}'")
                 exec_context.mark_criterion_blocked(blocked_criteria, reason, alternatives)
             else:
+                logger.info(f"🔧 [{self.agent_name}]   → No specific blocked_criteria, auto-detecting...")
                 # Block any pending booking criteria
+                found_criteria = False
                 for crit in exec_context.criteria.values():
                     if crit.state == CriterionState.PENDING and "booked" in crit.description.lower():
+                        logger.info(f"🔧 [{self.agent_name}]       • Blocking criterion: '{crit.description}'")
                         exec_context.mark_criterion_blocked(crit.id, reason, alternatives)
+                        found_criteria = True
+                if not found_criteria:
+                    logger.info(f"🔧 [{self.agent_name}]       • No pending booking criteria found to block")
             
             # Store for response generation
+            logger.info(f"🔧 [{self.agent_name}]   → Storing user options and suggested response...")
             exec_context.pending_user_options = alternatives
             exec_context.suggested_response = tool_result.get("suggested_response")
+            logger.info(f"🔧 [{self.agent_name}]       • Pending options: {len(alternatives)}")
+            logger.info(f"🔧 [{self.agent_name}]       • Suggested response: {exec_context.suggested_response[:100] if exec_context.suggested_response else 'None'}...")
             
             # Store continuation context
-            exec_context.set_continuation_context(
-                awaiting="user_selection",
-                options=alternatives,
-                original_request=tool_result.get("requested_time"),
+            logger.info(f"🔧 [{self.agent_name}]   → Building continuation context...")
+            continuation_data = {
+                "awaiting": "user_selection",
+                "options": alternatives,
+                "original_request": tool_result.get("requested_time"),
                 **{k: v for k, v in tool_result.items() if k in ["doctor_id", "date", "procedure"]}
-            )
+            }
+            exec_context.set_continuation_context(**continuation_data)
+            logger.info(f"🔧 [{self.agent_name}]       • Context keys: {list(exec_context.continuation_context.keys())}")
+            logger.debug(f"🔧 [{self.agent_name}]       • Full context:\n{json.dumps(exec_context.continuation_context, indent=4, default=str)}")
             
             # Persist for next turn
+            logger.info(f"🔧 [{self.agent_name}]   → Persisting to state manager...")
             self.state_manager.update_agentic_state(
                 session_id,
                 status="blocked",
                 continuation_context=exec_context.continuation_context
             )
+            logger.info(f"🔧 [{self.agent_name}]       ✅ State persisted")
             
+            logger.info(f"🔧 [{self.agent_name}]   → Decision: RESPOND_WITH_OPTIONS (override)")
+            logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
             return AgentDecision.RESPOND_WITH_OPTIONS
         
         elif result_type == ToolResultType.RECOVERABLE:
+            logger.info(f"🔧 [{self.agent_name}]   → Result type: RECOVERABLE 🔧")
             recovery_action = tool_result.get("recovery_action")
-            logger.info(f"Recoverable error from {tool_name}. Suggested: {recovery_action}")
+            logger.info(f"🔧 [{self.agent_name}]   → Error can be recovered from")
+            logger.info(f"🔧 [{self.agent_name}]   → Suggested recovery action: {recovery_action}")
+            logger.info(f"🔧 [{self.agent_name}]   → Original error: {tool_result.get('error', 'N/A')}")
             
+            logger.info(f"🔧 [{self.agent_name}]   → Adding recovery hint observation...")
             exec_context.add_observation(
                 "recovery_hint", tool_name,
                 {"suggested_action": recovery_action, "original_error": tool_result.get("error")}
             )
             
+            logger.info(f"🔧 [{self.agent_name}]   → Decision: Continue (let agent decide recovery in next think)")
+            logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
             return None  # Let agent figure out recovery in next think
         
         elif result_type == ToolResultType.FATAL:
-            logger.warning(f"Fatal error from {tool_name}: {tool_result.get('error')}")
+            logger.warning(f"🔧 [{self.agent_name}]   → Result type: FATAL ❌")
+            logger.warning(f"🔧 [{self.agent_name}]   → Cannot recover from this error")
+            error_msg = tool_result.get('error', 'Unknown fatal error')
+            logger.warning(f"🔧 [{self.agent_name}]   → Error: {error_msg}")
+            
             exec_context.fatal_error = tool_result
+            logger.info(f"🔧 [{self.agent_name}]   → Fatal error stored in execution context")
             
             # Mark relevant criteria as failed
+            logger.info(f"🔧 [{self.agent_name}]   → Marking all pending/in-progress criteria as failed...")
+            failed_count = 0
             for crit in exec_context.criteria.values():
                 if crit.state in [CriterionState.PENDING, CriterionState.IN_PROGRESS]:
-                    exec_context.mark_criterion_failed(crit.id, tool_result.get("error", "Fatal error"))
+                    logger.info(f"🔧 [{self.agent_name}]       • Failing criterion: '{crit.description}'")
+                    exec_context.mark_criterion_failed(crit.id, error_msg)
+                    failed_count += 1
+            logger.info(f"🔧 [{self.agent_name}]       → Total criteria failed: {failed_count}")
             
+            logger.info(f"🔧 [{self.agent_name}]   → Decision: RESPOND_IMPOSSIBLE (override)")
+            logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
             return AgentDecision.RESPOND_IMPOSSIBLE
         
         elif result_type == ToolResultType.SYSTEM_ERROR:
-            if exec_context.retry_count < exec_context.max_retries:
-                logger.info(f"System error, will retry ({exec_context.retry_count + 1}/{exec_context.max_retries})")
+            logger.warning(f"🔧 [{self.agent_name}]   → Result type: SYSTEM_ERROR 🚫")
+            
+            # Check if recovery_action is provided
+            recovery_action = tool_result.get("recovery_action")
+            recovery_message = tool_result.get("recovery_message")
+            error_msg = tool_result.get("error", "")
+            
+            logger.warning(f"🔧 [{self.agent_name}]   → System/infrastructure error occurred")
+            logger.warning(f"🔧 [{self.agent_name}]   → Error: {error_msg}")
+            logger.info(f"🔧 [{self.agent_name}]   → Recovery action provided: {recovery_action or 'None'}")
+            logger.info(f"🔧 [{self.agent_name}]   → Recovery message: {recovery_message or 'None'}")
+            
+            # Create error signature for tracking
+            logger.info(f"🔧 [{self.agent_name}]   → Creating error signature for tracking...")
+            error_signature = self._create_error_signature(tool_name, error_msg)
+            logger.info(f"🔧 [{self.agent_name}]       • Signature: {error_signature[:80]}...")
+            
+            # Check if we've already tried recovery for this error
+            logger.info(f"🔧 [{self.agent_name}]   → Checking recovery attempts history...")
+            recovery_info = exec_context.recovery_attempts.get(error_signature)
+            has_tried_recovery = recovery_info and recovery_info.get("attempted", False)
+            logger.info(f"🔧 [{self.agent_name}]       • Previous attempts: {len(exec_context.recovery_attempts)}")
+            logger.info(f"🔧 [{self.agent_name}]       • This error attempted: {has_tried_recovery}")
+            
+            if recovery_action and not has_tried_recovery:
+                # First time seeing this error with recovery_action - try recovery
+                logger.info(f"🔧 [{self.agent_name}]   → FIRST ATTEMPT - will try recovery")
+                logger.info(f"🔧 [{self.agent_name}]   → Recording recovery attempt...")
+                
+                exec_context.recovery_attempts[error_signature] = {
+                    "attempted": True,
+                    "recovery_action": recovery_action,
+                    "recovery_message": recovery_message,
+                    "original_tool": tool_name,
+                    "original_error": error_msg,
+                    "iteration": exec_context.iteration
+                }
+                exec_context.recovery_executed = True
+                
+                logger.info(f"🔧 [{self.agent_name}]       ✅ Recovery attempt recorded")
+                logger.info(f"🔧 [{self.agent_name}]       • Recovery action: {recovery_action}")
+                logger.info(f"🔧 [{self.agent_name}]       • At iteration: {exec_context.iteration}")
+                logger.info(f"🔧 [{self.agent_name}]   → Decision: EXECUTE_RECOVERY (override)")
+                logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
+                return AgentDecision.EXECUTE_RECOVERY
+            
+            elif has_tried_recovery:
+                # Same error after recovery attempt - give up immediately
+                logger.error(f"🔧 [{self.agent_name}]   → ERROR PERSISTED after recovery!")
+                logger.error(f"🔧 [{self.agent_name}]   → Previous recovery: {recovery_info.get('recovery_action')}")
+                logger.error(f"🔧 [{self.agent_name}]   → Previous attempt at iteration: {recovery_info.get('iteration')}")
+                logger.error(f"🔧 [{self.agent_name}]   → Giving up - marking as fatal")
+                
+                exec_context.fatal_error = tool_result
+                logger.info(f"🔧 [{self.agent_name}]   → Decision: RESPOND_IMPOSSIBLE (override)")
+                logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
+                return AgentDecision.RESPOND_IMPOSSIBLE
+            
+            elif exec_context.retry_count < exec_context.max_retries:
+                # No recovery_action, use standard retry logic
+                logger.info(f"🔧 [{self.agent_name}]   → NO recovery_action provided")
+                logger.info(f"🔧 [{self.agent_name}]   → Using standard retry logic")
+                logger.info(f"🔧 [{self.agent_name}]   → Retry count: {exec_context.retry_count + 1}/{exec_context.max_retries}")
+                logger.info(f"🔧 [{self.agent_name}]   → Decision: RETRY (override)")
+                logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
                 return AgentDecision.RETRY
             else:
-                logger.error(f"System error after max retries")
+                # Max retries exceeded
+                logger.error(f"🔧 [{self.agent_name}]   → MAX RETRIES EXCEEDED")
+                logger.error(f"🔧 [{self.agent_name}]   → Retry count: {exec_context.retry_count}/{exec_context.max_retries}")
+                logger.error(f"🔧 [{self.agent_name}]   → Giving up - marking as fatal")
+                
                 exec_context.fatal_error = tool_result
+                logger.info(f"🔧 [{self.agent_name}]   → Decision: RESPOND_IMPOSSIBLE (override)")
+                logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
                 return AgentDecision.RESPOND_IMPOSSIBLE
         
+        logger.info(f"🔧 [{self.agent_name}]   → No override decision needed")
+        logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
         return None
 
     def _handle_override(
@@ -2074,6 +2898,9 @@ DECISION RULES:
         
         elif override == AgentDecision.RETRY:
             return None  # Continue loop
+        
+        elif override == AgentDecision.EXECUTE_RECOVERY:
+            return None  # Continue loop (handled in main loop)
         
         return None
 
@@ -2147,6 +2974,155 @@ DECISION RULES:
             return " ".join(parts) + " Would you like me to continue?"
         
         return "I'm still working on your request. Could you please provide more details or try a simpler request?"
+
+    async def _generate_focused_response(
+        self,
+        session_id: str,
+        exec_context: ExecutionContext
+    ) -> str:
+        """
+        Generate response AFTER agent decides to respond.
+        Uses full execution context, user_wants, and tone.
+        """
+        logger.info(f"🅰 [{self.agent_name}] Initializing focused response generation (Option 2)")
+        
+        context = self._context.get(session_id, {})
+        
+        user_wants = context.get("user_wants", context.get("user_intent", ""))
+        tone = context.get("tone", "helpful")
+        language = context.get("current_language", "en")
+        dialect = context.get("current_dialect")
+        
+        execution_summary = self._build_execution_summary(exec_context)
+        
+        logger.info(f"👩🏻‍💻 [{self.agent_name}] Focused response inputs:")
+        logger.info(f"👩🏻‍💻   - user_wants: {user_wants}")
+        logger.info(f"👩🏻‍💻   - tone: {tone}")
+        logger.info(f"👩🏻‍💻   - language: {language}")
+        logger.info(f"👩🏻‍💻   - dialect: {dialect}")
+        logger.info(f"👩🏻‍💻   - execution_summary: {execution_summary}")
+        logger.info(f"👩🏻‍💻   - observations_count: {len(exec_context.observations)}")
+        
+        system_prompt = f"""Generate a {tone} response for a clinic receptionist.
+
+USER WANTED: {user_wants}
+TONE: {tone}
+LANGUAGE: {language}
+DIALECT: {dialect if dialect else ""}
+
+WHAT HAPPENED:
+{execution_summary}
+
+RULES:
+- Report what actually happened (based on execution results above)
+- Be {tone} and super natural
+- Don't be overly friendly, just warm
+- Don't sound redundant
+- No JSON, UUIDs, or technical details
+- Use user's language preference
+- Keep it concise (2-4 sentences)"""
+
+        logger.info(f"🅰 [{self.agent_name}] System prompt length: {len(system_prompt)} chars")
+        logger.debug(f"🅰 [{self.agent_name}] Full system prompt:\n{system_prompt}")
+
+        # Get observability logger
+        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+        llm_start_time = time.time()
+        
+        logger.info(f"🅰 [{self.agent_name}] Calling LLM for focused response generation...")
+
+        try:
+            # Try to get token usage if available
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": "Generate the response."}],
+                    temperature=0.5,
+                    max_tokens=300
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": "Generate the response."}],
+                    temperature=0.5,
+                    max_tokens=300
+                )
+                tokens = TokenUsage()
+
+            llm_duration_seconds = time.time() - llm_start_time
+
+            # Logging with error handling - don't let logging errors prevent response return
+            try:
+                logger.info(f"🅰 [{self.agent_name}] LLM call completed in {llm_duration_seconds:.2f}s")
+                logger.info(f"🅰 [{self.agent_name}] Token usage - input: {tokens.input_tokens}, output: {tokens.output_tokens}, total: {tokens.total_tokens}")
+                logger.info(f"🅰 [{self.agent_name}] Generated response ({len(response)} chars): {response}")
+                logger.debug(f"🅰 [{self.agent_name}] Full response text:\n{response}")
+            except Exception as log_error:
+                # Logging error shouldn't prevent response return
+                logger.warning(f"🅰 [{self.agent_name}] Error in logging (non-critical): {log_error}")
+
+            # Record LLM call
+            try:
+                if obs_logger:
+                    obs_logger.record_llm_call(
+                        component=f"agent.{self.agent_name}.generate_focused_response",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_seconds=llm_duration_seconds,
+                        system_prompt_length=len(system_prompt),
+                        messages_count=1,
+                        temperature=0.5,
+                        max_tokens=300,
+                        error=None
+                    )
+            except Exception as obs_error:
+                # Observability logging error shouldn't prevent response return
+                logger.warning(f"🅰 [{self.agent_name}] Error in observability logging (non-critical): {obs_error}")
+
+            logger.info(f"🅰 [{self.agent_name}] Focused response generation completed successfully")
+            return response
+
+        except Exception as e:
+            logger.error(f"🅰 [{self.agent_name}] Error generating focused response: {e}", exc_info=True)
+            error_response = "I apologize, but I encountered an issue processing your request. Please try again."
+            logger.info(f"🅰 [{self.agent_name}] Returning error fallback response: {error_response}")
+            return error_response
+
+    def _build_execution_summary(self, exec_context: ExecutionContext) -> str:
+        """Build compact summary of execution for response generation."""
+        lines = []
+        for obs in exec_context.observations:
+            if obs.type == "tool":
+                result = obs.result
+                if result.get("success"):
+                    # Extract key user-facing data
+                    key_data = self._extract_key_data(obs.name, result)
+                    lines.append(f"SUCCESS - {obs.name}: {key_data}")
+                else:
+                    error = result.get("error") or result.get("error_message") or "Failed"
+                    lines.append(f"FAILED - {obs.name}: {error}")
+        return "\n".join(lines) if lines else "No actions were taken."
+
+    def _extract_key_data(self, tool_name: str, result: Dict[str, Any]) -> str:
+        """Extract key user-facing data from tool result."""
+        if tool_name == "book_appointment":
+            return f"Booked {result.get('doctor_name', 'doctor')} on {result.get('date', '')} at {result.get('time', '')}. Confirmation: {result.get('confirmation_number', result.get('appointment_id', 'N/A'))}"
+        elif tool_name == "cancel_appointment":
+            return f"Cancelled appointment {result.get('appointment_id', '')}"
+        elif tool_name == "check_availability":
+            if result.get("available"):
+                return f"Available at {result.get('available_slots', result.get('availability_ranges', []))}"
+            return f"Not available. Alternatives: {result.get('alternatives', [])}"
+        elif tool_name == "list_doctors":
+            doctors = result.get("doctors", [])
+            if doctors:
+                return f"Found {len(doctors)} doctor(s)"
+            return "No doctors found"
+        elif tool_name == "find_doctor_by_name":
+            return f"Found doctor: {result.get('doctor_name', 'Unknown')}"
+        # Generic fallback
+        return str(result.get("message", result.get("data", "Completed")))[:100]
 
 # ==================== HELPER CLASSES ====================
 

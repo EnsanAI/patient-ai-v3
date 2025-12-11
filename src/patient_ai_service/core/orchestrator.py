@@ -143,20 +143,25 @@ class Orchestrator:
             step1_duration = (time.time() - step1_start) * 1000
             logger.info(f"Step 1 completed in {step1_duration:.2f}ms")
 
-            # Step 2: Translation (input)
+            # Step 2: Translation (input) - OPTIMIZED: Single LLM call for detect + translate
             step2_start = time.time()
             logger.info("-" * 100)
-            logger.info("ORCHESTRATOR STEP 2: Translation (Input)")
+            logger.info("ORCHESTRATOR STEP 2: Translation (Input) [OPTIMIZED]")
             logger.info("-" * 100)
             logger.info(f"Original message: {message[:200]}")
             with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
                 translation_agent = self.agents["translation"]
 
-                # Detect language and dialect
-                detect_start = time.time()
-                detected_lang, detected_dialect = await translation_agent.detect_language_and_dialect(message)
-                detect_duration = (time.time() - detect_start) * 1000
-                logger.info(f"Language detection: {detected_lang}-{detected_dialect} (took {detect_duration:.2f}ms)")
+                # OPTIMIZED: Single LLM call for detection AND translation
+                translate_start = time.time()
+                english_message, detected_lang, detected_dialect, translation_succeeded = await translation_agent.detect_and_translate(message, session_id)
+                translate_duration = (time.time() - translate_start) * 1000
+
+                logger.info(
+                    f"[FAST] Language: {detected_lang}-{detected_dialect or 'unknown'}, "
+                    f"translation_succeeded: {translation_succeeded} "
+                    f"(took {translate_duration:.2f}ms - single LLM call)"
+                )
 
                 # Get current language context
                 global_state = self.state_manager.get_global_state(session_id)
@@ -174,33 +179,26 @@ class Orchestrator:
                         language_context.turn_count
                     )
                 else:
-                    # Update current dialect if detected
+                    # Update both language and dialect from detect_and_translate results
+                    # This ensures they stay in sync even if dialect changes within same language
                     language_context.current_language = detected_lang
                     language_context.current_dialect = detected_dialect
                     language_context.last_detected_at = datetime.utcnow()
 
                 language_context.turn_count += 1
 
-                # Translate to English if needed
-                if detected_lang != "en":
-                    translate_start = time.time()
-                    english_message = await translation_agent.translate_to_english_with_dialect(
-                        message,
-                        detected_lang,
-                        detected_dialect
+                # Track translation status explicitly
+                if not translation_succeeded:
+                    logger.warning(
+                        f"⚠️ TRANSLATION FALLBACK for session {session_id}: "
+                        f"passing original message to reasoning engine"
                     )
-                    translate_duration = (time.time() - translate_start) * 1000
-                    logger.info(f"Translation to English: {message[:100]}... -> {english_message[:100]}... (took {translate_duration:.2f}ms)")
-                else:
-                    english_message = message
-                    logger.info("No translation needed (already in English)")
-
-                # Validate translation succeeded
-                if not english_message or len(english_message.strip()) == 0:
-                    logger.error(f"Translation failed for session {session_id}")
                     language_context.translation_failures += 1
-                    language_context.last_translation_error = "Empty translation result"
-                    english_message = message  # Fallback to original
+                    language_context.last_translation_error = "Translation failed - using original"
+                elif detected_lang != "en":
+                    logger.info(f"Translation to English: {message[:100]}... -> {english_message[:100]}...")
+                else:
+                    logger.info("No translation needed (already in English)")
 
                 # Update global state with new language context
                 self.state_manager.update_global_state(
@@ -220,7 +218,8 @@ class Orchestrator:
                         outputs={
                             "english_message": english_message[:100],
                             "detected_lang": detected_lang,
-                            "detected_dialect": detected_dialect
+                            "detected_dialect": detected_dialect,
+                            "translation_succeeded": translation_succeeded
                         }
                     )
             step2_duration = (time.time() - step2_start) * 1000
@@ -627,30 +626,22 @@ class Orchestrator:
             step12_duration = (time.time() - step12_start) * 1000
             logger.info(f"Step 12 completed in {step12_duration:.2f}ms")
 
-            # Step 13: Translation (output)
+            # Step 13: Translation (output) - DISABLED
+            # The agent's _generate_focused_response already generates responses in the target language
+            # based on context.get("current_language"). No additional translation needed.
             step13_start = time.time()
             logger.info("-" * 100)
-            logger.info("ORCHESTRATOR STEP 13: Translation (Output)")
+            logger.info("ORCHESTRATOR STEP 13: Translation (Output) - DISABLED")
             logger.info("-" * 100)
-            # Get current language context for translation
-            language_context = global_state.language_context
-
-            if language_context.current_language != "en":
-                logger.info(f"Translating response from English to {language_context.get_full_language_code()}")
-                logger.info(f"English response: {english_response[:200]}...")
-                with obs_logger.pipeline_step(13, "translation_output", "translation", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
-                    # process_output now uses dialect-aware translation internally
-                    translated_response = await translation_agent.process_output(
-                        session_id,
-                        english_response
-                    )
-                    logger.info(f"Translated response to {language_context.get_full_language_code()}")
-                    logger.info(f"Translated response: {translated_response[:200]}...")
-            else:
-                translated_response = english_response
-                logger.info("No translation needed (target language is English)")
+            logger.info("Translation handled by agent's _generate_focused_response method")
+            logger.info("Agent generates response directly in target language based on context.current_language")
+            
+            # Use agent response as-is (already in target language)
+            translated_response = english_response
+            logger.info(f"Using agent response as-is (already in target language): {translated_response[:200]}...")
+            
             step13_duration = (time.time() - step13_start) * 1000
-            logger.info(f"Step 13 completed in {step13_duration:.2f}ms")
+            logger.info(f"Step 13 completed in {step13_duration:.2f}ms (skipped translation)")
 
             # Step 14: Build response
             with obs_logger.pipeline_step(14, "build_response", "orchestrator", {}) if obs_logger else nullcontext():
@@ -688,14 +679,14 @@ class Orchestrator:
             logger.info(f"Response generated by {agent_name}")
             
             # Log final response summary
-            pipeline_duration_ms = (time.time() - pipeline_start_time) * 1000
+            pipeline_duration_seconds = time.time() - pipeline_start_time
             logger.info("=" * 100)
             logger.info("ORCHESTRATOR: process_message() COMPLETED")
             logger.info("=" * 100)
             logger.info(f"Session ID: {session_id}")
             logger.info(f"Final Response: {translated_response[:200]}...")
             logger.info(f"Agent Used: {agent_name}")
-            logger.info(f"Total Pipeline Duration: {pipeline_duration_ms:.2f}ms")
+            logger.info(f"Total Pipeline Duration: {pipeline_duration_seconds:.3f}s")
             logger.info(f"Tools Used: {len(execution_log.tools_used)}")
             logger.info("=" * 100)
             
@@ -713,24 +704,31 @@ class Orchestrator:
             
             # Log observability summary
             if obs_logger:
-                pipeline_duration_ms = (time.time() - pipeline_start_time) * 1000
+                pipeline_duration_seconds = time.time() - pipeline_start_time
                 obs_logger.record_pipeline_step(
                     15, "pipeline_complete", "orchestrator",
-                    metadata={"total_duration_ms": pipeline_duration_ms}
+                    metadata={"total_duration_seconds": pipeline_duration_seconds}
                 )
                 obs_logger.log_summary()
+                
+                # Reset observability logger for next request (preserves accumulative cost)
+                clear_observability_logger(session_id)
 
             return response
 
         except Exception as e:
-            pipeline_duration_ms = (time.time() - pipeline_start_time) * 1000
+            pipeline_duration_seconds = time.time() - pipeline_start_time
             logger.error(f"Error in orchestrator: {e}", exc_info=True)
+            
+            # Reset observability logger even on error
+            if obs_logger:
+                clear_observability_logger(session_id)
             logger.info("=" * 100)
             logger.info("ORCHESTRATOR: process_message() FAILED")
             logger.info("=" * 100)
             logger.info(f"Session ID: {session_id}")
             logger.info(f"Error: {str(e)}")
-            logger.info(f"Pipeline Duration Before Error: {pipeline_duration_ms:.2f}ms")
+            logger.info(f"Pipeline Duration Before Error: {pipeline_duration_seconds:.3f}s")
             logger.info("=" * 100)
             
             if obs_logger:
@@ -972,6 +970,9 @@ class Orchestrator:
             # Language
             "current_language": language_context.current_language,
             "current_dialect": language_context.current_dialect,
+
+            # Response guidance
+            "tone": reasoning.response_guidance.tone,
 
             # Backward compatibility
             "user_wants": task_context.get("user_intent", ""),

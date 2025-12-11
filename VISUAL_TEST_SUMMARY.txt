@@ -1,177 +1,112 @@
-
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║        🦷 PATIENT AI SERVICE V2 - INTENT TESTING RESULTS SUMMARY 🦷         ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                          📊 OVERALL PERFORMANCE                              │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   Total Tests:        14                                                    │
-│   ✅ Passed:          13                                                    │
-│   ⚠️  Warnings:        1                                                     │
-│   ❌ Failed:           0                                                     │
-│                                                                              │
-│   🎯 Success Rate:    92%                                                   │
-│                                                                              │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
-│   █████████████████████████████████████████████████▒▒▒▒▒▒▒▒  92%           │
-│   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
-│                                                                              │
-│   🎉 VERDICT: EXCELLENT - All core intents working!                        │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                      📋 CATEGORY BREAKDOWN                                   │
-├────────────────────┬──────────┬──────────────────────────────────────────────┤
-│                    │          │                                              │
-│  1️⃣  Booking        │  100%    │  ██████████████████████████████  (2/2)    │
-│                    │   ✅     │  Status: WORKING                            │
-│                    │          │                                              │
-├────────────────────┼──────────┼──────────────────────────────────────────────┤
-│                    │          │                                              │
-│  2️⃣  Rescheduling   │  100%    │  ██████████████████████████████  (4/4)    │
-│                    │   ✅     │  Status: FIXED & WORKING 🔧                 │
-│                    │          │  Previously: ❌ CRASHED                      │
-│                    │          │                                              │
-├────────────────────┼──────────┼──────────────────────────────────────────────┤
-│                    │          │                                              │
-│  3️⃣  Cancellation   │   66%    │  ████████████████████▒▒▒▒▒▒▒▒  (2/3)      │
-│                    │   ⚠️     │  Status: MOSTLY WORKING                     │
-│                    │          │  1 edge case detected                       │
-│                    │          │                                              │
-├────────────────────┼──────────┼──────────────────────────────────────────────┤
-│                    │          │                                              │
-│  4️⃣  Checking       │  100%    │  ██████████████████████████████  (3/3)    │
-│                    │   ✅     │  Status: FIXED & WORKING 🔧                 │
-│                    │          │  Previously: ❌ CRASHED                      │
-│                    │          │                                              │
-├────────────────────┼──────────┼──────────────────────────────────────────────┤
-│                    │          │                                              │
-│  5️⃣  Follow-up      │  100%    │  ██████████████████████████████  (2/2)    │
-│                    │   ✅     │  Status: FIXED & WORKING 🔧                 │
-│                    │          │  Previously: ❌ CRASHED                      │
-│                    │          │                                              │
-└────────────────────┴──────────┴──────────────────────────────────────────────┘
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                      🔍 BEFORE vs AFTER                                      │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ❌ BEFORE THE FIX:                                                         │
-│  ┌────────────────────────────────────────────────────────────────────┐    │
-│  │                                                                    │    │
-│  │  User: "can i move it to 3pm?"                                    │    │
-│  │  Response: ❌ "I'm sorry, I encountered an error..."               │    │
-│  │                                                                    │    │
-│  │  • Booking:        ✅ Working (20%)                                │    │
-│  │  • Rescheduling:   ❌ CRASHED                                      │    │
-│  │  • Cancellation:   ❌ CRASHED                                      │    │
-│  │  • Checking:       ❌ CRASHED                                      │    │
-│  │  • Follow-up:      ❌ CRASHED                                      │    │
-│  │                                                                    │    │
-│  └────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  ✅ AFTER THE FIX:                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐    │
-│  │                                                                    │    │
-│  │  User: "can i move it to 3pm?"                                    │    │
-│  │  Response: ✅ "I understand you'd like to reschedule..."           │    │
-│  │            (Proper workflow execution)                            │    │
-│  │                                                                    │    │
-│  │  • Booking:        ✅ Working (100%)                               │    │
-│  │  • Rescheduling:   ✅ FIXED - 100% success                        │    │
-│  │  • Cancellation:   ✅ FIXED - 66% success                         │    │
-│  │  • Checking:       ✅ FIXED - 100% success                        │    │
-│  │  • Follow-up:      ✅ FIXED - 100% success                        │    │
-│  │                                                                    │    │
-│  └────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  📈 IMPROVEMENT: +360% functionality increase                               │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                      ✅ DETAILED TEST RESULTS                                │
-├────┬──────────────────────────────┬────────────────────────────┬────────────┤
-│ #  │ Test Name                    │ Message                    │ Status     │
-├────┼──────────────────────────────┼────────────────────────────┼────────────┤
-│ 1  │ Booking-1: Complete info     │ "...Dr. Atef tomorrow..."  │ ✅ PASS   │
-│ 2  │ Booking-2: Partial info      │ "...cleaning appointment"  │ ✅ PASS   │
-│ 3  │ Reschedule-1: Context-aware  │ "can i move it to 3pm?"    │ ✅ PASS   │
-│ 4  │ Reschedule-2: Explicit       │ "...tomorrow at 11am"      │ ✅ PASS   │
-│ 5  │ Reschedule-3: Change time    │ "change...time to 2pm"     │ ✅ PASS   │
-│ 6  │ Reschedule-4: Generic        │ "I need to reschedule"     │ ✅ PASS   │
-│ 7  │ Cancel-1: Direct             │ "cancel my appointment"    │ ✅ PASS   │
-│ 8  │ Cancel-2: Context-aware      │ "i can't make it..."       │ ⚠️  WARN  │
-│ 9  │ Cancel-3: With reason        │ "...something came up"     │ ✅ PASS   │
-│ 10 │ Check-1: Next appointment    │ "when is my next..."       │ ✅ PASS   │
-│ 11 │ Check-2: All appointments    │ "show all my appointments" │ ✅ PASS   │
-│ 12 │ Check-3: Specific query      │ "what appointments..."     │ ✅ PASS   │
-│ 13 │ Followup-1: General          │ "...follow-up appointment" │ ✅ PASS   │
-│ 14 │ Followup-2: Post-treatment   │ "...sensitivity normal?"   │ ✅ PASS   │
-└────┴──────────────────────────────┴────────────────────────────┴────────────┘
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                      🎯 KEY ACHIEVEMENTS                                     │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ✅ Original Issue RESOLVED:                                                │
-│     "can i move it to 3pm?" now works perfectly!                           │
-│                                                                              │
-│  ✅ Zero Crashes:                                                           │
-│     All intents execute without errors (previously crashed)                │
-│                                                                              │
-│  ✅ Comprehensive Workflows Added:                                          │
-│     • 322 lines of detailed instructions                                   │
-│     • Context-aware processing                                             │
-│     • Smart defaults and error handling                                    │
-│                                                                              │
-│  ✅ Production Ready:                                                       │
-│     92% success rate, stable performance                                   │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                      📁 TEST ARTIFACTS CREATED                               │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ✅ test_ui.html                  - Interactive web testing dashboard       │
-│  ✅ test_all_intents.sh           - Automated bash testing script          │
-│  ✅ run_intent_tests.py           - Python comprehensive test suite        │
-│  ✅ test_results_*.txt            - Raw test execution output              │
-│  ✅ TEST_RESULTS_DASHBOARD.md     - Comprehensive analysis report          │
-│  ✅ VISUAL_TEST_SUMMARY.txt       - This visual summary (ASCII art)        │
-│  ✅ INTENT_FIXES_SUMMARY.md       - Implementation documentation           │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                      🚀 FINAL VERDICT                                        │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│                    🎉 EXCELLENT - ALL CORE INTENTS WORKING! 🎉              │
-│                                                                              │
-│   The Patient AI Service V2 has been successfully tested and validated.    │
-│   All critical appointment workflows are now operational and ready for      │
-│   production deployment.                                                    │
-│                                                                              │
-│   ⭐⭐⭐⭐⭐  5/5 STARS                                                          │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-                          Test Date: November 24, 2025
-                          Service Version: 2.0.0
-                          Status: ✅ ALL TESTS COMPLETED SUCCESSFULLY
-
-
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,398 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,398 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] BUILDING THINKING PROMPT
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 1: Getting tools description...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Tools description length: 5696 chars
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 2: Extracting context fields...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → User intent: schedule appointment with Mohammed Atef for next Wednesday for a root canal
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Routing action: request_time_selection
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Prior context: available times for Dr. Mohammed Atef provided
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Entities: ['patient_id']
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Constraints: 3 constraint(s)
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 3: Checking for continuation context...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Is continuation: False
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 4: No continuation - skipping continuation section
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 5: Getting criteria display...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Criteria display (106 chars)
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 6: Getting observations summary...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Observations summary (1732 chars)
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 7: Assembling final prompt...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Final prompt assembled
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Total prompt length: 10955 chars
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] PROMPT BUILDING COMPLETE
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Prompt length: 10955 chars
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 3/5] Preparing LLM call...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Model: o4-mini
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Provider: openai
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Temperature: 0.3
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → System prompt length: 4093 chars
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Calling LLM at 2025-12-10T23:32:56.403800...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 4/5] Executing LLM call...
+carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,404 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Using create_message_with_usage (token tracking enabled)
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,041 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   ✅ LLM call completed in 10.638s
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Token usage:
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Input tokens: 3563
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Output tokens: 1050
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Total tokens: 4613
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Response length: 883 chars
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Raw response:
+carebot-patient-ai-v3-local  | {
+carebot-patient-ai-v3-local  |     "analysis": "We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.",
+carebot-patient-ai-v3-local  |     "criteria_assessment": {
+carebot-patient-ai-v3-local  |         "complete": [
+carebot-patient-ai-v3-local  |             "Retrieve available time slots for Dr. Mohammed Atef on the requested date"
+carebot-patient-ai-v3-local  |         ],
+carebot-patient-ai-v3-local  |         "pending": [
+carebot-patient-ai-v3-local  |             "Prompt user to select a time"
+carebot-patient-ai-v3-local  |         ],
+carebot-patient-ai-v3-local  |         "blocked": []
+carebot-patient-ai-v3-local  |     },
+carebot-patient-ai-v3-local  |     "last_result_analysis": {
+carebot-patient-ai-v3-local  |         "tool": "check_availability",
+carebot-patient-ai-v3-local  |         "result_type": "partial",
+carebot-patient-ai-v3-local  |         "interpretation": "Availability for 2025-12-17 was returned with a list of open time slots and ranges."
+carebot-patient-ai-v3-local  |     },
+carebot-patient-ai-v3-local  |     "decision": "RESPOND_WITH_OPTIONS",
+carebot-patient-ai-v3-local  |     "reasoning": "We need to ask the user to pick from the returned available time slots to proceed with booking.",
+carebot-patient-ai-v3-local  |     "is_task_complete": false
+carebot-patient-ai-v3-local  | }
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 5/5] Parsing LLM response...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] PARSING THINKING RESPONSE
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 1: Extracting JSON from response...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Response preview: {
+carebot-patient-ai-v3-local  |     "analysis": "We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.",
+carebot-patient-ai-v3-local  |     "criteria_assessment": {
+carebot-patient-ai-v3-local  |         "complete": [
+carebot-patient-ai-v3-local  |             "Retrieve availa...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ JSON extracted successfully
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → JSON length: 883 chars
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 2: Parsing JSON...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ JSON parsed successfully
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Top-level keys: ['analysis', 'criteria_assessment', 'last_result_analysis', 'decision', 'reasoning', 'is_task_complete']
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 3: Extracting decision...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Raw decision string: 'RESPOND_WITH_OPTIONS'
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Mapped to: respond_options
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 4: Extracting additional fields...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Analysis: We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choos...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Reasoning: We need to ask the user to pick from the returned available time slots to proceed with booking.
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Is task complete: False
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 5: Processing criteria assessment...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Assessment keys: ['complete', 'pending', 'blocked']
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Criteria marked complete: ['Retrieve available time slots for Dr. Mohammed Atef on the requested date']
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]       • Marking 'Retrieve available time slots for Dr. Mohammed Atef on the requested date' as complete...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - ✅ Criterion COMPLETE: Retrieve available time slots for Dr. Mohammed Atef on the requested date
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]         ✅ Marked
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Criteria still pending: ['Prompt user to select a time']
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 6: Processing last result analysis...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Last tool: check_availability
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Result type: partial
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Interpretation: Availability for 2025-12-17 was returned with a list of open time slots and ranges....
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 7: Extracting decision-specific data...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 8: Building ThinkingResult object...
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ ThinkingResult created successfully
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] PARSING COMPLETE - Decision: respond_options
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   ✅ Parsing completed successfully
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Decision: respond_options
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Reasoning: We need to ask the user to pick from the returned available time slots to proceed with booking.
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Is task complete: False
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Analysis: We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Task status assessment:
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Complete: ['Retrieve available time slots for Dr. Mohammed Atef on the requested date']
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Pending: ['Prompt user to select a time']
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Blocked: []
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] ════════════════════════════════════════════════════════
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] EXITING _think() - Decision: respond_options
+carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,050 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] ════════════════════════════════════════════════════════
