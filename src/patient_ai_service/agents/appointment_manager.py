@@ -1364,7 +1364,6 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "doctor_id": doctor_id,
                     "date": date,
                     "available": True,
-                    "available_slots": available_slots,
                     "availability_ranges": availability_ranges,
                     "count": len(available_slots),
                     "next_step": "ask_user_preferred_time_or_book",
@@ -2054,7 +2053,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             try:
                 result = self.db_client.cancel_appointment(
                     appointment_id=apt_id,
-                    reason="Rollback due to partial multi-booking failure"
+                    cancellation_reason="Rollback due to partial multi-booking failure"
                 )
                 rollback_results.append({
                     "appointment_id": apt_id,

@@ -1,112 +1,418 @@
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,398 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,398 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] BUILDING THINKING PROMPT
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 1: Getting tools description...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Tools description length: 5696 chars
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 2: Extracting context fields...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → User intent: schedule appointment with Mohammed Atef for next Wednesday for a root canal
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Routing action: request_time_selection
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Prior context: available times for Dr. Mohammed Atef provided
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Entities: ['patient_id']
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Constraints: 3 constraint(s)
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 3: Checking for continuation context...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Is continuation: False
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 4: No continuation - skipping continuation section
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 5: Getting criteria display...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Criteria display (106 chars)
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 6: Getting observations summary...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Observations summary (1732 chars)
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 7: Assembling final prompt...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Final prompt assembled
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Total prompt length: 10955 chars
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] PROMPT BUILDING COMPLETE
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Prompt length: 10955 chars
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 3/5] Preparing LLM call...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Model: o4-mini
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Provider: openai
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Temperature: 0.3
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → System prompt length: 4093 chars
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Calling LLM at 2025-12-10T23:32:56.403800...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 4/5] Executing LLM call...
-carebot-patient-ai-v3-local  | 2025-12-10 23:32:56,404 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Using create_message_with_usage (token tracking enabled)
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,041 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   ✅ LLM call completed in 10.638s
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Token usage:
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Input tokens: 3563
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Output tokens: 1050
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Total tokens: 4613
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Response length: 883 chars
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Raw response:
-carebot-patient-ai-v3-local  | {
-carebot-patient-ai-v3-local  |     "analysis": "We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.",
-carebot-patient-ai-v3-local  |     "criteria_assessment": {
-carebot-patient-ai-v3-local  |         "complete": [
-carebot-patient-ai-v3-local  |             "Retrieve available time slots for Dr. Mohammed Atef on the requested date"
-carebot-patient-ai-v3-local  |         ],
-carebot-patient-ai-v3-local  |         "pending": [
-carebot-patient-ai-v3-local  |             "Prompt user to select a time"
-carebot-patient-ai-v3-local  |         ],
-carebot-patient-ai-v3-local  |         "blocked": []
-carebot-patient-ai-v3-local  |     },
-carebot-patient-ai-v3-local  |     "last_result_analysis": {
-carebot-patient-ai-v3-local  |         "tool": "check_availability",
-carebot-patient-ai-v3-local  |         "result_type": "partial",
-carebot-patient-ai-v3-local  |         "interpretation": "Availability for 2025-12-17 was returned with a list of open time slots and ranges."
-carebot-patient-ai-v3-local  |     },
-carebot-patient-ai-v3-local  |     "decision": "RESPOND_WITH_OPTIONS",
-carebot-patient-ai-v3-local  |     "reasoning": "We need to ask the user to pick from the returned available time slots to proceed with booking.",
-carebot-patient-ai-v3-local  |     "is_task_complete": false
-carebot-patient-ai-v3-local  | }
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 5/5] Parsing LLM response...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] PARSING THINKING RESPONSE
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 1: Extracting JSON from response...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Response preview: {
-carebot-patient-ai-v3-local  |     "analysis": "We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.",
-carebot-patient-ai-v3-local  |     "criteria_assessment": {
-carebot-patient-ai-v3-local  |         "complete": [
-carebot-patient-ai-v3-local  |             "Retrieve availa...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ JSON extracted successfully
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → JSON length: 883 chars
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 2: Parsing JSON...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ JSON parsed successfully
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Top-level keys: ['analysis', 'criteria_assessment', 'last_result_analysis', 'decision', 'reasoning', 'is_task_complete']
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 3: Extracting decision...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Raw decision string: 'RESPOND_WITH_OPTIONS'
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Mapped to: respond_options
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 4: Extracting additional fields...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Analysis: We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choos...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Reasoning: We need to ask the user to pick from the returned available time slots to proceed with booking.
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Is task complete: False
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 5: Processing criteria assessment...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Assessment keys: ['complete', 'pending', 'blocked']
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Criteria marked complete: ['Retrieve available time slots for Dr. Mohammed Atef on the requested date']
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]       • Marking 'Retrieve available time slots for Dr. Mohammed Atef on the requested date' as complete...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - ✅ Criterion COMPLETE: Retrieve available time slots for Dr. Mohammed Atef on the requested date
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]         ✅ Marked
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Criteria still pending: ['Prompt user to select a time']
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 6: Processing last result analysis...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Last tool: check_availability
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Result type: partial
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Interpretation: Availability for 2025-12-17 was returned with a list of open time slots and ranges....
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 7: Extracting decision-specific data...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 8: Building ThinkingResult object...
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ ThinkingResult created successfully
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] PARSING COMPLETE - Decision: respond_options
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   ✅ Parsing completed successfully
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Decision: respond_options
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Reasoning: We need to ask the user to pick from the returned available time slots to proceed with booking.
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Is task complete: False
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Analysis: We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Task status assessment:
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Complete: ['Retrieve available time slots for Dr. Mohammed Atef on the requested date']
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Pending: ['Prompt user to select a time']
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Blocked: []
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] ════════════════════════════════════════════════════════
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] EXITING _think() - Decision: respond_options
-carebot-patient-ai-v3-local  | 2025-12-10 23:33:07,050 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] ════════════════════════════════════════════════════════
+2025-12-10 23:32:56,398 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:32:56,398 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] BUILDING THINKING PROMPT
+2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 1: Getting tools description...
+2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Tools description length: 5696 chars
+2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 2: Extracting context fields...
+2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → User intent: schedule appointment with Mohammed Atef for next Wednesday for a root canal
+2025-12-10 23:32:56,399 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Routing action: request_time_selection
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Prior context: available times for Dr. Mohammed Atef provided
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Entities: ['patient_id']
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Constraints: 3 constraint(s)
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 3: Checking for continuation context...
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Is continuation: False
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 4: No continuation - skipping continuation section
+2025-12-10 23:32:56,400 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 5: Getting criteria display...
+2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Criteria display (106 chars)
+2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 6: Getting observations summary...
+2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Observations summary (1732 chars)
+2025-12-10 23:32:56,401 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] Step 7: Assembling final prompt...
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   ✅ Final prompt assembled
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager]   → Total prompt length: 10955 chars
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] PROMPT BUILDING COMPLETE
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 📝 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Prompt length: 10955 chars
+2025-12-10 23:32:56,402 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 3/5] Preparing LLM call...
+2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Model: o4-mini
+2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Provider: openai
+2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Temperature: 0.3
+2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → System prompt length: 4093 chars
+2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Calling LLM at 2025-12-10T23:32:56.403800...
+2025-12-10 23:32:56,403 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 4/5] Executing LLM call...
+2025-12-10 23:32:56,404 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Using create_message_with_usage (token tracking enabled)
+2025-12-10 23:33:07,041 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   ✅ LLM call completed in 10.638s
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Token usage:
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Input tokens: 3563
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Output tokens: 1050
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Total tokens: 4613
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Response length: 883 chars
+2025-12-10 23:33:07,042 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Raw response:
+{
+    "analysis": "We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.",
+    "criteria_assessment": {
+        "complete": [
+            "Retrieve available time slots for Dr. Mohammed Atef on the requested date"
+        ],
+        "pending": [
+            "Prompt user to select a time"
+        ],
+        "blocked": []
+    },
+    "last_result_analysis": {
+        "tool": "check_availability",
+        "result_type": "partial",
+        "interpretation": "Availability for 2025-12-17 was returned with a list of open time slots and ranges."
+    },
+    "decision": "RESPOND_WITH_OPTIONS",
+    "reasoning": "We need to ask the user to pick from the returned available time slots to proceed with booking.",
+    "is_task_complete": false
+}
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] [STEP 5/5] Parsing LLM response...
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] PARSING THINKING RESPONSE
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 1: Extracting JSON from response...
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Response preview: {
+    "analysis": "We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.",
+    "criteria_assessment": {
+        "complete": [
+            "Retrieve availa...
+2025-12-10 23:33:07,043 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ JSON extracted successfully
+2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → JSON length: 883 chars
+2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 2: Parsing JSON...
+2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ JSON parsed successfully
+2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Top-level keys: ['analysis', 'criteria_assessment', 'last_result_analysis', 'decision', 'reasoning', 'is_task_complete']
+2025-12-10 23:33:07,044 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 3: Extracting decision...
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Raw decision string: 'RESPOND_WITH_OPTIONS'
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Mapped to: respond_options
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 4: Extracting additional fields...
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Analysis: We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choos...
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Reasoning: We need to ask the user to pick from the returned available time slots to proceed with booking.
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Is task complete: False
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 5: Processing criteria assessment...
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Assessment keys: ['complete', 'pending', 'blocked']
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Criteria marked complete: ['Retrieve available time slots for Dr. Mohammed Atef on the requested date']
+2025-12-10 23:33:07,045 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]       • Marking 'Retrieve available time slots for Dr. Mohammed Atef on the requested date' as complete...
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - ✅ Criterion COMPLETE: Retrieve available time slots for Dr. Mohammed Atef on the requested date
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]         ✅ Marked
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Criteria still pending: ['Prompt user to select a time']
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 6: Processing last result analysis...
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Last tool: check_availability
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Result type: partial
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   → Interpretation: Availability for 2025-12-17 was returned with a list of open time slots and ranges....
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 7: Extracting decision-specific data...
+2025-12-10 23:33:07,046 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] Step 8: Building ThinkingResult object...
+2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager]   ✅ ThinkingResult created successfully
+2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] PARSING COMPLETE - Decision: respond_options
+2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🔍 [AppointmentManager] ─────────────────────────────────────────
+2025-12-10 23:33:07,047 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   ✅ Parsing completed successfully
+2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Decision: respond_options
+2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Reasoning: We need to ask the user to pick from the returned available time slots to proceed with booking.
+2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Is task complete: False
+2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Analysis: We have identified Dr. Mohammed Atef's ID and successfully retrieved his available time slots for next Wednesday (2025-12-17). The user needs to choose a specific time for the root canal appointment.
+2025-12-10 23:33:07,048 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]   → Task status assessment:
+2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Complete: ['Retrieve available time slots for Dr. Mohammed Atef on the requested date']
+2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Pending: ['Prompt user to select a time']
+2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager]       • Blocked: []
+2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] ════════════════════════════════════════════════════════
+2025-12-10 23:33:07,049 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] EXITING _think() - Decision: respond_options
+2025-12-10 23:33:07,050 - patient_ai_service.agents.base_agent - INFO - 🧠 [AppointmentManager] ════════════════════════════════════════════════════════
+
+
+
+
+
+
+═══════════════════════════════════════════════════════════════
+CONVERSATION STATE
+═══════════════════════════════════════════════════════════════
+
+**User Facts (persistent, never lost):**
+{
+  "appointment_time": "10:30 AM",
+  "appointment_date": "17"
+}
+
+**Conversation Summary:**
+No previous conversation
+
+**Recent Messages (last 6 turns):**
+User: Has the appointment been booked?
+Assistant: من فضلك، في أي تاريخ تم تحديد الموعد الساعة 10:30 صباحاً؟
+User: Day 17
+Assistant: Which doctor would you like to book this appointment with?
+User: الميعاد اتحجز ولا لا يعم
+User: Has the appointment been booked or not, uncle?
+
+**System State:**
+- Last Action: asked_for_date
+- Awaiting Response: confirmation
+
+═══════════════════════════════════════════════════════════════
+CONTINUATION CONTEXT (Previous flow was interrupted)
+═══════════════════════════════════════════════════════════════
+
+The system is waiting for: user_selection
+Options presented to user: []
+Original request: 10:00
+Resolved so far: {}
+
+IMPORTANT: Check if user's message is a response to the above!
+
+═══════════════════════════════════════════════════════════════
+PATIENT INFORMATION
+═══════════════════════════════════════════════════════════════
+
+- Name: mohamed
+- Registered: Yes
+- Patient ID: 7b262a99-9491-4a6c-b5ae-fcd6e9fd319f
+
+═══════════════════════════════════════════════════════════════
+NEW USER MESSAGE
+═══════════════════════════════════════════════════════════════
+
+"Has the appointment been booked or not, uncle?"
+
+═══════════════════════════════════════════════════════════════
+CONTINUATION DETECTION RULES
+═══════════════════════════════════════════════════════════════
+
+If user's message is short (1-3 words) AND system was awaiting a response:
+- "yeah", "ok", "sure" → User CONFIRMS previous suggestion
+- "3pm", "4pm", "2:30" → User SELECTS a time from options
+- "the first one" → User selects first option
+- "no", "neither" → User REJECTS options, needs alternatives
+- "actually..." → User wants to CHANGE something
+
+When detected as continuation:
+- Set is_continuation: true
+- Set continuation_type: "selection" | "confirmation" | "rejection"
+- Extract selected_option if applicable
+- Include resolved_entities from continuation context
+
+═══════════════════════════════════════════════════════════════
+YOUR TASK
+═══════════════════════════════════════════════════════════════
+
+Analyze and respond with ONLY a valid JSON object.
+
+CRITICAL RULES:
+- Output ONLY the JSON object, no other text
+- Do NOT include comments (no // or # characters)
+- Use lowercase true/false for booleans (not True/False)
+- Use null for missing values (not None or "null")
+
+PLAN GENERATION (for response_guidance.plan):
+- ALWAYS generate a plan when routing to appointment_manager
+- Plan should be 2-4 concise steps
+- Include specific tool names and actions
+- Examples:
+  * "1. Check if patient is registered (if not, redirect to registration), 2. Get doctor list, 3. Check availability for requested date/time, 4. Book appointment if available"
+  * "1. Get patient's existing appointments, 2. Display appointment details"
+  * "1. Get appointment by ID, 2. Update status to cancelled with reason"
+- For other agents, plan can be brief or empty
+
+JSON STRUCTURE (IMPORTANT: No comments allowed in JSON output):
+
+{
+    "understanding": {
+        "what_user_means": "Plain English explanation of what user actually wants",
+        "is_continuation": "Is this continuing previous topic? RESPOND WITH bool true/false",
+        "continuation_type": "selection/confirmation/rejection/new_request/null",
+        "selected_option": "value user selected or null",
+        "sentiment": "affirmative/negative/neutral/unclear",
+        "is_conversation_restart": false
+    },
+    "routing": {
+        "agent": "appointment_manager/registration/general_assistant/medical_inquiry/emergency_response",
+        "action": "Specific action for agent to take",
+        "urgency": "routine/urgent/emergency"
+    },
+    "memory_updates": {
+        "new_facts": {},
+        "system_action": "What the system/agent DID so far in this conversation. Examples: 'asked_for_date', 'provided_doctor_list', 'checked_availability', 'proposed_registration', 'showed_appointments', 'asked_for_confirmation'. Use past tense. REQUIRED - always provide this.",
+        "awaiting": "What the system is waiting for from the user. Examples: 'date_selection', 'time_confirmation', 'doctor_choice', 'user_info', 'confirmation', 'appointment_id'. Use empty string '' if not waiting for anything. REQUIRED - always provide this (even if empty)."
+    },
+    "response_guidance": {
+        "tone": "decide based on user tone",
+        "task_context": {
+            "user_intent": "What user wants (incorporate continuation context if resuming)",
+            "success_criteria": [],
+            "constraints": [],
+            "prior_context": "Relevant context including previous options",
+            "is_continuation": true/false,
+            "continuation_type": "selection/confirmation/rejection/null",
+            "selected_option": "The option user selected",
+            "continuation_context": {}
+        },
+        "minimal_context": {
+            "user_wants": "Brief what user wants",
+            "action": "Suggested action",
+            "prior_context": "Any relevant prior context"
+        },
+        "plan": "Short step-by-step plan for the agent."
+    },
+    "reasoning_chain": [
+        "Step 1: What I observe...",
+        "Step 2: What I conclude...",
+        "Step 3: Therefore..."
+    ]
+}
+
+FIELD VALUES GUIDE:
+- understanding.is_continuation: true if continuing previous topic, else false
+- understanding.continuation_type: "selection", "confirmation", "rejection", "new_request", or null
+- understanding.sentiment: "affirmative", "negative", "neutral", or "unclear"
+- routing.agent: "appointment_manager", "registration", "general_assistant", "medical_inquiry", or "emergency_response"
+- routing.urgency: "routine", "urgent", or "emergency"
+- memory_updates.system_action: Past tense action like "showed_appointments", "asked_for_date", etc.
+- memory_updates.awaiting: What system waits for like "confirmation", "date_selection", or "" if nothing
+- response_guidance.tone: "helpful", "empathetic", "urgent", or "professional"
+
+KEY RULES:
+1. If system proposed action (check "Last Action") and user said "yeah/ok/sure/yes" → is_continuation=true, sentiment=affirmative
+2. Emergency keywords (severe bleeding, can't breathe, knocked out, severe pain) → urgency=emergency
+3. Extract ONLY NEW facts to new_facts (don't repeat what's in user_facts already)
+4. For minimal_context, keep it BRIEF - just essential info
+5. If user not registered and wants to book appointment → recommend registration first
+6. Short ambiguous responses like "tomorrow" → likely continuation of previous topic
+
+
+
+
+
+
+
+
+
+"""Analyze this conversation situation and respond with ONE complete JSON.
+
+{registration_status_section}
+═══════════════════════════════════════════════════════════════
+CONVERSATION STATE
+═══════════════════════════════════════════════════════════════
+
+**User Facts (persistent, never lost):**
+{json.dumps(memory.user_facts, indent=2) if memory.user_facts else "None collected yet"}
+
+**Conversation Summary:**
+{memory.summary if memory.summary else ""}
+
+**Recent Messages (last {len(memory.recent_turns)} turns):**
+{recent_turns_formatted if recent_turns_formatted else "No previous messages"}
+
+**System State:**
+- Last Action: {memory.last_action or "None"}
+- Awaiting Response: {memory.awaiting or "Nothing specific"}
+{continuation_section}
+═══════════════════════════════════════════════════════════════
+PATIENT INFORMATION
+═══════════════════════════════════════════════════════════════
+
+- Name: {patient_info.get('first_name', 'Unknown')}
+- Registered: {'Yes' if patient_info.get('patient_id') else 'No - NOT registered yet'}
+- Patient ID: {patient_info.get('patient_id', 'None')}
+═══════════════════════════════════════════════════════════════
+NEW USER MESSAGE
+═══════════════════════════════════════════════════════════════
+
+"{user_message}"
+
+═══════════════════════════════════════════════════════════════
+CONTINUATION DETECTION RULES
+═══════════════════════════════════════════════════════════════
+
+If user's message is short (1-3 words) AND system was awaiting a response:
+- "yeah", "ok", "sure" → User CONFIRMS previous suggestion
+- "3pm", "4pm", "2:30" → User SELECTS a time from options
+- "the first one" → User selects first option
+- "no", "neither" → User REJECTS options, needs alternatives
+- "actually..." → User wants to CHANGE something
+
+When detected as continuation:
+- Set is_continuation: true
+- Set continuation_type: "selection" | "confirmation" | "rejection"
+- Extract selected_option if applicable
+- Include resolved_entities from continuation context
+
+═══════════════════════════════════════════════════════════════
+YOUR TASK
+═══════════════════════════════════════════════════════════════
+
+Analyze and respond with ONLY a valid JSON object.
+
+CRITICAL RULES:
+- Output ONLY the JSON object, no other text
+- Do NOT include comments (no // or # characters)
+- Use lowercase true/false for booleans (not True/False)
+- Use null for missing values (not None or "null")
+
+PLAN GENERATION (for response_guidance.plan):
+- ALWAYS generate a plan when routing to appointment_manager
+- Plan should be 2-4 concise steps
+- Include specific tool names and actions
+- Examples:
+  * "1. Check if patient is registered (if not, redirect to registration), 2. Get doctor list, 3. Check availability for requested date/time, 4. Book appointment if available"
+  * "1. Get patient's existing appointments, 2. Display appointment details"
+  * "1. Get appointment by ID, 2. Update status to cancelled with reason"
+- For other agents, plan can be brief or empty
+
+JSON STRUCTURE (IMPORTANT: No comments allowed in JSON output):
+
+{{
+    "understanding": {{
+        "what_user_means": "Plain English explanation of what user actually wants",
+        "is_continuation": "Is this continuing previous topic? RESPOND WITH bool true/false",
+        "continuation_type": "selection/confirmation/rejection/new_request/null",
+        "selected_option": "value user selected or null",
+        "sentiment": "affirmative/negative/neutral/unclear",
+        "is_conversation_restart": false
+    }},
+    "routing": {{
+        "agent": "appointment_manager/registration/general_assistant/medical_inquiry/emergency_response",
+        "action": "Specific action for agent to take",
+        "urgency": "routine/urgent/emergency"
+    }},
+    "memory_updates": {{
+        "new_facts": {{}},
+        "system_action": "What the system/agent DID so far in this conversation. Examples: 'asked_for_date', 'provided_doctor_list', 'checked_availability', 'proposed_registration', 'showed_appointments', 'asked_for_confirmation'. Use past tense. REQUIRED - always provide this.",
+        "awaiting": "What the system is waiting for from the user. Examples: 'date_selection', 'time_confirmation', 'doctor_choice', 'user_info', 'confirmation', 'appointment_id'. Use empty string '' if not waiting for anything. REQUIRED - always provide this (even if empty)."
+    }},
+    "response_guidance": {{
+        "tone": "decide based on user tone",
+        "task_context": {{
+            "user_intent": "What user wants (incorporate continuation context if resuming)",
+            "success_criteria": [],
+            "constraints": [],
+            "prior_context": "Relevant context including previous options",
+            "is_continuation": true/false,
+            "continuation_type": "selection/confirmation/rejection/null",
+            "selected_option": "The option user selected",
+            "continuation_context": {{}}
+        }},
+        "minimal_context": {{
+            "user_wants": "Brief what user wants",
+            "action": "Suggested action",
+            "prior_context": "Any relevant prior context"
+        }},
+        "plan": "Short step-by-step plan for the agent."
+    }},
+    "reasoning_chain": [
+        "Step 1: What I observe...",
+        "Step 2: What I conclude...",
+        "Step 3: Therefore..."
+    ]
+}}
+
+FIELD VALUES GUIDE:
+- understanding.is_continuation: true if continuing previous topic, else false
+- understanding.continuation_type: "selection", "confirmation", "rejection", "new_request", or null
+- understanding.sentiment: "affirmative", "negative", "neutral", or "unclear"
+- routing.agent: "appointment_manager", "registration", "general_assistant", "medical_inquiry", or "emergency_response"
+- routing.urgency: "routine", "urgent", or "emergency"
+- memory_updates.system_action: Past tense action like "showed_appointments", "asked_for_date", etc.
+- memory_updates.awaiting: What system waits for like "confirmation", "date_selection", or "" if nothing
+- response_guidance.tone: "helpful", "empathetic", "urgent", or "professional"
+
+KEY RULES:
+1. If system proposed action (check "Last Action") and user said "yeah/ok/sure/yes" → is_continuation=true, sentiment=affirmative
+2. Emergency keywords (severe bleeding, can't breathe, knocked out, severe pain) → urgency=emergency
+3. Extract ONLY NEW facts to new_facts (don't repeat what's in user_facts already)
+4. For minimal_context, keep it BRIEF - just essential info
+5. If user not registered and wants to book appointment → recommend registration first
+6. Short ambiguous responses like "tomorrow" → likely continuation of previous topic
+
+RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""

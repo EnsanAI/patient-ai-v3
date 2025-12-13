@@ -832,6 +832,11 @@ class BaseAgent(ABC):
                 logger.info(f"[{self.agent_name}] Asking for clarification")
                 return thinking.clarification_question, execution_log
             
+            elif thinking.decision == AgentDecision.COLLECT_INFORMATION:
+                logger.info(f"[{self.agent_name}] Collecting information - generating focused response")
+                response = await self._generate_focused_response(session_id, exec_context)
+                return response, execution_log
+            
             elif thinking.decision == AgentDecision.RETRY:
                 logger.info(f"[{self.agent_name}] Retrying last action")
                 # Don't increment if we just executed recovery (recovery has its own tracking)
@@ -1168,13 +1173,13 @@ YOUR RESPONSE FORMAT:
         "remaining": ["List of actions still needed"],
         "is_complete": true/false
     },
-    "decision": "CALL_TOOL" | "RESPOND" | "RETRY" | "CLARIFY",
+    "decision": "CALL_TOOL" | "RESPOND" | "RETRY" | "CLARIFY" | "COLLECT_INFORMATION",
     "reasoning": "Why I'm making this decision...",
     "tool_call": {
         "name": "tool_name (if decision is CALL_TOOL)",
         "input": { "param": "value" }
     },
-    "response": "Final response text (if decision is RESPOND or CLARIFY)"
+    "response": "Final response text (if decision is RESPOND or CLARIFY or COLLECT_INFORMATION)"
 }
 ```
 
@@ -1187,6 +1192,8 @@ DECISION GUIDE:
 - RETRY: A tool failed and I should try a different approach
 
 - CLARIFY: I need more information from the user
+
+- COLLECT_INFORMATION: Collect missing or required information from user
 
 """
 
@@ -1843,6 +1850,11 @@ CLARIFY:
 - Required parameters are missing
 - Ask a specific question
 
+COLLECT_INFORMATION:
+- You need to exit the agentic loop to collect information from the user
+- Use this when you need to gather data before continuing execution
+- Response will pass through focused response generation for natural output
+
 RETRY:
 - A tool returned result_type=SYSTEM_ERROR
 - Haven't exceeded retry limit
@@ -2001,7 +2013,7 @@ Respond with JSON:
         "interpretation": "what this result means for our task"
     }},
     
-    "decision": "CALL_TOOL | RESPOND | RESPOND_WITH_OPTIONS | RESPOND_IMPOSSIBLE | CLARIFY | RETRY",
+    "decision": "CALL_TOOL | RESPOND | RESPOND_WITH_OPTIONS | RESPOND_IMPOSSIBLE | CLARIFY | COLLECT_INFORMATION | RETRY",
     "reasoning": "Why I chose this decision",
     
     "is_task_complete": true/false,
@@ -2012,6 +2024,9 @@ Respond with JSON:
     
     // If CLARIFY:
     "clarification_question": "The specific question to ask"
+    
+    // If COLLECT_INFORMATION:
+    // (No additional fields needed - response will be generated via focused response generation)
 }}
 
 DECISION RULES:
@@ -2020,6 +2035,7 @@ DECISION RULES:
 3. If last result has alternatives and available=false → RESPOND_WITH_OPTIONS
 4. If task impossible → RESPOND_IMPOSSIBLE
 5. Only CLARIFY if execution reveals missing CRITICAL data not in context
+6. Use COLLECT_INFORMATION when you need to exit agentic loop to gather information from user
 """
             
         logger.info(f"📝 [{self.agent_name}]   ✅ Final prompt assembled")
@@ -2027,8 +2043,10 @@ DECISION RULES:
         logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
         logger.info(f"📝 [{self.agent_name}] PROMPT BUILDING COMPLETE")
         logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
-        logger.debug(f"📝 [{self.agent_name}] Full prompt content:\n{prompt}")
-        
+        logger.info(80*">")
+        logger.info(f"📝 [{self.agent_name}] Full thinking prompt content:\n{prompt}")
+        logger.info(80*">")
+
         return prompt
 
     def _parse_thinking_response(
@@ -2078,7 +2096,8 @@ DECISION RULES:
                 "RESPOND_IMPOSSIBLE": AgentDecision.RESPOND_IMPOSSIBLE,
                 "CLARIFY": AgentDecision.CLARIFY,
                 "RETRY": AgentDecision.RETRY,
-                "EXECUTE_RECOVERY": AgentDecision.EXECUTE_RECOVERY
+                "EXECUTE_RECOVERY": AgentDecision.EXECUTE_RECOVERY,
+                "COLLECT_INFORMATION": AgentDecision.COLLECT_INFORMATION
             }
             decision = decision_map.get(decision_str, AgentDecision.RESPOND)
             logger.info(f"🔍 [{self.agent_name}]   → Mapped to: {decision.value}")
@@ -2150,6 +2169,9 @@ DECISION RULES:
                 
                 if not clarification_question:
                     logger.warning(f"🔍 [{self.agent_name}]   ⚠️  CLARIFY decision but no clarification_question provided!")
+            
+            elif decision == AgentDecision.COLLECT_INFORMATION:
+                logger.info(f"🔍 [{self.agent_name}]   → Collecting information - will generate focused response")
             
             # Build result
             logger.info(f"🔍 [{self.agent_name}] Step 8: Building ThinkingResult object...")
@@ -2350,7 +2372,7 @@ DECISION RULES:
         
         prompt = self._build_thinking_prompt(message, context, exec_context)
         logger.info(f"🧠 [{self.agent_name}]   → Prompt length: {len(prompt)} chars")
-        logger.debug(f"🧠 [{self.agent_name}]   → Full prompt:\n{prompt}")
+        logger.info(f"🧠 [{self.agent_name}]   → Full thinking prompt:\n{prompt}")
         
         # ═════════════════════════════════════════════════════════════════════
         # STEP 3: PREPARE LLM CALL
@@ -2441,6 +2463,9 @@ DECISION RULES:
             
             if thinking_result.decision == AgentDecision.CLARIFY:
                 logger.info(f"🧠 [{self.agent_name}]   → Clarification question: {thinking_result.clarification_question}")
+            
+            if thinking_result.decision == AgentDecision.COLLECT_INFORMATION:
+                logger.info(f"🧠 [{self.agent_name}]   → Collecting information - will exit agentic loop and generate focused response")
             
             if thinking_result.task_status:
                 logger.info(f"🧠 [{self.agent_name}]   → Task status assessment:")
@@ -2995,6 +3020,11 @@ DECISION RULES:
         
         execution_summary = self._build_execution_summary(exec_context)
         
+        # Get agent's system prompt to include critical restrictions
+        agent_system_prompt = self._get_system_prompt(session_id)
+        # Extract key restrictions section if present (for registration agent, this is critical)
+        agent_restrictions = self._extract_key_restrictions(agent_system_prompt)
+        
         logger.info(f"👩🏻‍💻 [{self.agent_name}] Focused response inputs:")
         logger.info(f"👩🏻‍💻   - user_wants: {user_wants}")
         logger.info(f"👩🏻‍💻   - tone: {tone}")
@@ -3002,6 +3032,7 @@ DECISION RULES:
         logger.info(f"👩🏻‍💻   - dialect: {dialect}")
         logger.info(f"👩🏻‍💻   - execution_summary: {execution_summary}")
         logger.info(f"👩🏻‍💻   - observations_count: {len(exec_context.observations)}")
+        logger.info(f"👩🏻‍💻   - agent_restrictions: {agent_restrictions[:200] if agent_restrictions else 'None'}...")
         
         system_prompt = f"""Generate a {tone} response for a clinic receptionist.
 
@@ -3013,6 +3044,8 @@ DIALECT: {dialect if dialect else ""}
 WHAT HAPPENED:
 {execution_summary}
 
+{agent_restrictions if agent_restrictions else ""}
+
 RULES:
 - Report what actually happened (based on execution results above)
 - Be {tone} and super natural
@@ -3020,7 +3053,8 @@ RULES:
 - Don't sound redundant
 - No JSON, UUIDs, or technical details
 - Use user's language preference
-- Keep it concise (2-4 sentences)"""
+- Keep it concise (2-4 sentences)
+- **CRITICAL**: If this is a registration agent asking for information, ONLY ask for the required fields specified in the agent restrictions above. DO NOT ask for optional fields like email, insurance, allergies, medications, etc."""
 
         logger.info(f"🅰 [{self.agent_name}] System prompt length: {len(system_prompt)} chars")
         logger.debug(f"🅰 [{self.agent_name}] Full system prompt:\n{system_prompt}")
@@ -3123,6 +3157,44 @@ RULES:
             return f"Found doctor: {result.get('doctor_name', 'Unknown')}"
         # Generic fallback
         return str(result.get("message", result.get("data", "Completed")))[:100]
+
+    def _extract_key_restrictions(self, system_prompt: str) -> str:
+        """
+        Extract key restrictions from agent's system prompt for focused response generation.
+        Looks for sections about what to collect/not collect.
+        """
+        # Look for common restriction patterns
+        restrictions = []
+        
+        # Check for "ONLY" or "DO NOT" patterns
+        lines = system_prompt.split('\n')
+        in_restriction_section = False
+        restriction_lines = []
+        
+        for i, line in enumerate(lines):
+            # Look for key restriction markers
+            if any(marker in line.upper() for marker in ['ONLY', 'DO NOT', 'REQUIRED FIELDS', 'COLLECT ONLY', 'YOUR ROLE']):
+                in_restriction_section = True
+                restriction_lines.append(line)
+            elif in_restriction_section:
+                # Continue collecting until we hit a section break or empty line followed by new section
+                if line.strip() and not line.strip().startswith('═'):
+                    restriction_lines.append(line)
+                elif line.strip().startswith('═') or (line.strip() == '' and i < len(lines) - 1 and lines[i+1].strip().startswith('═')):
+                    # Hit a new section, stop collecting
+                    break
+        
+        if restriction_lines:
+            # Extract the most relevant parts (usually the first few lines with restrictions)
+            key_lines = []
+            for line in restriction_lines[:15]:  # Limit to first 15 lines
+                if any(keyword in line.upper() for keyword in ['ONLY', 'DO NOT', 'REQUIRED', 'COLLECT', 'NOT ASK']):
+                    key_lines.append(line.strip())
+            
+            if key_lines:
+                return "\n".join(key_lines)
+        
+        return ""
 
 # ==================== HELPER CLASSES ====================
 

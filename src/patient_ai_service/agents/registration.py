@@ -1,14 +1,17 @@
 """
 Registration Agent.
 
-Handles new patient registration flow.
+Simplified agent for new patient registration using a single tool with state persistence.
 """
 
 import logging
+import re
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 from .base_agent import BaseAgent
 from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
+from patient_ai_service.models.agentic import ToolResultType
 
 logger = logging.getLogger(__name__)
 
@@ -18,19 +21,11 @@ class RegistrationAgent(BaseAgent):
     Agent for new patient registration.
 
     Features:
-    - Collect patient information
-    - Validate required fields
-    - Create user and patient records
-    - Track completion progress
+    - Single register_patient tool that accepts partial info
+    - State persistence across conversation turns
+    - Dynamic result types (SUCCESS, USER_INPUT_NEEDED, SYSTEM_ERROR)
+    - Natural conversation flow with entity extraction
     """
-
-    REQUIRED_FIELDS = [
-        "first_name",
-        "last_name",
-        "phone",
-        "date_of_birth",
-        "gender"
-    ]
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
         super().__init__(agent_name="Registration", **kwargs)
@@ -38,389 +33,295 @@ class RegistrationAgent(BaseAgent):
 
     async def on_activated(self, session_id: str, reasoning: Any):
         """
-        Set up registration workflow when agent is activated.
+        Set up registration context when agent is activated.
 
-        Args:
-            session_id: Session identifier
-            reasoning: ReasoningOutput from reasoning engine
+        Extracts any entities from reasoning and persists them to state.
         """
-        # Get current registration state
-        reg_state = self.state_manager.get_registration_state(session_id)
-        global_state = self.state_manager.get_global_state(session_id)
+        logger.info(f"Registration agent activated for session {session_id}")
 
-        # If registration not started, initialize it
-        if not reg_state.form_completion:
-            logger.info(f"Initializing registration workflow for session {session_id}")
+        # Extract entities from reasoning if available
+        if reasoning and hasattr(reasoning, 'response_guidance'):
+            task_context = reasoning.response_guidance.task_context
+            if hasattr(task_context, 'entities') and task_context.entities:
+                entities = task_context.entities
+                # Filter to only registration-relevant fields
+                valid_fields = ['first_name', 'last_name', 'phone', 'date_of_birth', 'gender']
+                updates = {k: v for k, v in entities.items() if k in valid_fields and v}
 
-            # Determine missing fields
-            missing_fields = []
-            for field in self.REQUIRED_FIELDS:
-                # Check if field exists in patient profile
-                profile_value = getattr(global_state.patient_profile, field, None)
-                if not profile_value:
-                    missing_fields.append(field)
-
-            # Update registration state
-            self.state_manager.update_registration_state(
-                session_id,
-                current_section="personal_info",
-                workflow_step="collecting",
-                missing_fields=missing_fields
-            )
-
-            logger.info(f"Registration initialized with {len(missing_fields)} missing fields")
+                if updates:
+                    self.state_manager.update_patient_profile(session_id, **updates)
+                    logger.info(f"Extracted entities from reasoning: {list(updates.keys())}")
 
     def _register_tools(self):
-        """Register registration tools."""
-
-        # Save field
+        """Register the single registration tool."""
         self.register_tool(
-            name="save_field",
-            function=self.tool_save_field,
-            description="Save a single registration field",
+            name="register_patient",
+            function=self.tool_register_patient,
+            description="""Register a new patient with the clinic.
+
+This tool requires ALL 5 fields to be provided. The tool will:
+1. Validate all required fields are present
+2. Normalize date format automatically
+3. Create user account and patient record in database
+4. Return SUCCESS with patient_id when registration is complete
+
+If any field is missing or invalid, the tool returns USER_INPUT_NEEDED with details about what's missing.
+
+REQUIRED FIELDS (all must be provided):
+- first_name: Patient's first name
+- last_name: Patient's last name
+- phone: Phone number (any format accepted)
+- date_of_birth: Date of birth (YYYY-MM-DD preferred, but flexible formats accepted)
+- gender: Gender (male, female, or other)
+
+The tool will automatically normalize date formats and handle existing users.""",
             parameters={
-                "field_name": {
+                "first_name": {
                     "type": "string",
-                    "description": "Field name (e.g., 'first_name', 'phone')"
+                    "description": "REQUIRED: Patient's first name",
+                    "required": True
                 },
-                "value": {
+                "last_name": {
                     "type": "string",
-                    "description": "Field value"
+                    "description": "REQUIRED: Patient's last name",
+                    "required": True
+                },
+                "phone": {
+                    "type": "string",
+                    "description": "REQUIRED: Phone number in any format (e.g., +1234567890, 123-456-7890)",
+                    "required": True
+                },
+                "date_of_birth": {
+                    "type": "string",
+                    "description": "REQUIRED: Date of birth. Preferred format: YYYY-MM-DD (e.g., 1990-05-15). Also accepts: DD-MM-YYYY, DD/MM/YYYY, MM-DD-YYYY formats which will be auto-normalized",
+                    "required": True
+                },
+                "gender": {
+                    "type": "string",
+                    "description": "REQUIRED: Gender. Valid values: male, female, other",
+                    "required": True
                 }
             }
-        )
-
-        # Save list field
-        self.register_tool(
-            name="save_list",
-            function=self.tool_save_list,
-            description="Save a list field (allergies, medications, etc.)",
-            parameters={
-                "field_name": {
-                    "type": "string",
-                    "description": "Field name (e.g., 'allergies', 'medications')"
-                },
-                "values": {
-                    "type": "array",
-                    "description": "List of values",
-                    "items": {"type": "string"}
-                }
-            }
-        )
-
-        # Check completion status
-        self.register_tool(
-            name="check_completion",
-            function=self.tool_check_completion,
-            description="Check registration completion status",
-            parameters={}
-        )
-
-        # Complete registration
-        self.register_tool(
-            name="complete_registration",
-            function=self.tool_complete_registration,
-            description="Finalize and submit registration",
-            parameters={}
         )
 
     def _get_system_prompt(self, session_id: str) -> str:
-        """Generate registration system prompt."""
-        reg_state = self.state_manager.get_registration_state(session_id)
+        """Generate simplified registration system prompt."""
         global_state = self.state_manager.get_global_state(session_id)
-        
-        # Check if registration is actually complete (patient exists in DB)
-        patient_registered = (
-            global_state.patient_profile.patient_id is not None and
-            global_state.patient_profile.patient_id != ""
-        )
-        registration_complete = reg_state.registration_complete if reg_state else False
-        
-        # Determine actual registration status
-        if patient_registered or registration_complete:
-            registration_status = "✅ REGISTRATION COMPLETE - Patient is registered in system"
-        elif reg_state.form_completion >= 1.0:
-            registration_status = f"⚠️ FORM COMPLETE ({reg_state.form_completion * 100:.0f}%) BUT NOT SUBMITTED - Use complete_registration tool to finalize"
-        else:
-            registration_status = f"🔄 IN PROGRESS: {reg_state.form_completion * 100:.0f}% complete"
+        patient = global_state.patient_profile
+        reg_state = self.state_manager.get_registration_state(session_id)
+
+        # Check if already registered
+        if patient.patient_id:
+            return f"""You are a patient registration assistant for Bright Smile Dental Clinic.
+
+✅ REGISTRATION COMPLETE
+Patient {patient.first_name} {patient.last_name} is already registered.
+Patient ID: {patient.patient_id}
+
+If user needs to update information or has other requests, guide them appropriately."""
+
+        # Build status display
+        known_info = []
+        missing_info = []
+
+        fields = [
+            ("first_name", "First name", patient.first_name),
+            ("last_name", "Last name", patient.last_name),
+            ("phone", "Phone", patient.phone),
+            ("date_of_birth", "Date of birth", patient.date_of_birth),
+            ("gender", "Gender", patient.gender),
+        ]
+
+        for field_name, display_name, value in fields:
+            if value:
+                known_info.append(f"✓ {display_name}: {value}")
+            else:
+                missing_info.append(display_name)
+
+        status_section = "\n".join(known_info) if known_info else "No information collected yet"
+        missing_section = ", ".join(missing_info) if missing_info else "All fields collected!"
 
         return f"""You are a patient registration assistant for Bright Smile Dental Clinic.
 
 REGISTRATION STATUS:
-{registration_status}
-- Current Section: {reg_state.current_section}
-- Missing Fields: {', '.join(reg_state.missing_fields) if reg_state.missing_fields else 'None'}
+{status_section}
 
-COLLECTED INFORMATION:
-{self._format_collected_fields(reg_state.collected_fields)}
+STILL NEEDED:
+{missing_section}
 
-YOUR ROLE:
-1. Welcome new patients warmly
-2. Collect ONLY the 5 required fields (first name, last name, phone, DOB, gender)
-3. DO NOT ask for any optional information (email, address, emergency contacts, insurance, allergies, medications, etc.)
-4. Validate inputs (phone numbers, dates, etc.)
-5. Track progress and show completion status
-6. Complete registration as soon as all 5 fields are collected
-7. **IMPORTANT**: If user wants to schedule an appointment, redirect them to appointment scheduling AFTER registration is complete
+INSTRUCTIONS:
+1. Greet new patients warmly
+2. Call register_patient with any new info you learn (the tool saves progress automatically)
+3. If tool returns USER_INPUT_NEEDED → ask user for missing fields naturally
+4. If tool returns SUCCESS → congratulate and confirm registration
+5. You can ask for multiple fields at once to speed up the process
 
-REQUIRED FIELDS:
-✓ First Name
-✓ Last Name
-✓ Phone Number
-✓ Date of Birth
-✓ Gender
+TOOL: register_patient(first_name, last_name, phone, date_of_birth, gender)
+- ALL parameters are REQUIRED - you must have all 5 fields before calling
+- Date format: YYYY-MM-DD preferred (but tool accepts various formats and normalizes automatically)
+- If you don't have all fields yet, use COLLECT_INFORMATION to ask the user for missing fields
 
-IMPORTANT INSTRUCTIONS:
-- When ALL required fields are collected (form_completion = 100%), you MUST call the complete_registration tool
-- Do NOT wait for the user to explicitly ask to complete - if form is 100% complete, complete it automatically
-- After calling complete_registration successfully, you MUST provide a warm, congratulatory message to the user
-- DO NOT just say "Using tool: complete_registration" - instead, provide a complete response like:
-  "🎉 Congratulations! Your registration is now complete! You're all set to book appointments with us. How can I help you today?"
-- Always follow up tool calls with a natural, conversational response
+PRIVACY: Your information is securely stored and used only for providing dental care."""
 
-COLLECTION STRATEGY:
-1. Collect first name
-2. Collect last name
-3. Collect phone number (international format)
-4. Collect date of birth (YYYY-MM-DD)
-5. Collect gender
-6. Complete registration - DO NOT ask for any other information
-
-GUIDELINES:
-- One question at a time (don't overwhelm)
-- Explain data privacy and security
-- Validate formats (phone: international format, DOB: YYYY-MM-DD)
-- **CRITICAL: You MUST use the save_field tool to save each piece of information the user provides**
-- **When user provides their name, phone, DOB, gender, or emergency contact info, IMMEDIATELY call save_field tool**
-- **DO NOT claim registration is complete unless registration_complete flag is True**
-- **If form is 100% complete (form_completion >= 1.0), you MUST automatically call complete_registration tool - do not wait for user to ask**
-- **If user requests appointment scheduling and registration is incomplete, complete registration first, then redirect to appointment scheduling**
-- Be patient and understanding
-- Confirm information before finalizing
-- Congratulate on completion
-
-PRIVACY STATEMENT:
-"Your information is securely stored and used only for providing dental care. We comply with all data protection regulations and never share your information without consent."
-
-Use tools to save information and track progress."""
-
-        return prompt
-
-    def _format_collected_fields(self, fields: Dict[str, Any]) -> str:
-        """Format collected fields for display."""
-        if not fields:
-            return "None yet"
-
-        lines = []
-        for key, value in fields.items():
-            if value:
-                display_key = key.replace("_", " ").title()
-                lines.append(f"- {display_key}: {value}")
-
-        return "\n".join(lines) if lines else "None yet"
-
-    # Tool implementations
-
-    def tool_save_field(
+    def tool_register_patient(
         self,
         session_id: str,
-        field_name: str,
-        value: str
+        first_name: str,
+        last_name: str,
+        phone: str,
+        date_of_birth: str,
+        gender: str
     ) -> Dict[str, Any]:
-        """Save a registration field."""
+        """
+        Register a new patient with the clinic.
+
+        All parameters are REQUIRED. The tool validates all fields, normalizes the date,
+        and creates the user account and patient record.
+
+        Returns:
+            - SUCCESS: All fields valid, patient registered
+            - USER_INPUT_NEEDED: Missing or invalid fields, agent should collect correct info
+            - SYSTEM_ERROR: DB failure, should retry
+        """
         try:
-            reg_state = self.state_manager.get_registration_state(session_id)
-
-            # Update collected fields
-            collected = reg_state.collected_fields.copy()
-            collected[field_name] = value
-
-            # Update patient profile in global state
-            self.state_manager.update_patient_profile(
-                session_id,
-                **{field_name: value}
-            )
-
-            # Calculate completion
-            required_collected = sum(
-                1 for field in self.REQUIRED_FIELDS
-                if field in collected and collected[field]
-            )
-            completion = required_collected / len(self.REQUIRED_FIELDS)
-
-            # Update missing fields
-            missing = [
-                field for field in self.REQUIRED_FIELDS
-                if field not in collected or not collected[field]
-            ]
-
-            # Update state
-            self.state_manager.update_registration_state(
-                session_id,
-                collected_fields=collected,
-                form_completion=completion,
-                missing_fields=missing
-            )
-            
-            # Auto-complete registration if all required fields are collected
-            result = {
-                "success": True,
-                "field": field_name,
-                "value": value,
-                "completion": f"{completion * 100:.0f}%",
-                "remaining": len(missing),
-                "form_complete": completion >= 1.0
-            }
-            
-            # If form is 100% complete, automatically complete registration
-            if completion >= 1.0:
-                logger.info(f"Form is 100% complete for session {session_id}, auto-completing registration...")
-                completion_result = self.tool_complete_registration(session_id)
-                if "error" not in completion_result:
-                    result["registration_completed"] = True
-                    result["patient_id"] = completion_result.get("patient_id")
-                    result["user_id"] = completion_result.get("user_id")
-                else:
-                    result["registration_error"] = completion_result.get("error")
-                    logger.error(f"Failed to auto-complete registration: {completion_result.get('error')}")
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Error saving field: {e}")
-            return {"error": str(e)}
-
-    def tool_save_list(
-        self,
-        session_id: str,
-        field_name: str,
-        values: list
-    ) -> Dict[str, Any]:
-        """Save a list field."""
-        try:
-            # Update patient profile
-            self.state_manager.update_patient_profile(
-                session_id,
-                **{field_name: values}
-            )
-
-            # Update collected fields
-            reg_state = self.state_manager.get_registration_state(session_id)
-            collected = reg_state.collected_fields.copy()
-            collected[field_name] = values
-
-            self.state_manager.update_registration_state(
-                session_id,
-                collected_fields=collected
-            )
-
-            return {
-                "success": True,
-                "field": field_name,
-                "values": values,
-                "count": len(values)
-            }
-
-        except Exception as e:
-            logger.error(f"Error saving list: {e}")
-            return {"error": str(e)}
-
-    def tool_check_completion(self, session_id: str) -> Dict[str, Any]:
-        """Check registration completion status."""
-        try:
-            reg_state = self.state_manager.get_registration_state(session_id)
-
-            return {
-                "success": True,
-                "completion": f"{reg_state.form_completion * 100:.0f}%",
-                "complete": reg_state.form_completion >= 1.0,
-                "missing_fields": reg_state.missing_fields,
-                "collected_count": len(reg_state.collected_fields)
-            }
-
-        except Exception as e:
-            logger.error(f"Error checking completion: {e}")
-            return {"error": str(e)}
-
-    def tool_complete_registration(self, session_id: str) -> Dict[str, Any]:
-        """Complete registration and create user/patient records."""
-        try:
+            # === STEP 1: Check if already registered ===
             global_state = self.state_manager.get_global_state(session_id)
-            reg_state = self.state_manager.get_registration_state(session_id)
             patient = global_state.patient_profile
 
-            # Validate completion
-            if reg_state.form_completion < 1.0:
+            if patient.patient_id:
                 return {
-                    "error": "Registration incomplete",
-                    "missing": reg_state.missing_fields
+                    "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
+                    "patient_id": patient.patient_id,
+                    "user_id": patient.user_id,
+                    "already_registered": True,
+                    "suggested_response": f"You're already registered! Your patient ID is {patient.patient_id}."
                 }
 
-            # Check if user already exists
-            existing_user = self.db_client.get_user_by_phone_number(patient.phone)
-            
-            if existing_user:
-                # User already exists, use existing user_id
-                user_id = existing_user.get("id")
-                logger.info(f"User already exists with ID: {user_id}, skipping user creation")
-            else:
-                # Create user account
-                logger.info(f"Creating new user for phone: {patient.phone}")
-                user_data = self.db_client.register_user(
-                    email=patient.email or f"{patient.phone}@temp.clinic",
-                    full_name=f"{patient.first_name} {patient.last_name}",
-                    phone_number=patient.phone,
-                    role_id="patient_role_id",  # Default patient role
-                    language_preference=patient.preferred_language
-                )
+            # === STEP 2: Validate all required fields are provided ===
+            fields = {
+                "first_name": first_name.strip() if first_name else None,
+                "last_name": last_name.strip() if last_name else None,
+                "phone": phone.strip() if phone else None,
+                "date_of_birth": date_of_birth.strip() if date_of_birth else None,
+                "gender": gender.strip().lower() if gender else None
+            }
 
+            # Check for missing fields
+            missing = [k for k, v in fields.items() if not v]
+            if missing:
+                friendly_missing = [f.replace('_', ' ') for f in missing]
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "missing_fields": missing,
+                    "blocks_criteria": "registration_complete",
+                    "suggested_response": f"I need your {', '.join(friendly_missing)} to complete registration.",
+                    "next_action": "collect_information"
+                }
+
+            # === STEP 3: Normalize date ===
+            normalized_dob = self._normalize_date_of_birth(fields["date_of_birth"])
+            if not normalized_dob:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": "invalid_date_format",
+                    "invalid_field": "date_of_birth",
+                    "invalid_value": fields["date_of_birth"],
+                    "blocks_criteria": "registration_complete",
+                    "suggested_response": f"I couldn't parse '{fields['date_of_birth']}' as a date. Could you provide your date of birth as YYYY-MM-DD (e.g., 1990-05-15)?"
+                }
+
+            # Update fields with normalized date
+            fields["date_of_birth"] = normalized_dob
+
+            # === STEP 4: Save to state (for persistence) ===
+            self.state_manager.update_patient_profile(session_id, **fields)
+            logger.info(f"Saving registration info for patient: {fields['first_name']} {fields['last_name']}")
+
+            # === STEP 4: Normalize date ===
+            normalized_dob = self._normalize_date_of_birth(fields["date_of_birth"])
+            if not normalized_dob:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": "invalid_date_format",
+                    "invalid_field": "date_of_birth",
+                    "invalid_value": fields["date_of_birth"],
+                    "blocks_criteria": "registration_complete",
+                    "suggested_response": f"I couldn't parse '{fields['date_of_birth']}' as a date. Could you provide your date of birth as YYYY-MM-DD (e.g., 1990-05-15)?"
+                }
+
+            # === STEP 5: Create user & patient in DB ===
+            existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
+
+            if existing_user:
+                user_id = existing_user.get("id")
+                logger.info(f"Found existing user: {user_id}")
+            else:
+                # Create user
+                user_data = self.db_client.register_user(
+                    email=f"{fields['phone']}@temp.clinic",
+                    full_name=f"{fields['first_name']} {fields['last_name']}",
+                    phone_number=fields["phone"],
+                    role_id="patient_role_id"
+                )
                 if not user_data:
-                    # If registration failed, try to get user again (might have been created)
-                    logger.warning("User registration returned None, checking if user exists...")
-                    existing_user = self.db_client.get_user_by_phone_number(patient.phone)
+                    # Try to fetch user again (might have been created by race condition)
+                    existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
                     if existing_user:
                         user_id = existing_user.get("id")
-                        logger.info(f"User found after failed registration attempt: {user_id}")
                     else:
-                        return {"error": "Failed to create user account"}
+                        return {
+                            "success": False,
+                            "result_type": ToolResultType.SYSTEM_ERROR.value,
+                            "error": "user_creation_failed",
+                            "should_retry": True,
+                            "suggested_response": "I'm having trouble creating your account. Let me try again..."
+                        }
                 else:
                     user_id = user_data.get("userId") or user_data.get("id")
                     if not user_id:
-                        # Try to get user by phone as fallback
-                        existing_user = self.db_client.get_user_by_phone_number(patient.phone)
+                        # Fallback: try to get user by phone
+                        existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
                         if existing_user:
                             user_id = existing_user.get("id")
-                            logger.info(f"Got user_id from phone lookup: {user_id}")
                         else:
-                            return {"error": "Failed to get user ID from registration response"}
+                            return {
+                                "success": False,
+                                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                                "error": "user_id_not_returned",
+                                "should_retry": True,
+                                "suggested_response": "I'm having trouble setting up your account. Let me try again..."
+                            }
 
             # Create patient record
             patient_data = self.db_client.create_patient(
                 user_id=user_id,
-                first_name=patient.first_name,
-                last_name=patient.last_name,
-                date_of_birth=patient.date_of_birth,
-                gender=patient.gender,
-                emergency_contact_name=patient.emergency_contact_name,
-                emergency_contact_phone=patient.emergency_contact_phone,
-                insurance_provider=patient.insurance_provider,
-                insurance_policy_number=patient.insurance_id,
-                allergies=patient.allergies,
-                medications=patient.medications
+                first_name=fields["first_name"],
+                last_name=fields["last_name"],
+                date_of_birth=normalized_dob,
+                gender=fields["gender"]
             )
 
             if not patient_data:
-                return {"error": "Failed to create patient record"}
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "patient_creation_failed",
+                    "should_retry": True,
+                    "suggested_response": "I'm having trouble creating your patient record. Let me try again..."
+                }
 
             patient_id = patient_data.get("id")
 
-            # Update state
+            # === STEP 6: Update final state ===
             self.state_manager.update_patient_profile(
                 session_id,
                 patient_id=patient_id,
                 user_id=user_id
             )
-
             self.state_manager.update_registration_state(
                 session_id,
                 registration_complete=True
@@ -430,11 +331,90 @@ Use tools to save information and track progress."""
 
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "patient_id": patient_id,
                 "user_id": user_id,
-                "message": "Registration completed successfully!"
+                "satisfies_criteria": ["registration_complete"],
+                "suggested_response": f"Welcome {fields['first_name']}! You're now registered. Your patient ID is {patient_id}. You're all set to book appointments!"
             }
 
         except Exception as e:
-            logger.error(f"Error completing registration: {e}")
-            return {"error": str(e)}
+            logger.error(f"Registration error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True,
+                "suggested_response": "Something went wrong. Let me try again..."
+            }
+
+    def _normalize_date_of_birth(self, date_str: str) -> Optional[str]:
+        """
+        Normalize date of birth to YYYY-MM-DD format.
+
+        Accepts various formats:
+        - YYYY-MM-DD (already correct)
+        - DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY
+        - MM-DD-YYYY, MM/DD/YYYY (US format)
+
+        Returns normalized date in YYYY-MM-DD format or None if invalid.
+        """
+        if not date_str or not date_str.strip():
+            return None
+
+        date_str = date_str.strip()
+
+        # If already in YYYY-MM-DD format, validate and return
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+            try:
+                datetime.strptime(date_str, '%Y-%m-%d')
+                return date_str
+            except ValueError:
+                pass
+
+        # Try various date formats
+        date_formats = [
+            ('%d-%m-%Y', r'^\d{1,2}-\d{1,2}-\d{4}$'),
+            ('%d/%m/%Y', r'^\d{1,2}/\d{1,2}/\d{4}$'),
+            ('%d.%m.%Y', r'^\d{1,2}\.\d{1,2}\.\d{4}$'),
+            ('%m-%d-%Y', r'^\d{1,2}-\d{1,2}-\d{4}$'),
+            ('%m/%d/%Y', r'^\d{1,2}/\d{1,2}/\d{4}$'),
+        ]
+
+        for fmt, pattern in date_formats:
+            if re.match(pattern, date_str):
+                try:
+                    parsed_date = datetime.strptime(date_str, fmt)
+                    normalized = parsed_date.strftime('%Y-%m-%d')
+                    logger.info(f"Normalized date '{date_str}' to '{normalized}'")
+                    return normalized
+                except ValueError:
+                    continue
+
+        # Flexible approach: extract numbers and try to construct a date
+        numbers = re.findall(r'\d+', date_str)
+        if len(numbers) >= 3:
+            try:
+                day, month, year = map(int, numbers[:3])
+
+                # Validate ranges
+                if 1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100:
+                    try:
+                        parsed_date = datetime(year, month, day)
+                        normalized = parsed_date.strftime('%Y-%m-%d')
+                        logger.info(f"Normalized date '{date_str}' to '{normalized}'")
+                        return normalized
+                    except ValueError:
+                        # Try swapping day/month
+                        try:
+                            parsed_date = datetime(year, day, month)
+                            normalized = parsed_date.strftime('%Y-%m-%d')
+                            logger.info(f"Normalized date '{date_str}' to '{normalized}' (swapped day/month)")
+                            return normalized
+                        except ValueError:
+                            pass
+            except (ValueError, IndexError):
+                pass
+
+        logger.warning(f"Could not normalize date format: {date_str}")
+        return None

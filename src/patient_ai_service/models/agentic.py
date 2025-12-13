@@ -58,6 +58,7 @@ class AgentDecision(str, Enum):
     RESPOND_COMPLETE = "respond_complete"       # Task fully completed
     RESPOND_IMPOSSIBLE = "respond_impossible"   # Task cannot be done
     EXECUTE_RECOVERY = "execute_recovery"       # Execute recovery_action automatically
+    COLLECT_INFORMATION = "collect_information" # Exit agentic loop to collect information, passes through focused response generation
 
 
 # =============================================================================

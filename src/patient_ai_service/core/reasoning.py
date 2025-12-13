@@ -744,17 +744,36 @@ Resolved so far: {json.dumps(continuation_context.get('resolved_entities', {}), 
 IMPORTANT: Check if user's message is a response to the above!
 """
 
+        # Registration status section - ONLY when patient is NOT registered
+        registration_status_section = ""
+        is_registered = bool(patient_info.get('patient_id'))
+        if not is_registered:
+            registration_status_section = """
+═══════════════════════════════════════════════════════════════
+REGISTRATION STATUS - IMPORTANT
+═══════════════════════════════════════════════════════════════
+
+⚠️ PATIENT IS NOT REGISTERED
+
+The patient can ONLY inquire about the clinic through the general_assistant agent.
+
+For any other actions (booking appointments, managing appointments, etc.), 
+the patient MUST register first through the registration agent.
+
+ROUTING RULES:
+- General inquiries about the clinic → general_assistant (allowed)
+- Appointment booking, management, or any patient-specific actions → registration (must register first)
+- Medical inquiries → registration (must register first)
+- Emergency situations → registration (must register first)
+
+"""
+
         return f"""Analyze this conversation situation and respond with ONE complete JSON.
 
+{registration_status_section}
 ═══════════════════════════════════════════════════════════════
 CONVERSATION STATE
 ═══════════════════════════════════════════════════════════════
-
-**User Facts (persistent, never lost):**
-{json.dumps(memory.user_facts, indent=2) if memory.user_facts else "None collected yet"}
-
-**Conversation Summary:**
-{memory.summary if memory.summary else "No previous conversation"}
 
 **Recent Messages (last {len(memory.recent_turns)} turns):**
 {recent_turns_formatted if recent_turns_formatted else "No previous messages"}
@@ -772,29 +791,6 @@ PATIENT INFORMATION
 - Patient ID: {patient_info.get('patient_id', 'None')}
 
 ═══════════════════════════════════════════════════════════════
-NEW USER MESSAGE
-═══════════════════════════════════════════════════════════════
-
-"{user_message}"
-
-═══════════════════════════════════════════════════════════════
-CONTINUATION DETECTION RULES
-═══════════════════════════════════════════════════════════════
-
-If user's message is short (1-3 words) AND system was awaiting a response:
-- "yeah", "ok", "sure" → User CONFIRMS previous suggestion
-- "3pm", "4pm", "2:30" → User SELECTS a time from options
-- "the first one" → User selects first option
-- "no", "neither" → User REJECTS options, needs alternatives
-- "actually..." → User wants to CHANGE something
-
-When detected as continuation:
-- Set is_continuation: true
-- Set continuation_type: "selection" | "confirmation" | "rejection"
-- Extract selected_option if applicable
-- Include resolved_entities from continuation context
-
-═══════════════════════════════════════════════════════════════
 YOUR TASK
 ═══════════════════════════════════════════════════════════════
 
@@ -806,48 +802,29 @@ CRITICAL RULES:
 - Use lowercase true/false for booleans (not True/False)
 - Use null for missing values (not None or "null")
 
-PLAN GENERATION (for response_guidance.plan):
-- ALWAYS generate a plan when routing to appointment_manager
-- Plan should be 2-4 concise steps
-- Include specific tool names and actions
-- Examples:
-  * "1. Check if patient is registered (if not, redirect to registration), 2. Get doctor list, 3. Check availability for requested date/time, 4. Book appointment if available"
-  * "1. Get patient's existing appointments, 2. Display appointment details"
-  * "1. Get appointment by ID, 2. Update status to cancelled with reason"
-- For other agents, plan can be brief or empty
-
 JSON STRUCTURE (IMPORTANT: No comments allowed in JSON output):
 
 {{
     "understanding": {{
         "what_user_means": "Plain English explanation of what user actually wants",
-        "is_continuation": "Is this continuing previous topic? RESPOND WITH bool true/false",
-        "continuation_type": "selection/confirmation/rejection/new_request/null",
-        "selected_option": "value user selected or null",
-        "sentiment": "affirmative/negative/neutral/unclear",
-        "is_conversation_restart": false
+        "selected_option": "latest value user selected or null",
+        "sentiment": "iput user mood or feeling",
     }},
     "routing": {{
         "agent": "appointment_manager/registration/general_assistant/medical_inquiry/emergency_response",
-        "action": "Specific action for agent to take",
-        "urgency": "routine/urgent/emergency"
     }},
     "memory_updates": {{
         "new_facts": {{}},
-        "system_action": "What the system/agent DID so far in this conversation. Examples: 'asked_for_date', 'provided_doctor_list', 'checked_availability', 'proposed_registration', 'showed_appointments', 'asked_for_confirmation'. Use past tense. REQUIRED - always provide this.",
         "awaiting": "What the system is waiting for from the user. Examples: 'date_selection', 'time_confirmation', 'doctor_choice', 'user_info', 'confirmation', 'appointment_id'. Use empty string '' if not waiting for anything. REQUIRED - always provide this (even if empty)."
     }},
     "response_guidance": {{
-        "tone": "decide based on user tone",
+        "tone": "decide tone for response generation based on user tone",
         "task_context": {{
             "user_intent": "What user wants (incorporate continuation context if resuming)",
             "success_criteria": [],
             "constraints": [],
             "prior_context": "Relevant context including previous options",
-            "is_continuation": true/false,
-            "continuation_type": "selection/confirmation/rejection/null",
             "selected_option": "The option user selected",
-            "continuation_context": {{}}
         }},
         "minimal_context": {{
             "user_wants": "Brief what user wants",
@@ -855,33 +832,9 @@ JSON STRUCTURE (IMPORTANT: No comments allowed in JSON output):
             "prior_context": "Any relevant prior context"
         }},
         "plan": "Short step-by-step plan for the agent."
-    }},
-    "reasoning_chain": [
-        "Step 1: What I observe...",
-        "Step 2: What I conclude...",
-        "Step 3: Therefore..."
-    ]
 }}
 
-FIELD VALUES GUIDE:
-- understanding.is_continuation: true if continuing previous topic, else false
-- understanding.continuation_type: "selection", "confirmation", "rejection", "new_request", or null
-- understanding.sentiment: "affirmative", "negative", "neutral", or "unclear"
-- routing.agent: "appointment_manager", "registration", "general_assistant", "medical_inquiry", or "emergency_response"
-- routing.urgency: "routine", "urgent", or "emergency"
-- memory_updates.system_action: Past tense action like "showed_appointments", "asked_for_date", etc.
-- memory_updates.awaiting: What system waits for like "confirmation", "date_selection", or "" if nothing
-- response_guidance.tone: "helpful", "empathetic", "urgent", or "professional"
-
-KEY RULES:
-1. If system proposed action (check "Last Action") and user said "yeah/ok/sure/yes" → is_continuation=true, sentiment=affirmative
-2. Emergency keywords (severe bleeding, can't breathe, knocked out, severe pain) → urgency=emergency
-3. Extract ONLY NEW facts to new_facts (don't repeat what's in user_facts already)
-4. For minimal_context, keep it BRIEF - just essential info
-5. If user not registered and wants to book appointment → recommend registration first
-6. Short ambiguous responses like "tomorrow" → likely continuation of previous topic
-
-RESPOND WITH VALID JSON ONLY - NO OTHER TEXT."""
+RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
 
     def _parse_reasoning_response(
         self,
