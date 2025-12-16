@@ -253,7 +253,7 @@ class ObservabilityLogger:
     
     def record_pipeline_step(
         self,
-        step_number: int,
+        step_number: float,  # Changed to float to support decimal steps like 4.5
         step_name: str,
         component: str,
         inputs: Dict[str, Any] = None,
@@ -594,7 +594,8 @@ class ObservabilityLogger:
         step_mapping = {
             "translation.detect_and_translate": (2, "Translation (Input) [OPTIMIZED]"),
             "memory.summarize": (3, "Add to Memory"),
-            "reasoning": (4, "Reasoning"),
+            "situation_assessor": (4, "Situation Assessment"),
+            "reasoning": (4, "Reasoning"),  # Legacy - may be used in comprehensive reasoning path
             "agent.": (8, "Agent Execution"),  # Prefix match for all agent calls
             "validation": (9, "Validation"),
             "finalization": (11, "Finalization"),
@@ -690,12 +691,14 @@ class ObservabilityLogger:
                     if settings.cost_tracking_enabled:
                         logger.info(f"    Cost: ${llm_call.cost.total_cost_usd:.6f}")
 
-            # Other agent calls (verify, etc.)
+            # Other agent calls (plan, verify, etc.)
             if other_calls:
                 logger.info(f"\n  Other Agent Operations:")
                 for llm_call in other_calls:
                     logger.info(f"    {llm_call.component}")
-                    logger.info(f"      Tokens: {llm_call.tokens.total_tokens}")
+                    logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
+                    logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
+                               f"(total: {llm_call.tokens.total_tokens})")
                     if settings.cost_tracking_enabled:
                         logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
 

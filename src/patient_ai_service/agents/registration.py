@@ -28,7 +28,7 @@ class RegistrationAgent(BaseAgent):
     """
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
-        super().__init__(agent_name="Registration", **kwargs)
+        super().__init__(agent_name="registration", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
     async def on_activated(self, session_id: str, reasoning: Any):

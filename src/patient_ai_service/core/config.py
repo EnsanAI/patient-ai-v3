@@ -3,11 +3,52 @@ Configuration management for the dental clinic system.
 """
 
 import os
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
 from patient_ai_service.models.enums import LLMProvider, AnthropicModel, OpenAIModel
+
+
+# =============================================================================
+# ARCHITECTURE V2 SETTINGS
+# =============================================================================
+
+class ArchitectureV2Settings(BaseSettings):
+    """Settings for the enhanced architecture."""
+    
+    # Feature flags
+    enable_situation_assessor: bool = True
+    enable_focused_handling: bool = True
+    enable_task_plans: bool = True
+    enable_entity_caching: bool = True
+    enable_script_detection: bool = True
+    enable_conversational_fast_path: bool = True
+    
+    # Situation Assessor
+    assessor_confidence_threshold: float = 0.7
+    assessor_temperature: float = 0.1
+    assessor_max_tokens: int = 500
+    
+    # Focused Handling
+    focused_temperature: float = 0.2
+    focused_max_tokens: int = 300
+    
+    # Task Plans
+    task_plan_enabled_agents: List[str] = Field(
+        default_factory=lambda: ["appointment_manager", "registration"]
+    )
+    max_task_retries: int = 2
+    
+    # Entity Caching
+    availability_cache_ttl_seconds: int = 300  # 5 minutes
+    doctor_info_cache_ttl_seconds: Optional[int] = None  # Never expires
+    
+    # Fallback behavior
+    fallback_to_comprehensive_on_error: bool = True
+    
+    class Config:
+        env_prefix = "CAREBOT_V2_"
 
 
 class Settings(BaseSettings):
@@ -146,6 +187,12 @@ class Settings(BaseSettings):
     cost_tracking_enabled: bool = Field(
         default=True,
         description="Enable cost tracking for LLM calls"
+    )
+    
+    # Architecture V2
+    v2: ArchitectureV2Settings = Field(
+        default_factory=ArchitectureV2Settings,
+        description="Architecture V2 settings"
     )
 
     # Tool execution limits (PHASE 1)

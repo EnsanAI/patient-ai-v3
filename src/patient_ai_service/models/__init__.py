@@ -44,6 +44,14 @@ from .validation import (
     ValidationResult,
 )
 
+from .agent_plan import (
+    PlanStatus,
+    TaskStatus,
+    PlanTask,
+    AgentPlan,
+    PlanAction,
+)
+
 __all__ = [
     # Enums
     "IntentType",
@@ -77,4 +85,10 @@ __all__ = [
     "ToolExecution",
     "ExecutionLog",
     "ValidationResult",
+    # Agent Plan
+    "PlanStatus",
+    "TaskStatus",
+    "PlanTask",
+    "AgentPlan",
+    "PlanAction",
 ]

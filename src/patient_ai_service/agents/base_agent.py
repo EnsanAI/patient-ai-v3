@@ -22,10 +22,15 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Callable, Tuple
+from typing import Dict, List, Optional, Any, Callable, Tuple, TYPE_CHECKING
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
+
+if TYPE_CHECKING:
+    from patient_ai_service.models.task_plan import TaskPlan, Task
+
+from patient_ai_service.models.agent_plan import AgentPlan, PlanAction, PlanStatus, TaskStatus, PlanTask
 
 from patient_ai_service.core import get_llm_client, get_state_manager
 from patient_ai_service.core.llm import LLMClient
@@ -48,7 +53,10 @@ from patient_ai_service.models.agentic import (
     Observation,
     CompletionCheck,
     ThinkingResult,
-    AgentDecision
+    AgentDecision,
+    ConfirmationSummary,
+    AgentResponseData,
+    PatientContext
 )
 
 logger = logging.getLogger(__name__)
@@ -174,6 +182,16 @@ class ExecutionContext:
         self.tool_calls: int = 0
         self.llm_calls: int = 0
         self.started_at: datetime = datetime.utcnow()
+        
+        # Task context (from reasoning engine)
+        self.task_context: Optional[Dict[str, Any]] = None
+        
+        # NEW: Task Plan (legacy - for backward compatibility)
+        self.task_plan: Optional['TaskPlan'] = None
+        self.planning_complete: bool = False
+        
+        # NEW: Agent Plan (Phase 4 - persistent execution plan)
+        self.plan: Optional[AgentPlan] = None
     
     # -------------------------------------------------------------------------
     # Observation Management
@@ -283,17 +301,7 @@ class ExecutionContext:
     # Criteria Management
     # -------------------------------------------------------------------------
     
-    def initialize_criteria(self, criteria_list: List[str]):
-        """Initialize criteria from the reasoning engine."""
-        for i, desc in enumerate(criteria_list):
-            criterion_id = f"criterion_{i}"
-            self.criteria[criterion_id] = Criterion(
-                id=criterion_id,
-                description=desc,
-                state=CriterionState.PENDING
-            )
-        
-        logger.info(f"Initialized {len(criteria_list)} success criteria")
+    # NOTE: initialize_criteria() removed in Phase 6 - plans replace criteria-based execution
     
     def add_criterion(self, description: str, required: bool = True) -> str:
         """Add a new criterion discovered during execution."""
@@ -364,10 +372,14 @@ class ExecutionContext:
     # -------------------------------------------------------------------------
     
     def check_completion(self) -> CompletionCheck:
-        """Check if all criteria are met or if we're blocked."""
+        """Check if all criteria are met or if we're blocked.
+        
+        Phase 6 update: Also checks plan tasks when criteria are not being used.
+        """
         logger.info(f"✓ [ExecutionContext] Checking completion status...")
         result = CompletionCheck(is_complete=False)
         
+        # Check criteria first (legacy path)
         for criterion in self.criteria.values():
             if criterion.state == CriterionState.COMPLETE:
                 result.completed_criteria.append(criterion.description)
@@ -391,7 +403,35 @@ class ExecutionContext:
                 result.pending_criteria.append(criterion.description)
                 logger.info(f"✓ [ExecutionContext]   ○ PENDING: {criterion.description}")
         
-        # Complete if all criteria are complete (none pending, blocked, or failed)
+        # Phase 6: If no criteria, check plan tasks instead
+        if not self.plan:
+            logger.info(f"✓ [ExecutionContext] Using plan-based completion check (no criteria)")
+            from patient_ai_service.models.agent_plan import TaskStatus
+            
+            for task in self.plan.tasks:
+                if task.status == TaskStatus.COMPLETE:
+                    result.completed_criteria.append(f"Task: {task.description}")
+                    logger.info(f"✓ [ExecutionContext]   ✅ TASK COMPLETE: {task.id} - {task.description}")
+                
+                elif task.status == TaskStatus.BLOCKED:
+                    result.blocked_criteria.append(f"Task: {task.description}")
+                    result.has_blocked = True
+                    if task.blocked_options:
+                        result.blocked_options[task.description] = task.blocked_options
+                    if task.blocked_reason:
+                        result.blocked_reasons[task.description] = task.blocked_reason
+                    logger.info(f"✓ [ExecutionContext]   ⏸️  TASK BLOCKED: {task.id} - {task.description}")
+                
+                elif task.status == TaskStatus.FAILED:
+                    result.failed_criteria.append(f"Task: {task.description}")
+                    result.has_failed = True
+                    logger.info(f"✓ [ExecutionContext]   ❌ TASK FAILED: {task.id} - {task.description} (reason: {task.failed_reason})")
+                
+                else:  # PENDING or IN_PROGRESS
+                    result.pending_criteria.append(f"Task: {task.description}")
+                    logger.info(f"✓ [ExecutionContext]   ○ TASK PENDING: {task.id} - {task.description}")
+        
+        # Complete if all criteria/tasks are complete (none pending, blocked, or failed)
         result.is_complete = (
             len(result.pending_criteria) == 0 and
             len(result.blocked_criteria) == 0 and
@@ -415,6 +455,97 @@ class ExecutionContext:
     def get_blocked_criteria(self) -> List[Criterion]:
         """Get all blocked criteria."""
         return [c for c in self.criteria.values() if c.state == CriterionState.BLOCKED]
+    
+    # NOTE: get_criteria_display() removed in Phase 6 - replaced with plan-based execution
+    
+    # NEW: Task Plan Methods
+    
+    def set_task_plan(self, plan: 'TaskPlan'):
+        """Set the task plan for this execution."""
+        from patient_ai_service.models.task_plan import TaskPlan
+        self.task_plan = plan
+        self.planning_complete = True
+        logger.info(f"Task plan set with {len(plan.tasks)} tasks")
+    
+    def get_next_task(self) -> Optional['Task']:
+        """Get the next executable task from the plan."""
+        if not self.task_plan:
+            return None
+        return self.task_plan.get_next_executable_task()
+    
+    def mark_task_complete(self, task_id: str, result: Dict[str, Any]):
+        """Mark a task as complete."""
+        if not self.task_plan:
+            return
+        
+        task = self.task_plan.get_task(task_id)
+        if task:
+            task.mark_complete(result, self.iteration)
+            self.task_plan.update_metrics()
+            logger.info("📋 [TaskPlan] ════════════════════════════════════════════════════════")
+            logger.info(f"📋 [TaskPlan] ✅ Task completed: {task_id} ({task.action or task.description})")
+    
+    def mark_task_blocked(
+        self,
+        task_id: str,
+        reason: str,
+        options: List[Any] = None,
+        suggested_response: str = None
+    ):
+        """Mark a task as blocked."""
+        if not self.task_plan:
+            return
+        
+        task = self.task_plan.get_task(task_id)
+        if task:
+            task.mark_blocked(reason, options, suggested_response)
+            self.task_plan.update_metrics()
+            logger.info("📋 [TaskPlan] ════════════════════════════════════════════════════════")
+            logger.info(f"📋 [TaskPlan] ⚠️  Task blocked: {task_id} ({task.action or task.description})")
+            logger.info(f"📋 [TaskPlan]   Reason: {reason}")
+            if options:
+                logger.info(f"📋 [TaskPlan]   Options: {len(options)}")
+    
+    def mark_task_failed(self, task_id: str, reason: str):
+        """Mark a task as failed."""
+        if not self.task_plan:
+            return
+        
+        task = self.task_plan.get_task(task_id)
+        if task:
+            task.mark_failed(reason)
+            self.task_plan.update_metrics()
+            logger.warning("📋 [TaskPlan] ════════════════════════════════════════════════════════")
+            logger.warning(f"📋 [TaskPlan] ❌ Task failed: {task_id} ({task.action or task.description})")
+            logger.warning(f"📋 [TaskPlan]   Reason: {reason}")
+    
+    def is_plan_complete(self) -> bool:
+        """Check if all tasks in the plan are complete."""
+        if not self.task_plan:
+            return False
+        return self.task_plan.all_tasks_complete()
+    
+    def is_plan_blocked(self) -> bool:
+        """Check if the plan is blocked."""
+        if not self.task_plan:
+            return False
+        return self.task_plan.has_blocked_tasks()
+    
+    def get_task_plan_display(self) -> str:
+        """Get task plan display for prompts."""
+        if not self.task_plan:
+            return "No task plan generated yet."
+        return self.task_plan.get_status_display()
+    
+    def get_plan_continuation_context(self) -> Dict[str, Any]:
+        """Get context for resuming a blocked plan."""
+        if not self.task_plan:
+            return {}
+        return self.task_plan.get_continuation_context()
+    
+    # -------------------------------------------------------------------------
+    # Criteria Display (existing method)
+    # -------------------------------------------------------------------------
     
     def get_criteria_display(self) -> str:
         """Get formatted criteria display for thinking prompt."""
@@ -520,11 +651,20 @@ class BaseAgent(ABC):
         # Tool registry
         self._tools: Dict[str, Callable] = {}
         self._tool_schemas: List[Dict[str, Any]] = []
+        
+        # NEW: Cached static content
+        self._cached_tools_description: Optional[str] = None
+        self._cached_react_instructions: Optional[str] = None
+        self._cached_result_type_guide: Optional[str] = None
+        self._cached_decision_guide: Optional[str] = None
 
         # Register agent-specific tools
         self._register_tools()
+        
+        # Build caches after tools registered
+        self._build_static_caches()
 
-        logger.info(f"Initialized {self.agent_name} agent with ReAct pattern (max_iterations={self.max_iterations})")
+        logger.info(f"Initialized {self.agent_name} agent with ReAct pattern (max_iterations={self.max_iterations}) (static content cached)")
 
     # ==================== ABSTRACT METHODS ====================
 
@@ -576,7 +716,198 @@ class BaseAgent(ABC):
             }
         }
         self._tool_schemas.append(schema)
+        
+        # IMPORTANT: Invalidate tools cache when tools change
+        self._cached_tools_description = None
+        
         logger.debug(f"Registered tool '{name}' for {self.agent_name}")
+
+    # ==================== PLAN GENERATION (Phase 4) ====================
+    
+    async def _plan(
+        self,
+        session_id: str,
+        objective: str,
+        entities: Dict[str, Any],
+        constraints: Optional[List[str]] = None
+    ) -> AgentPlan:
+        """
+        Generate execution plan for the objective.
+        
+        Override in specialized agents for domain-specific planning.
+        Default: Use LLM to generate plan based on role + tools.
+        
+        Args:
+            session_id: Session identifier
+            objective: WHAT to achieve (from reasoning engine)
+            entities: Known entities (from reasoning engine)
+            constraints: Any constraints (from reasoning engine)
+            
+        Returns:
+            AgentPlan with tasks to execute
+        """
+        logger.info(f"📋 [{self.agent_name}] Creating new plan...")
+        logger.info(f"📋 [{self.agent_name}]   Objective: {objective}")
+        logger.info(f"📋 [{self.agent_name}]   Entities: {list(entities.keys())}")
+        
+        plan = AgentPlan(
+            session_id=session_id,
+            agent_name=self.agent_name,
+            objective=objective,
+            original_message=entities.get("_original_message", ""),
+            initial_entities=entities,
+            constraints=constraints or []
+        )
+        
+        # Default: Let LLM generate the plan
+        await self._generate_plan_with_llm(plan)
+        
+        logger.info(f"📋 [{self.agent_name}] ✅ Generated plan: {len(plan.tasks)} tasks")
+        for task in plan.tasks:
+            deps = f" (depends on: {task.depends_on})" if task.depends_on else ""
+            logger.info(f"📋 [{self.agent_name}]   • {task.id}: {task.tool or 'info'} - {task.description}{deps}")
+        
+        plan.status = PlanStatus.EXECUTING
+        logger.info(f"🧠 [{self.agent_name}] Plan status: {plan.status.value}")
+        return plan
+    
+    async def _generate_plan_with_llm(self, plan: AgentPlan):
+        """Use LLM to generate tasks for the plan."""
+        
+        tools_desc = self._get_tools_description()
+        
+        prompt = f"""You are the {self.agent_name} agent. Generate an execution plan.
+
+OBJECTIVE: {plan.objective}
+
+KNOWN ENTITIES:
+{json.dumps(plan.initial_entities, indent=2, default=str)}
+
+AVAILABLE TOOLS:
+{tools_desc}
+
+Generate a plan as JSON:
+{{
+    "tasks": [
+        {{
+            "id": "task_1",
+            "description": "What this task does",
+            "tool": "tool_name or null for info gathering",
+            "params": {{}},
+            "depends_on": []
+        }}
+    ]
+}}
+
+RULES:
+1. Only use tools listed above
+2. Order tasks by dependencies
+3. Keep it minimal - only necessary tasks
+4. If info is missing, first task should be to collect it
+
+Output ONLY valid JSON."""
+
+        # Get observability logger
+        obs_logger = get_observability_logger(plan.session_id) if settings.enable_observability else None
+        
+        # Make LLM call with token tracking
+        llm_start_time = time.time()
+        system_prompt = "You are a task planner. Output only valid JSON."
+        plan_temperature = 0.2
+        plan_max_tokens = 500
+        
+        if hasattr(self.llm_client, 'create_message_with_usage'):
+            response, tokens = self.llm_client.create_message_with_usage(
+                system=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=plan_temperature,
+                max_tokens=plan_max_tokens
+            )
+        else:
+            response = self.llm_client.create_message(
+                system=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=plan_temperature,
+                max_tokens=plan_max_tokens
+            )
+            tokens = TokenUsage()
+        
+        llm_duration_seconds = time.time() - llm_start_time
+        
+        # Record LLM call
+        if obs_logger:
+            llm_call = obs_logger.record_llm_call(
+                component=f"agent.{self.agent_name}.plan",
+                provider=settings.llm_provider.value,
+                model=settings.get_llm_model(),
+                tokens=tokens,
+                duration_seconds=llm_duration_seconds,
+                system_prompt_length=len(system_prompt),
+                messages_count=1,
+                temperature=plan_temperature,
+                max_tokens=plan_max_tokens
+            )
+            
+            # Full observability logging for token calculation
+            logger.info(f"📋 [{self.agent_name}] 📊 Plan Generation Token Usage Details:")
+            logger.info(f"📋 [{self.agent_name}]   Input tokens: {tokens.input_tokens}")
+            logger.info(f"📋 [{self.agent_name}]   Output tokens: {tokens.output_tokens}")
+            logger.info(f"📋 [{self.agent_name}]   Total tokens: {tokens.total_tokens}")
+            logger.info(f"📋 [{self.agent_name}]   LLM Duration: {llm_duration_seconds * 1000:.2f}ms ({llm_duration_seconds:.3f}s)")
+            logger.info(f"📋 [{self.agent_name}]   Model: {settings.get_llm_model()}")
+            logger.info(f"📋 [{self.agent_name}]   Provider: {settings.llm_provider.value}")
+            logger.info(f"📋 [{self.agent_name}]   Temperature: {plan_temperature}")
+            logger.info(f"📋 [{self.agent_name}]   Max tokens: {plan_max_tokens}")
+            logger.info(f"📋 [{self.agent_name}]   System prompt length: {len(system_prompt)} chars")
+            logger.info(f"📋 [{self.agent_name}]   User prompt length: {len(prompt)} chars")
+            
+            # Log cost if available
+            if llm_call and llm_call.cost and settings.cost_tracking_enabled:
+                logger.info(f"📋 [{self.agent_name}]   Cost: ${llm_call.cost.total_cost_usd:.6f}")
+                logger.info(f"📋 [{self.agent_name}]     - Input cost: ${llm_call.cost.input_cost_usd:.6f}")
+                logger.info(f"📋 [{self.agent_name}]     - Output cost: ${llm_call.cost.output_cost_usd:.6f}")
+            
+            # Record tokens in token tracker for component-level tracking
+            obs_logger.token_tracker.record_tokens(
+                component=f"agent.{self.agent_name}.plan",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens
+            )
+        
+        # Parse and add tasks
+        try:
+            # Extract JSON from response
+            json_str = self._extract_json(response)
+            data = json.loads(json_str)
+            for task_data in data.get("tasks", []):
+                plan.add_task(
+                    description=task_data.get("description", ""),
+                    tool=task_data.get("tool"),
+                    params=task_data.get("params", {}),
+                    depends_on=task_data.get("depends_on", [])
+                )
+        except Exception as e:
+            logger.error(f"📋 [{self.agent_name}] Failed to parse plan: {e}")
+            # Fallback: single generic task
+            plan.add_task(
+                description="Complete the objective",
+                tool=None,
+                params={}
+            )
+    
+    def _extract_json(self, text: str) -> str:
+        """Extract JSON from LLM response (handles markdown code blocks)."""
+        import re
+        # Try to find JSON in code blocks
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if json_match:
+            return json_match.group(1)
+        # Try to find JSON object directly
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json_match.group(0)
+        # Return as-is if no JSON found
+        return text
 
     # ==================== MAIN ENTRY POINT ====================
 
@@ -611,13 +942,89 @@ class BaseAgent(ABC):
         if execution_log is None:
             execution_log = ExecutionLog(tools_used=[])
         
-        # Initialize execution context
+        # Get context (assessor already ran, routing decided)
         context = self._context.get(session_id, {})
-        exec_context = ExecutionContext(session_id, self.max_iterations, user_request=message)
+        routing_action = context.get('routing_action', '')
+        continuation_context = context.get('continuation_context', {})
         
-        # Initialize criteria from context
-        success_criteria = context.get("success_criteria", [])
-        exec_context.initialize_criteria(success_criteria)
+        # Handle confirmation-related actions directly (no agentic loop needed)
+        if routing_action == 'execute_confirmed_action':
+            return await self._execute_confirmed_action(session_id, continuation_context, execution_log)
+        
+        elif routing_action == 'handle_rejection':
+            return await self._handle_rejection(session_id, continuation_context, execution_log)
+        
+        elif routing_action == 'handle_modification':
+            # Modification needs to update pending action with new entities, then re-confirm
+            return await self._handle_modification(session_id, message, context, execution_log)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # PLAN LIFECYCLE MANAGEMENT (Phase 4)
+        # ═══════════════════════════════════════════════════════════════
+        plan_action_str = context.get("plan_action", "create_new")
+        existing_plan_data = context.get("existing_plan")
+        
+        plan = None
+        if plan_action_str == "create_new" or plan_action_str == "abandon_create":
+            # Generate new plan
+            logger.info(f"📋 [{self.agent_name}] Creating new plan...")
+            plan = await self._plan(
+                session_id=session_id,
+                objective=context.get("objective", ""),
+                entities=context.get("entities", {}),
+                constraints=context.get("constraints", [])
+            )
+            self.state_manager.store_agent_plan(session_id, plan)
+            
+        elif plan_action_str in ["resume", "update_resume"]:
+            # Load existing plan
+            if existing_plan_data:
+                plan = AgentPlan(**existing_plan_data)
+                logger.info(f"📋 [{self.agent_name}] Resuming plan: {plan.get_summary()}")
+                
+                if plan_action_str == "update_resume":
+                    # Add new entities from this turn
+                    new_entities = context.get("entities", {})
+                    plan.unblock_with_info(new_entities)
+                    logger.info(f"📋 [{self.agent_name}] Updated plan with: {list(new_entities.keys())}")
+                    logger.info(f"🧠 [{self.agent_name}] Plan status: {plan.status.value}")
+                    self.state_manager.store_agent_plan(session_id, plan)
+            else:
+                # Fallback: create new if no existing plan data
+                logger.warning(f"📋 [{self.agent_name}] No existing plan data for {plan_action_str}, creating new")
+                plan = await self._plan(
+                    session_id=session_id,
+                    objective=context.get("objective", context.get("user_intent", "")),
+                    entities=context.get("entities", {})
+                )
+                self.state_manager.store_agent_plan(session_id, plan)
+        else:
+            # Fallback: create new
+            logger.warning(f"📋 [{self.agent_name}] Unknown plan_action: {plan_action_str}, creating new")
+            plan = await self._plan(
+                session_id=session_id,
+                objective=context.get("objective", context.get("user_intent", "")),
+                entities=context.get("entities", {})
+            )
+            self.state_manager.store_agent_plan(session_id, plan)
+        
+        # Initialize execution context
+        exec_context = ExecutionContext(session_id, self.max_iterations, user_request=message)
+        exec_context.plan = plan  # NEW: Set plan in execution context
+        
+        # NEW: Set task_context from orchestrator context (includes objective, entities, etc.)
+        exec_context.task_context = {
+            "user_intent": context.get("user_intent", ""),
+            "objective": context.get("objective", ""),
+            "entities": context.get("entities", {}),
+            "success_criteria": context.get("success_criteria", []),
+            "constraints": context.get("constraints", []),
+            "prior_context": context.get("prior_context"),
+            "is_continuation": context.get("is_continuation", False),
+            "continuation_type": context.get("continuation_type"),
+            "selected_option": context.get("selected_option"),
+            "action": context.get("action", context.get("routing_action", "")),
+        }
         
         # Load continuation context if resuming
         continuation = context.get("continuation_context", {})
@@ -627,7 +1034,10 @@ class BaseAgent(ABC):
         
         logger.info(f"[{self.agent_name}] Starting agentic loop for session {session_id}")
         logger.info(f"[{self.agent_name}] Message: {message[:100]}...")
-        logger.info(f"[{self.agent_name}] Criteria: {success_criteria}")
+        if exec_context.plan:
+            logger.info(f"[{self.agent_name}] Plan: {exec_context.plan.objective} ({len(exec_context.plan.tasks)} tasks)")
+        else:
+            logger.warning(f"[{self.agent_name}] No plan in execution context!")
         
         # =====================================================================
         # MAIN AGENTIC LOOP
@@ -660,6 +1070,9 @@ class BaseAgent(ABC):
                 tool_name = thinking.tool_name
                 tool_input = thinking.tool_input or {}
                 
+                # Resolve any template placeholders in tool_input (e.g., {{task_1.doctor_id}})
+                tool_input = self._resolve_tool_input_templates(session_id, tool_input, exec_context)
+                
                 # Inject session_id if not present (tools require it as first parameter)
                 if "session_id" not in tool_input:
                     tool_input["session_id"] = session_id
@@ -675,6 +1088,31 @@ class BaseAgent(ABC):
                 override = await self._process_tool_result(
                     session_id, tool_name, tool_result, exec_context
                 )
+                
+                # UPDATE PLAN STATE (Phase 4)
+                if exec_context.plan and thinking.current_task_id:
+                    task_id = thinking.current_task_id
+                    if tool_result.get("success"):
+                        exec_context.plan.mark_task_complete(task_id, tool_result)
+                        logger.info(f"📋 [{self.agent_name}] Task {task_id} marked complete")
+                    elif tool_result.get("result_type") == "user_input_needed":
+                        exec_context.plan.mark_task_blocked(
+                            task_id,
+                            reason=tool_result.get("message", "Need more info"),
+                            awaiting=tool_result.get("missing_field", "information"),
+                            options=tool_result.get("alternatives")
+                        )
+                        logger.info(f"📋 [{self.agent_name}] Task {task_id} marked blocked")
+                    else:
+                        # Handle other result types (failed, etc.)
+                        task = exec_context.plan.get_task(task_id)
+                        if task:
+                            task.status = TaskStatus.FAILED
+                            task.failed_reason = tool_result.get("message", "Task failed")
+                            logger.warning(f"📋 [{self.agent_name}] Task {task_id} marked failed")
+                    
+                    # Save updated plan
+                    self.state_manager.store_agent_plan(session_id, exec_context.plan)
                 
                 if override:
                     # Handle EXECUTE_RECOVERY immediately (don't wait for next iteration)
@@ -777,26 +1215,57 @@ class BaseAgent(ABC):
                 completion = exec_context.check_completion()
                 
                 if completion.is_complete:
-                    logger.info(f"[{self.agent_name}] ✅ Task complete! Generating focused response.")
-                    response = await self._generate_focused_response(session_id, exec_context)
+                    logger.info(f"[{self.agent_name}] ✅ Task complete! Generating response.")
+                    # Use RESPOND_COMPLETE decision for unified response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_COMPLETE,
+                        thinking.response,
+                        exec_context
+                    )
                     return response, execution_log
                 
                 elif completion.has_blocked:
                     logger.info(f"[{self.agent_name}] ⏸️ Criteria blocked - presenting options")
-                    response = self._generate_options_response(exec_context)
+                    # Update response data with options from completion check
+                    if not thinking.response.options:
+                        thinking.response.options = []
+                        for criterion_id, options in completion.blocked_options.items():
+                            thinking.response.options.extend(options)
+                    if not thinking.response.options_context:
+                        thinking.response.options_context = "alternatives"
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_WITH_OPTIONS,
+                        thinking.response,
+                        exec_context
+                    )
                     return response, execution_log
                 
                 elif completion.has_failed:
                     logger.info(f"[{self.agent_name}] ❌ Criteria failed - explaining")
-                    response = self._generate_failure_response(exec_context)
+                    # Update response data with failure info
+                    if not thinking.response.failure_reason:
+                        thinking.response.failure_reason = "Task could not be completed"
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_IMPOSSIBLE,
+                        thinking.response,
+                        exec_context
+                    )
                     return response, execution_log
                 
                 else:
                     # Not complete but agent thinks it is
                     if thinking.is_task_complete:
-                        # Agent explicitly marked complete - trust it and generate focused response
-                        logger.info(f"[{self.agent_name}] Agent marked complete - generating focused response")
-                        response = await self._generate_focused_response(session_id, exec_context)
+                        # Agent explicitly marked complete - trust it and generate response
+                        logger.info(f"[{self.agent_name}] Agent marked complete - generating response")
+                        response = await self._generate_response(
+                            session_id,
+                            AgentDecision.RESPOND_COMPLETE,
+                            thinking.response,
+                            exec_context
+                        )
                         return response, execution_log
                     else:
                         # Force continue
@@ -815,28 +1284,181 @@ class BaseAgent(ABC):
             
             elif thinking.decision == AgentDecision.RESPOND_WITH_OPTIONS:
                 logger.info(f"[{self.agent_name}] Responding with options")
-                response = self._generate_options_response(exec_context)
+                response = await self._generate_response(
+                    session_id,
+                    AgentDecision.RESPOND_WITH_OPTIONS,
+                    thinking.response,
+                    exec_context
+                )
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_COMPLETE:
-                logger.info(f"[{self.agent_name}] Task complete - generating focused response")
-                response = await self._generate_focused_response(session_id, exec_context)
+                logger.info(f"[{self.agent_name}] Task complete - generating response")
+                response = await self._generate_response(
+                    session_id,
+                    AgentDecision.RESPOND_COMPLETE,
+                    thinking.response,
+                    exec_context
+                )
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_IMPOSSIBLE:
                 logger.info(f"[{self.agent_name}] Task impossible")
-                response = self._generate_failure_response(exec_context)
+                response = await self._generate_response(
+                    session_id,
+                    AgentDecision.RESPOND_IMPOSSIBLE,
+                    thinking.response,
+                    exec_context
+                )
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.CLARIFY:
-                logger.info(f"[{self.agent_name}] Asking for clarification")
-                return thinking.clarification_question, execution_log
-            
-            elif thinking.decision == AgentDecision.COLLECT_INFORMATION:
-                logger.info(f"[{self.agent_name}] Collecting information - generating focused response")
-                response = await self._generate_focused_response(session_id, exec_context)
+                logger.info(f"[{self.agent_name}] Asking for clarification - saving state")
+                
+                # Save continuation context using response data
+                awaiting = thinking.response.clarification_needed or thinking.awaiting_info or "clarification"
+                resolved = thinking.response.resolved_entities or thinking.resolved_entities or self._extract_resolved_entities(exec_context)
+                
+                self.state_manager.set_continuation_context(
+                    session_id,
+                    awaiting=awaiting,
+                    options=[],
+                    original_request=exec_context.user_request,
+                    resolved_entities=resolved,
+                    blocked_criteria=[]
+                )
+                
+                self.state_manager.update_agentic_state(
+                    session_id,
+                    status="blocked",
+                    active_agent=self.agent_name
+                )
+
+                # Mark plan as BLOCKED and persist for next turn (Fix 9)
+                self._mark_plan_blocked_and_store(session_id, exec_context, awaiting)
+
+                logger.info(f"[{self.agent_name}] Saved continuation: awaiting={awaiting}")
+
+                # Generate response using unified method
+                response = await self._generate_response(
+                    session_id,
+                    AgentDecision.CLARIFY,
+                    thinking.response,
+                    exec_context
+                )
                 return response, execution_log
-            
+
+            elif thinking.decision == AgentDecision.COLLECT_INFORMATION:
+                logger.info(f"[{self.agent_name}] Collecting information - saving state and generating response")
+                
+                # Save continuation context using response data
+                awaiting = thinking.response.information_needed or thinking.awaiting_info or "user_information"
+                resolved = thinking.response.resolved_entities or thinking.resolved_entities or self._extract_resolved_entities(exec_context)
+                
+                self.state_manager.set_continuation_context(
+                    session_id,
+                    awaiting=awaiting,
+                    options=[],  # No options for free-form input
+                    original_request=exec_context.user_request,
+                    resolved_entities=resolved,
+                    blocked_criteria=[c.description for c in exec_context.get_blocked_criteria()]
+                )
+                
+                # Update agentic state to blocked
+                self.state_manager.update_agentic_state(
+                    session_id,
+                    status="blocked",
+                    active_agent=self.agent_name
+                )
+
+                # Mark plan as BLOCKED and persist for next turn (Fix 9)
+                self._mark_plan_blocked_and_store(session_id, exec_context, awaiting)
+
+                logger.info(f"[{self.agent_name}] Saved continuation: awaiting={awaiting}, resolved={list(resolved.keys())}")
+
+                # Generate response using unified method
+                response = await self._generate_response(
+                    session_id,
+                    AgentDecision.COLLECT_INFORMATION,
+                    thinking.response,
+                    exec_context
+                )
+                return response, execution_log
+
+            elif thinking.decision == AgentDecision.REQUEST_CONFIRMATION:
+                logger.info(f"[{self.agent_name}] Requesting confirmation before critical action")
+                
+                # Check for confirmation data in response or legacy field
+                if not thinking.response.confirmation_action and not thinking.confirmation_summary:
+                    logger.warning(f"[{self.agent_name}] REQUEST_CONFIRMATION but no confirmation data!")
+                    # Fallback to just responding
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND,
+                        thinking.response,
+                        exec_context
+                    )
+                    return response, execution_log
+                
+                # Build confirmation details from response or legacy summary
+                if thinking.response.confirmation_action:
+                    confirmation_details = thinking.response.confirmation_details
+                    confirmation_action = thinking.response.confirmation_action
+                    pending_tool = None
+                    pending_tool_input = {}
+                else:
+                    # Legacy: use confirmation_summary
+                    summary = thinking.confirmation_summary
+                    if summary:
+                        confirmation_details = summary.details
+                        confirmation_action = summary.action
+                        pending_tool = summary.tool_name
+                        pending_tool_input = summary.tool_input
+                    else:
+                        # Fallback if both are missing
+                        confirmation_details = {}
+                        confirmation_action = "unknown_action"
+                        pending_tool = None
+                        pending_tool_input = {}
+                
+                # Save the pending action so we can execute it after confirmation
+                self.state_manager.set_continuation_context(
+                    session_id,
+                    awaiting="confirmation",
+                    options=["yes", "no", "confirm", "cancel"],
+                    original_request=exec_context.user_request,
+                    resolved_entities={
+                        "pending_action": confirmation_action,
+                        "pending_tool": pending_tool,
+                        "pending_tool_input": pending_tool_input,
+                        **confirmation_details
+                    },
+                    blocked_criteria=[]
+                )
+                
+                self.state_manager.update_agentic_state(
+                    session_id,
+                    status="awaiting_confirmation",
+                    active_agent=self.agent_name
+                )
+
+                # Mark plan as BLOCKED and persist for next turn (Fix 9)
+                self._mark_plan_blocked_and_store(
+                    session_id,
+                    exec_context,
+                    "confirmation",
+                    options=["yes", "no", "confirm", "cancel"]
+                )
+
+                # Generate confirmation message using unified method
+                response = await self._generate_response(
+                    session_id,
+                    AgentDecision.REQUEST_CONFIRMATION,
+                    thinking.response,
+                    exec_context
+                )
+                return response, execution_log
+
             elif thinking.decision == AgentDecision.RETRY:
                 logger.info(f"[{self.agent_name}] Retrying last action")
                 # Don't increment if we just executed recovery (recovery has its own tracking)
@@ -1021,203 +1643,217 @@ class BaseAgent(ABC):
             return self._get_error_response(str(e))
 
     # ==================== THINKING (REASONING) ====================
-
-    async def _think(
+    # NOTE: Old duplicate _think methods removed in Phase 4
+    # The _think method at line ~3456 is the one to use (modified for plan navigation)
+    
+    def _build_task_params(
+        self,
+        task: 'Task',
+        plan: 'TaskPlan',
+        session_id: str
+    ) -> Dict[str, Any]:
+        """
+        Build tool parameters for a task.
+        
+        Uses:
+        1. Params defined in task
+        2. Results from dependent tasks
+        3. Entity state (derived entities)
+        """
+        params = dict(task.params)  # Start with defined params
+        
+        # Get derived entities for cached values
+        entity_state = self.state_manager.get_entity_state(session_id)
+        
+        # Build params based on tool type
+        if task.tool == "check_availability":
+            # Get doctor_uuid from previous task or derived entities
+            doctor_uuid = params.get("doctor_id")
+            if not doctor_uuid:
+                # Try from dependent task
+                for dep_id in task.depends_on:
+                    dep_task = plan.get_task(dep_id)
+                    if dep_task and dep_task.result:
+                        if dep_task.tool in ["find_doctor_by_name", "list_doctors"]:
+                            doctor_data = dep_task.result.get("doctor", {})
+                            doctor_uuid = doctor_data.get("id")
+                            break
+            
+            if not doctor_uuid:
+                # Try from derived entities
+                doctor_entity = entity_state.derived.get_entity("doctor_uuid")
+                if doctor_entity:
+                    doctor_uuid = doctor_entity.value
+            
+            params["doctor_id"] = doctor_uuid
+            
+            # Get date/time from entities
+            if not params.get("date"):
+                params["date"] = plan.entities.get("date_preference")
+            if not params.get("time"):
+                params["time"] = plan.entities.get("time_preference")
+        
+        elif task.tool == "book_appointment":
+            # Build from previous tasks and entities
+            for dep_id in task.depends_on:
+                dep_task = plan.get_task(dep_id)
+                if not dep_task or not dep_task.result:
+                    continue
+                
+                if dep_task.tool == "check_availability":
+                    avail = dep_task.result
+                    if avail.get("available_at_requested_time"):
+                        params["time"] = avail.get("confirmed_time") or plan.entities.get("time_preference")
+                        params["date"] = avail.get("date") or plan.entities.get("date_preference")
+                
+                if dep_task.tool in ["find_doctor_by_name", "list_doctors"]:
+                    doctor_data = dep_task.result.get("doctor", {})
+                    params["doctor_id"] = doctor_data.get("id")
+            
+            # Get patient_id from entity state
+            patient_entity = entity_state.derived.get_entity("patient_id")
+            if patient_entity:
+                params["patient_id"] = patient_entity.value
+            
+            # Add procedure if not set
+            if not params.get("reason"):
+                params["reason"] = plan.entities.get("procedure_preference", "dental appointment")
+        
+        return params
+    
+    # NOTE: _generate_task_plan() and _generate_task_plan_llm() removed in Phase 6
+    # Replaced with _plan() method that uses AgentPlan instead of TaskPlan
+    
+    async def _resume_task_plan(
         self,
         session_id: str,
-        execution_context: 'ExecutionContext'
-    ) -> ThinkingResult:
+        execution_context: 'ExecutionContext',
+        user_selection: Any
+    ) -> bool:
         """
-        The THINK step of ReAct: Analyze and decide what to do next.
-
-        This is where the LLM reasons about:
-
-        1. What has been done so far (observations)
-
-        2. What the user requested
-
-        3. What still needs to be done
-
-        4. Whether the task is complete
-
+        Resume a blocked task plan after user provides input.
+        
+        Returns:
+            True if plan was resumed, False otherwise
         """
-        system_prompt = self._get_thinking_prompt(session_id, execution_context)
-
-        # Build messages with execution context
-        messages = self._build_thinking_messages(session_id, execution_context)
-
-        # Get observability logger
-        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
-        llm_start_time = time.time()
-        thinking_temperature = 0.2  # Lower temperature for more consistent reasoning
-
-        try:
-            # Try to get token usage if available
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
-                    system=system_prompt,
-                    messages=messages,
-                    temperature=thinking_temperature
-                )
-            else:
-                response = self.llm_client.create_message(
-                    system=system_prompt,
-                    messages=messages,
-                    temperature=thinking_temperature
-                )
-                tokens = TokenUsage()
-
-            llm_duration_seconds = time.time() - llm_start_time
-
-            # Record LLM call
-            if obs_logger:
-                obs_logger.record_llm_call(
-                    component=f"agent.{self.agent_name}.think.legacy",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
-                    tokens=tokens,
-                    duration_seconds=llm_duration_seconds,
-                    system_prompt_length=len(system_prompt),
-                    messages_count=len(messages),
-                    temperature=thinking_temperature,
-                    max_tokens=settings.llm_max_tokens,
-                    error=None
-                )
-
-            # Parse the thinking response
-            return self._parse_thinking_response(response, execution_context)
-
-        except Exception as e:
-            llm_duration_seconds = time.time() - llm_start_time
-            
-            # Record failed LLM call
-            if obs_logger:
-                obs_logger.record_llm_call(
-                    component=f"agent.{self.agent_name}.think.legacy",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
-                    tokens=TokenUsage(),
-                    duration_seconds=llm_duration_seconds,
-                    system_prompt_length=len(system_prompt),
-                    messages_count=len(messages),
-                    temperature=thinking_temperature,
-                    max_tokens=settings.llm_max_tokens,
-                    error=str(e)
-                )
-            
-            logger.error(f"Error in thinking step: {e}", exc_info=True)
-            # On error, try to respond with what we have
-            return ThinkingResult(
-                decision=AgentDecision.RESPOND,
-                reasoning=f"Error in reasoning: {str(e)}. Generating response from available data.",
-                is_task_complete=False
-            )
+        from patient_ai_service.models.task_plan import TaskStatus
+        
+        # Get saved plan
+        plan = self.state_manager.get_task_plan(session_id)
+        if not plan:
+            return False
+        
+        # Find blocked task
+        blocked = plan.get_blocked_tasks()
+        if not blocked:
+            return False
+        
+        blocked_task = blocked[0]
+        
+        # Update task based on user selection
+        # This depends on what kind of selection was needed
+        if blocked_task.tool == "check_availability":
+            # User selected a time from alternatives
+            blocked_task.params["time"] = user_selection
+            blocked_task.status = TaskStatus.PENDING
+            blocked_task.blocked_reason = None
+            blocked_task.blocked_options = None
+        
+        elif blocked_task.tool == "book_appointment":
+            # User confirmed or selected
+            blocked_task.status = TaskStatus.PENDING
+        
+        # Restore plan to execution context
+        execution_context.set_task_plan(plan)
+        plan.update_metrics()
+        
+        return True
 
     def _get_thinking_prompt(
         self,
         session_id: str,
         execution_context: 'ExecutionContext'
     ) -> str:
-        """Build the system prompt for the thinking step."""
+        """Build thinking prompt using cached static content."""
+        
+        # STATIC: Agent personality (cacheable per-agent, only patient context changes)
         base_prompt = self._get_system_prompt(session_id)
-
-        # Add ReAct reasoning instructions
-        react_instructions = """
-═══════════════════════════════════════════════════════════════
-AGENTIC REASONING PROTOCOL (ReAct Pattern)
-═══════════════════════════════════════════════════════════════
-You are operating in a THINK → ACT → OBSERVE loop. Your job in this step is to:
-
-1. ANALYZE what has been done (review observations below)
-
-2. EVALUATE if the user's request is fulfilled
-
-3. DECIDE your next action
-
-CRITICAL RULES:
-
-1. NEVER claim success before verifying tool results
-
-   - If you called book_appointment, CHECK if the result shows success
-
-   - If tool returned error, DO NOT say "appointment booked"
-
-2. READ TOOL RESULTS CAREFULLY
-
-   - Each observation shows what a tool returned
-
-   - "success": true means the action worked
-
-   - "error" in result means it failed
-
-3. COMPLETE THE FULL TASK
-
-   - If user asked for 2 appointments, book 2 appointments
-
-   - Don't stop after 1 tool call if more are needed
-
-4. VERIFY BEFORE RESPONDING
-
-   - Before saying "done", check: Did all required actions succeed?
-
-   - List what you accomplished vs what was requested
-
-YOUR RESPONSE FORMAT:
-
-```json
-{
-    "analysis": "What I observe from the execution history...",
-    "task_status": {
-        "user_requested": "Brief description of what user wants",
-        "completed": ["List of completed actions with results"],
-        "remaining": ["List of actions still needed"],
-        "is_complete": true/false
-    },
-    "decision": "CALL_TOOL" | "RESPOND" | "RETRY" | "CLARIFY" | "COLLECT_INFORMATION",
-    "reasoning": "Why I'm making this decision...",
-    "tool_call": {
-        "name": "tool_name (if decision is CALL_TOOL)",
-        "input": { "param": "value" }
-    },
-    "response": "Final response text (if decision is RESPOND or CLARIFY or COLLECT_INFORMATION)"
-}
-```
-
-DECISION GUIDE:
-
-- CALL_TOOL: More actions needed to complete the task
-
-- RESPOND: Task is complete AND verified (all tools succeeded)
-
-- RETRY: A tool failed and I should try a different approach
-
-- CLARIFY: I need more information from the user
-
-- COLLECT_INFORMATION: Collect missing or required information from user
-
-"""
-
-        # Add execution history summary
+        
+        # STATIC: Use cached instructions (never changes)
+        react_instructions = self._cached_react_instructions
+        result_type_guide = self._cached_result_type_guide
+        decision_guide = self._cached_decision_guide
+        tools_description = self._cached_tools_description
+        
+        # DYNAMIC: Only these change per-iteration
         observations_summary = self._format_observations(execution_context)
+        
+        # NEW: Get entity status display
+        entity_display = ""
+        try:
+            if session_id:
+                entity_display = self.state_manager.get_entity_display(session_id)
+        except Exception as e:
+            logger.warning(f"Failed to get entity display: {e}")
+        
+        # NEW: Get plan display (Phase 6 - replaced criteria with plan)
+        plan_display = ""
+        if execution_context.plan:
+            plan = execution_context.plan
+            completed = len(plan.get_completed_task_ids())
+            total = len(plan.tasks)
+            plan_display = f"""Plan: {plan.objective}
+Status: {plan.status.value}
+Progress: {completed}/{total} tasks complete
 
-        full_prompt = f"""{base_prompt}
-
+Tasks:
+"""
+            for task in plan.tasks:
+                status_icon = "✅" if task.status == TaskStatus.COMPLETE else "⏸️" if task.status == TaskStatus.BLOCKED else "🔄" if task.status == TaskStatus.IN_PROGRESS else "○"
+                plan_display += f"  {status_icon} {task.id}: {task.description}\n"
+        else:
+            plan_display = "No execution plan yet."
+        
+        # Build prompt with clear static/dynamic separation
+        # Static content should be at the BEGINNING for better caching
+        full_prompt = f"""
 {react_instructions}
 
+{result_type_guide}
+
+{decision_guide}
+
 ═══════════════════════════════════════════════════════════════
-EXECUTION HISTORY (What has happened so far)
+🛠️ AVAILABLE TOOLS (Use exact parameter names)
+═══════════════════════════════════════════════════════════════
+
+{tools_description}
+
+═══════════════════════════════════════════════════════════════
+AGENT CONTEXT
+═══════════════════════════════════════════════════════════════
+
+{base_prompt}
+
+═══════════════════════════════════════════════════════════════
+📦 ENTITY STATUS (Use cached data when valid - DON'T re-fetch!)
+═══════════════════════════════════════════════════════════════
+
+{entity_display if entity_display else "No entities resolved yet."}
+
+═══════════════════════════════════════════════════════════════
+📋 EXECUTION PLAN (Phase 6 - Plan-based execution)
+═══════════════════════════════════════════════════════════════
+
+{plan_display}
+
+═══════════════════════════════════════════════════════════════
+📊 EXECUTION HISTORY (Iteration {execution_context.iteration})
 ═══════════════════════════════════════════════════════════════
 
 {observations_summary if observations_summary else "No actions taken yet."}
-
-═══════════════════════════════════════════════════════════════
-AVAILABLE TOOLS
-═══════════════════════════════════════════════════════════════
-
-{self._format_tools_for_prompt()}
-
 """
-
+        
         return full_prompt
 
     def _format_observations(self, execution_context: 'ExecutionContext') -> str:
@@ -1268,6 +1904,235 @@ AVAILABLE TOOLS
             lines.append("")
 
         return "\n".join(lines)
+    
+    def _build_static_caches(self):
+        """Build cached static content that doesn't change per-iteration."""
+        
+        # Cache tools description
+        self._cached_tools_description = self._format_tools_for_prompt()
+        
+        # Cache ReAct instructions
+        self._cached_react_instructions = """
+═══════════════════════════════════════════════════════════════
+AGENTIC REASONING PROTOCOL (ReAct Pattern)
+═══════════════════════════════════════════════════════════════
+You are operating in a THINK → ACT → OBSERVE loop. Your job is to:
+
+1. ANALYZE what has been done (review observations)
+2. EVALUATE if the user's request is fulfilled
+3. DECIDE your next action
+
+CRITICAL RULES:
+1. NEVER claim success before verifying tool results
+2. READ TOOL RESULTS CAREFULLY - check for success/error
+3. COMPLETE THE FULL TASK before responding
+4. VERIFY BEFORE RESPONDING - Did all required actions succeed?
+"""
+        
+        # Cache result type guide
+        self._cached_result_type_guide = self._get_result_type_guide()
+        
+        # Cache decision guide
+        self._cached_decision_guide = self._get_decision_guide()
+        
+        logger.debug(f"[{self.agent_name}] Built static caches: tools={len(self._cached_tools_description)} chars")
+    
+    def _check_derived_entity_cache(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_input: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if we can use a cached derived entity instead of calling the tool.
+        
+        Returns:
+            Cached result if available and valid, None if tool should be called
+        """
+        # Tools that can use cached entities
+        cacheable_tools = {
+            "find_doctor_by_name": "doctor_uuid",
+            "list_doctors": "doctors_list",
+        }
+        
+        if tool_name not in cacheable_tools:
+            return None
+        
+        entity_key = cacheable_tools[tool_name]
+        cached_value = self.state_manager.get_valid_derived_entity(session_id, entity_key)
+        
+        if cached_value is None:
+            return None
+        
+        # Build result from cached entity
+        if tool_name == "find_doctor_by_name":
+            # Also need doctor_info for full result
+            doctor_info = self.state_manager.get_valid_derived_entity(session_id, "doctor_info")
+            if doctor_info:
+                return {
+                    "success": True,
+                    "result_type": "success",
+                    "doctor": doctor_info,
+                    "from_cache": True
+                }
+        
+        elif tool_name == "list_doctors":
+            return {
+                "success": True,
+                "result_type": "partial",
+                "doctors": cached_value,
+                "count": len(cached_value),
+                "from_cache": True
+            }
+        
+        return None
+
+    def _store_derived_entities(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        tool_result: Dict[str, Any]
+    ):
+        """
+        Store derived entities from a tool result.
+        
+        This is called after every successful tool execution.
+        """
+        try:
+            stored = self.state_manager.store_tool_result(
+                session_id=session_id,
+                tool_name=tool_name,
+                tool_params=tool_input,
+                tool_result=tool_result
+            )
+            
+            if stored:
+                logger.debug(f"[{self.agent_name}] Stored derived entities: {stored}")
+        
+        except Exception as e:
+            # Don't fail the tool call if entity storage fails
+            logger.warning(f"Failed to store derived entities: {e}")
+
+    def _resolve_tool_input_templates(
+        self,
+        session_id: str,
+        tool_input: Dict[str, Any],
+        exec_context: ExecutionContext
+    ) -> Dict[str, Any]:
+        """
+        Resolve template placeholders in tool_input using:
+        1. Previous task results from observations
+        2. Derived entities from state_manager
+        3. Plan's resolved_entities
+        
+        Templates like {{task_1.doctor_id}} or {{doctor_uuid}} are resolved to actual values.
+        """
+        import re
+        
+        resolved_input = {}
+        
+        # Build a resolution context from all available sources
+        resolution_context = {}
+        
+        # 1. From plan's resolved_entities
+        if exec_context.plan and exec_context.plan.resolved_entities:
+            resolution_context.update(exec_context.plan.resolved_entities)
+        
+        # 2. From observations (tool results)
+        for obs in exec_context.observations:
+            if obs.type == "tool" and obs.is_success():
+                result = obs.result
+                # Common entity patterns to extract
+                if 'doctor_id' in result:
+                    resolution_context['doctor_id'] = result['doctor_id']
+                    resolution_context['doctor_uuid'] = result['doctor_id']
+                if 'doctors' in result and result['doctors']:
+                    resolution_context['doctors_list'] = result['doctors']
+                if 'appointment_id' in result:
+                    resolution_context['appointment_id'] = result['appointment_id']
+        
+        # 3. From derived entities in state_manager
+        try:
+            entity_state = self.state_manager.get_entity_state(session_id)
+            # Extract derived entities from EntityState
+            if hasattr(entity_state, 'derived') and entity_state.derived:
+                # Get all valid derived entities
+                if hasattr(entity_state.derived, 'entities'):
+                    for key, entity in entity_state.derived.entities.items():
+                        if hasattr(entity, 'value') and not entity.is_stale():
+                            resolution_context[key] = entity.value
+        except Exception as e:
+            logger.warning(f"Could not load entity state for template resolution: {e}")
+        
+        # 4. From initial context entities
+        context = self._context.get(session_id, {})
+        entities = context.get('entities', {})
+        resolution_context.update(entities)
+        
+        # Now resolve each value in tool_input
+        for key, value in tool_input.items():
+            if isinstance(value, str):
+                resolved_value = value
+                
+                # Find all template patterns like {{something}}
+                template_pattern = r'\{\{([^}]+)\}\}'
+                matches = re.findall(template_pattern, value)
+                
+                for match in matches:
+                    template_key = match.strip()
+                    resolved = None
+                    
+                    # Try direct lookup
+                    if template_key in resolution_context:
+                        resolved = resolution_context[template_key]
+                    
+                    # Try task_N.field pattern (e.g., task_1.doctor_id)
+                    elif '.' in template_key:
+                        parts = template_key.split('.', 1)
+                        task_ref = parts[0]  # e.g., "task_1"
+                        field_ref = parts[1]  # e.g., "doctor_id_for_mohammed_atef"
+                        
+                        # Look in completed task results
+                        if exec_context.plan:
+                            task = exec_context.plan.get_task(task_ref)
+                            if task and task.result:
+                                # Try to find the field in the result
+                                result = task.result
+                                
+                                # Check if field_ref contains a doctor name hint
+                                if 'doctor' in field_ref.lower() and 'doctors' in result:
+                                    # Extract doctor name from field reference
+                                    name_match = re.search(r'for_(.+)', field_ref)
+                                    if name_match:
+                                        doctor_name_search = name_match.group(1).replace('_', ' ').lower()
+                                        for doctor in result.get('doctors', []):
+                                            if doctor_name_search in doctor.get('name', '').lower():
+                                                resolved = doctor.get('id')
+                                                break
+                                
+                                # Direct field lookup in result
+                                if not resolved and field_ref in result:
+                                    resolved = result[field_ref]
+                    
+                    # Also try common derived entity keys
+                    if not resolved and 'doctor' in template_key.lower():
+                        resolved = resolution_context.get('doctor_uuid') or resolution_context.get('doctor_id')
+                    
+                    # Replace the template if resolved
+                    if resolved is not None:
+                        template_str = '{{' + match + '}}'
+                        resolved_value = resolved_value.replace(template_str, str(resolved))
+                        logger.info(f"🔗 [{self.agent_name}] Resolved template {template_str} → {resolved}")
+                    else:
+                        logger.warning(f"🔗 [{self.agent_name}] Could not resolve template: {{{{{match}}}}}")
+                
+                resolved_input[key] = resolved_value
+            else:
+                # Non-string values pass through unchanged
+                resolved_input[key] = value
+        
+        return resolved_input
 
     def _build_thinking_messages(
         self,
@@ -1514,7 +2379,7 @@ Respond with JSON:
 
         This method is only used by process_message_legacy() for backward compatibility.
         New code should use _generate_focused_response() instead, which includes
-        user_wants and tone from the reasoning engine.
+        what_user_means and tone from the reasoning engine.
 
         This is called ONLY after all tools have been executed.
 
@@ -1722,8 +2587,10 @@ FORBIDDEN:
 
         parts = []
 
-        if "user_wants" in context:
-            parts.append(f"User wants: {context['user_wants']}")
+        if "what_user_means" in context:
+            parts.append(f"What user means: {context['what_user_means']}")
+        elif "user_intent" in context:
+            parts.append(f"User intent: {context['user_intent']}")
 
         if "action" in context:
             parts.append(f"Suggested action: {context['action']}")
@@ -1849,11 +2716,21 @@ CLARIFY:
 - You don't have enough information
 - Required parameters are missing
 - Ask a specific question
+- MUST specify clarification_question
+- MUST specify awaiting_info (what you need)
+- MUST specify resolved_entities (what you already have)
 
 COLLECT_INFORMATION:
 - You need to exit the agentic loop to collect information from the user
 - Use this when you need to gather data before continuing execution
 - Response will pass through focused response generation for natural output
+- MUST specify awaiting_info (what you need)
+- MUST specify resolved_entities (what you already have)
+
+REQUEST_CONFIRMATION:
+- Use BEFORE executing critical actions: book_appointment, cancel_appointment, reschedule_appointment
+- MUST specify confirmation_summary with full details (action, details, tool_name, tool_input)
+- Wait for user to confirm before calling the tool
 
 RETRY:
 - A tool returned result_type=SYSTEM_ERROR
@@ -1882,16 +2759,21 @@ RETRY:
         
         # Extract key context fields with safe defaults
         logger.info(f"📝 [{self.agent_name}] Step 2: Extracting context fields...")
-        user_intent = context.get('user_intent', context.get('user_wants', 'Not specified'))
+        user_intent = context.get('user_intent') or context.get('what_user_means', 'Not specified')
         entities = context.get('entities', {})
         constraints = context.get('constraints', [])
         prior_context = context.get('prior_context', 'None')
         routing_action = context.get('routing_action', context.get('action', 'Not specified'))
         
+        # NEW: Get entities_collected from GlobalState
+        global_state = self.state_manager.get_global_state(exec_context.session_id)
+        entities_collected = global_state.entities_collected
+        
         logger.info(f"📝 [{self.agent_name}]   → User intent: {user_intent}")
         logger.info(f"📝 [{self.agent_name}]   → Routing action: {routing_action}")
         logger.info(f"📝 [{self.agent_name}]   → Prior context: {prior_context}")
         logger.info(f"📝 [{self.agent_name}]   → Entities: {list(entities.keys()) if entities else 'None'}")
+        logger.info(f"📝 [{self.agent_name}]   → Entities collected: {list(entities_collected.keys()) if entities_collected else 'None'}")
         logger.info(f"📝 [{self.agent_name}]   → Constraints: {len(constraints)} constraint(s)")
         
         # Check for continuation
@@ -1930,11 +2812,18 @@ DO NOT start from scratch. BUILD ON what was already resolved.
         else:
             logger.info(f"📝 [{self.agent_name}] Step 4: No continuation - skipping continuation section")
         
-        # Get criteria and observations
-        logger.info(f"📝 [{self.agent_name}] Step 5: Getting criteria display...")
-        criteria_display = exec_context.get_criteria_display()
-        logger.info(f"📝 [{self.agent_name}]   ✅ Criteria display ({len(criteria_display)} chars)")
-        logger.debug(f"📝 [{self.agent_name}]   → Criteria:\n{criteria_display}")
+        # Get plan display (Phase 6 - replaced criteria with plan)
+        logger.info(f"📝 [{self.agent_name}] Step 5: Getting plan display...")
+        plan_display = ""
+        if exec_context.plan:
+            plan = exec_context.plan
+            completed = len(plan.get_completed_task_ids())
+            total = len(plan.tasks)
+            plan_display = f"Plan: {plan.objective}\nStatus: {plan.status.value}\nProgress: {completed}/{total} tasks complete"
+        else:
+            plan_display = "No execution plan yet."
+        logger.info(f"📝 [{self.agent_name}]   ✅ Plan display ({len(plan_display)} chars)")
+        logger.debug(f"📝 [{self.agent_name}]   → Plan:\n{plan_display}")
         
         logger.info(f"📝 [{self.agent_name}] Step 6: Getting observations summary...")
         observations_summary = exec_context.get_observations_summary()
@@ -1955,8 +2844,11 @@ What User Really Wants: {user_intent}
 Recommended Action: {routing_action}
 Prior Context: {prior_context}
 
-Entities Identified:
+Entities Identified (from reasoning):
 {json.dumps(entities, indent=2, default=str) if entities else '(none)'}
+
+Collected Entities (from conversation):
+{json.dumps(entities_collected, indent=2, default=str) if entities_collected else '(none)'}
 
 Constraints:
 {chr(10).join(f'  - {c}' for c in constraints) if constraints else '  (none)'}
@@ -1974,10 +2866,10 @@ Constraints:
 User's Literal Message: {message}
 
 ═══════════════════════════════════════════════════════════════════════════════
-✅ SUCCESS CRITERIA (What You Must Accomplish, if you can)
+📋 EXECUTION PLAN (Phase 6 - Plan-based execution)
 ═══════════════════════════════════════════════════════════════════════════════
 
-{criteria_display}
+{plan_display}
 
 ═══════════════════════════════════════════════════════════════════════════════
 📊 EXECUTION HISTORY (Iteration {exec_context.iteration})
@@ -2001,10 +2893,10 @@ Respond with JSON:
 {{
     "analysis": "What I observe and understand about the current state",
     
-    "criteria_assessment": {{
-        "complete": ["list of completed criteria"],
-        "pending": ["list of pending criteria"],
-        "blocked": ["list of blocked criteria with reasons"]
+    "plan_status": {{
+        "completed_tasks": ["list of completed task IDs"],
+        "pending_tasks": ["list of pending task IDs"],
+        "blocked_tasks": ["list of blocked task IDs with reasons"]
     }},
     
     "last_result_analysis": {{
@@ -2013,25 +2905,105 @@ Respond with JSON:
         "interpretation": "what this result means for our task"
     }},
     
-    "decision": "CALL_TOOL | RESPOND | RESPOND_WITH_OPTIONS | RESPOND_IMPOSSIBLE | CLARIFY | COLLECT_INFORMATION | RETRY",
+    "decision": "CALL_TOOL | RESPOND_COMPLETE | RESPOND_WITH_OPTIONS | RESPOND_IMPOSSIBLE | CLARIFY | COLLECT_INFORMATION | REQUEST_CONFIRMATION | RETRY",
     "reasoning": "Why I chose this decision",
     
     "is_task_complete": true/false,
     
-    // If CALL_TOOL:
-    "tool_name": "name of tool to call",
+    // ═══════════════════════════════════════════════════════════════
+    // If CALL_TOOL - specify tool to call
+    // ═══════════════════════════════════════════════════════════════
+    "tool_name": "name of tool",
     "tool_input": {{}},
     
-    // If CLARIFY:
-    "clarification_question": "The specific question to ask"
-    
-    // If COLLECT_INFORMATION:
-    // (No additional fields needed - response will be generated via focused response generation)
+    // ═══════════════════════════════════════════════════════════════
+    // RESPONSE DATA - Fill based on decision type
+    // ═══════════════════════════════════════════════════════════════
+    "response": {{
+        // Always fill resolved_entities with what we know
+        "resolved_entities": {{
+            "patient_id": "...",
+            "doctor_name": "...",
+            "date": "...",
+            "time": "..."
+        }},
+        
+        // For COLLECT_INFORMATION:
+        "information_needed": "visit_reason | preferred_time | doctor_preference | ...",
+        "information_question": "Natural question to ask user",
+        
+        // For CLARIFY:
+        "clarification_needed": "what's unclear",
+        "clarification_question": "Question to resolve ambiguity",
+        
+        // For RESPOND_WITH_OPTIONS:
+        "options": ["option1", "option2", "option3"],
+        "options_context": "available_times | doctors | dates",
+        "options_reason": "Why original request couldn't be fulfilled",
+        
+        // For RESPOND_IMPOSSIBLE:
+        "failure_reason": "Why task cannot be completed",
+        "failure_suggestion": "What user can do instead",
+        
+        // For RESPOND_COMPLETE:
+        "completion_summary": "What was accomplished",
+        "completion_details": {{
+            "appointment_id": "...",
+            "doctor": "...",
+            "date": "...",
+            "time": "..."
+        }},
+        
+        // For REQUEST_CONFIRMATION:
+        "confirmation_action": "book_appointment | cancel_appointment",
+        "confirmation_details": {{}},
+        "confirmation_question": "Should I proceed with...?"
+    }}
 }}
+
+═══════════════════════════════════════════════════════════════════════════════
+DECISION → RESPONSE MAPPING
+═══════════════════════════════════════════════════════════════════════════════
+
+COLLECT_INFORMATION:
+  → Fill: information_needed, information_question, resolved_entities
+  → Example: Need visit_reason before booking
+  → Response will ASK for missing info, NOT promise action
+
+CLARIFY:
+  → Fill: clarification_needed, clarification_question, resolved_entities
+  → Example: "3pm" could mean today or tomorrow
+  → Response will ask clarifying question
+
+RESPOND_WITH_OPTIONS:
+  → Fill: options, options_context, options_reason, resolved_entities
+  → Example: Requested time unavailable, here are alternatives
+  → Response will present options
+
+RESPOND_IMPOSSIBLE:
+  → Fill: failure_reason, failure_suggestion, resolved_entities
+  → Example: Doctor doesn't exist in system
+  → Response will explain failure and suggest alternatives
+
+RESPOND_COMPLETE:
+  → Fill: completion_summary, completion_details, resolved_entities
+  → Example: Appointment successfully booked
+  → Response will confirm what was done with details
+
+REQUEST_CONFIRMATION:
+  → Fill: confirmation_action, confirmation_details, confirmation_question
+  → Example: About to book - confirm details first
+  → Response will ask for confirmation
+
+CRITICAL RULES:
+- NEVER say "I'll check..." or "I'll do..." unless you're about to CALL_TOOL
+- COLLECT_INFORMATION = ASK for info, don't promise action
+- Only RESPOND_COMPLETE after tools have actually succeeded
+- Fill resolved_entities with EVERYTHING you know so far
 
 DECISION RULES:
 1. If reasoning engine provided clear guidance → EXECUTE IT (call appropriate tools)
-2. If all criteria are ✅ → RESPOND with is_task_complete=true
+2. If all criteria are ✅ → RESPOND_COMPLETE with is_task_complete=true
 3. If last result has alternatives and available=false → RESPOND_WITH_OPTIONS
 4. If task impossible → RESPOND_IMPOSSIBLE
 5. Only CLARIFY if execution reveals missing CRITICAL data not in context
@@ -2043,9 +3015,10 @@ DECISION RULES:
         logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
         logger.info(f"📝 [{self.agent_name}] PROMPT BUILDING COMPLETE")
         logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
-        logger.info(80*">")
-        logger.info(f"📝 [{self.agent_name}] Full thinking prompt content:\n{prompt}")
-        logger.info(80*">")
+        logger.info(80*"📜")
+        logger.info(f"📜 [{self.agent_name}]   → Prompt length: {len(prompt)} chars")
+        logger.info(f"📜 [{self.agent_name}] Full thinking prompt content:\n{prompt}")
+        logger.info(80*"📜")
 
         return prompt
 
@@ -2097,7 +3070,9 @@ DECISION RULES:
                 "CLARIFY": AgentDecision.CLARIFY,
                 "RETRY": AgentDecision.RETRY,
                 "EXECUTE_RECOVERY": AgentDecision.EXECUTE_RECOVERY,
-                "COLLECT_INFORMATION": AgentDecision.COLLECT_INFORMATION
+                "COLLECT_INFORMATION": AgentDecision.COLLECT_INFORMATION,
+                "REQUEST_CONFIRMATION": AgentDecision.REQUEST_CONFIRMATION,  # NEW
+                "CONFIRM": AgentDecision.REQUEST_CONFIRMATION  # Alias
             }
             decision = decision_map.get(decision_str, AgentDecision.RESPOND)
             logger.info(f"🔍 [{self.agent_name}]   → Mapped to: {decision.value}")
@@ -2153,6 +3128,8 @@ DECISION RULES:
             tool_name = None
             tool_input = None
             clarification_question = None
+            awaiting_info = None
+            resolved_entities = None
             
             if decision == AgentDecision.CALL_TOOL:
                 tool_name = data.get("tool_name")
@@ -2173,8 +3150,59 @@ DECISION RULES:
             elif decision == AgentDecision.COLLECT_INFORMATION:
                 logger.info(f"🔍 [{self.agent_name}]   → Collecting information - will generate focused response")
             
+            # Extract awaiting_info and resolved_entities for COLLECT_INFORMATION and CLARIFY
+            if decision in [AgentDecision.COLLECT_INFORMATION, AgentDecision.CLARIFY]:
+                awaiting_info = data.get("awaiting_info")
+                resolved_entities = data.get("resolved_entities", {})
+                logger.info(f"🔍 [{self.agent_name}]   → Awaiting info: {awaiting_info}")
+                logger.info(f"🔍 [{self.agent_name}]   → Resolved entities: {list(resolved_entities.keys()) if resolved_entities else 'None'}")
+            
+            # Extract confirmation_summary for REQUEST_CONFIRMATION (legacy)
+            confirmation_summary = None
+            if decision == AgentDecision.REQUEST_CONFIRMATION:
+                confirmation_data = data.get("confirmation_summary")
+                if confirmation_data:
+                    try:
+                        confirmation_summary = ConfirmationSummary(**confirmation_data)
+                        logger.info(f"🔍 [{self.agent_name}]   → Confirmation action: {confirmation_summary.action}")
+                        logger.info(f"🔍 [{self.agent_name}]   → Confirmation tool: {confirmation_summary.tool_name}")
+                    except Exception as e:
+                        logger.warning(f"🔍 [{self.agent_name}]   ⚠️  Failed to parse confirmation_summary: {e}")
+                else:
+                    logger.warning(f"🔍 [{self.agent_name}]   ⚠️  REQUEST_CONFIRMATION but no confirmation_summary provided!")
+            
+            # Extract response object (NEW structured approach)
+            logger.info(f"🔍 [{self.agent_name}] Step 8: Extracting response data...")
+            response_data = None
+            response_obj = data.get("response", {})
+            
+            if response_obj:
+                try:
+                    # Create AgentResponseData from response object
+                    response_data = AgentResponseData(**response_obj)
+                    logger.info(f"🔍 [{self.agent_name}]   ✅ Response data extracted successfully")
+                    logger.info(f"🔍 [{self.agent_name}]   → Response fields: {list(response_obj.keys())}")
+                except Exception as e:
+                    logger.warning(f"🔍 [{self.agent_name}]   ⚠️  Failed to parse response object: {e}")
+                    logger.warning(f"🔍 [{self.agent_name}]   → Response object: {response_obj}")
+                    # Create empty response data as fallback
+                    response_data = AgentResponseData()
+            else:
+                # Fallback to legacy fields for backward compatibility
+                logger.info(f"🔍 [{self.agent_name}]   → No response object found, using legacy fields")
+                response_data = AgentResponseData(
+                    information_needed=awaiting_info,
+                    information_question=None,  # Will be generated from information_needed
+                    clarification_needed=None,
+                    clarification_question=clarification_question,
+                    resolved_entities=resolved_entities or {},
+                    confirmation_action=confirmation_summary.action if confirmation_summary else None,
+                    confirmation_details=confirmation_summary.details if confirmation_summary else {},
+                    confirmation_question=None  # Will be generated
+                )
+            
             # Build result
-            logger.info(f"🔍 [{self.agent_name}] Step 8: Building ThinkingResult object...")
+            logger.info(f"🔍 [{self.agent_name}] Step 9: Building ThinkingResult object...")
             result = ThinkingResult(
                 analysis=analysis,
                 task_status=assessment,
@@ -2183,8 +3211,12 @@ DECISION RULES:
                 tool_name=tool_name,
                 tool_input=tool_input,
                 response_text=None,  # No longer extracted from thinking - generated after decision
-                clarification_question=clarification_question,
-                is_task_complete=is_task_complete
+                clarification_question=clarification_question,  # Legacy
+                is_task_complete=is_task_complete,
+                awaiting_info=awaiting_info,  # Legacy
+                resolved_entities=resolved_entities,  # Legacy
+                confirmation_summary=confirmation_summary,  # Legacy
+                response=response_data  # NEW structured response
             )
             
             logger.info(f"🔍 [{self.agent_name}]   ✅ ThinkingResult created successfully")
@@ -2223,6 +3255,230 @@ DECISION RULES:
                 reasoning=f"Parse error: {e}",
                 clarification_question="I'm having trouble understanding. Could you please rephrase your request?"
             )
+
+    def _extract_resolved_entities(self, exec_context: ExecutionContext) -> Dict[str, Any]:
+        """Extract what we've already resolved from execution context and observations."""
+        resolved = {}
+        
+        # From context
+        context = self._context.get(exec_context.session_id, {})
+        entities = context.get('entities', {})
+        for key in ['patient_id', 'doctor_id', 'doctor_name', 'date', 'time', 'procedure']:
+            if key in entities and entities[key]:
+                resolved[key] = entities[key]
+        
+        # From successful tool results
+        for obs in exec_context.observations:
+            if obs.is_success() and obs.type == "tool":
+                result = obs.result
+                # Extract key booking entities from tool results
+                if 'doctor_id' in result:
+                    resolved['doctor_id'] = result['doctor_id']
+                if 'doctor_name' in result:
+                    resolved['doctor_name'] = result['doctor_name']
+                if 'date' in result:
+                    resolved['date'] = result['date']
+                if 'available_slots' in result and result['available_slots']:
+                    resolved['available_slots'] = result['available_slots']
+        
+        return resolved
+
+    def _mark_plan_blocked_and_store(
+        self,
+        session_id: str,
+        exec_context: ExecutionContext,
+        awaiting: str,
+        options: Optional[List[str]] = None
+    ):
+        """
+        Mark the current plan as BLOCKED and persist it for next turn.
+
+        Called when the agent needs user input (CLARIFY, COLLECT_INFORMATION, REQUEST_CONFIRMATION).
+        This ensures the plan can be resumed when the user responds.
+
+        Args:
+            session_id: Session identifier
+            exec_context: Current execution context (contains the plan)
+            awaiting: What we're waiting for from the user
+            options: Optional list of valid options (for selections/confirmations)
+        """
+        if exec_context.plan:
+            reason = f"Waiting for user to provide: {awaiting}"
+            exec_context.plan.mark_blocked(
+                reason=reason,
+                awaiting=awaiting,
+                options=options or []
+            )
+            self.state_manager.store_agent_plan(session_id, exec_context.plan)
+            logger.info(f"🛑 [{self.agent_name}] Plan marked BLOCKED and stored: {reason}")
+        else:
+            logger.warning(f"📋 [{self.agent_name}] No plan to mark blocked (awaiting={awaiting})")
+
+    def _generate_confirmation_request(self, summary: ConfirmationSummary) -> str:
+        """Generate a confirmation request message for the user."""
+        action = summary.action
+        details = summary.details
+        
+        if action == "book_appointment":
+            doctor = details.get('doctor_name', 'the doctor')
+            date = details.get('date', '')
+            time = details.get('time', '')
+            procedure = details.get('procedure', 'your appointment')
+            
+            return (
+                f"I'm ready to book your {procedure} with {doctor} "
+                f"on {date} at {time}. "
+                f"Should I confirm this booking?"
+            )
+        
+        elif action == "cancel_appointment":
+            doctor = details.get('doctor_name', 'the doctor')
+            date = details.get('date', '')
+            time = details.get('time', '')
+            
+            return (
+                f"I'll cancel your appointment with {doctor} "
+                f"on {date} at {time}. "
+                f"Are you sure you want to cancel?"
+            )
+        
+        elif action == "reschedule_appointment":
+            old_date = details.get('old_date', '')
+            old_time = details.get('old_time', '')
+            new_date = details.get('new_date', details.get('date', ''))
+            new_time = details.get('new_time', details.get('time', ''))
+            doctor = details.get('doctor_name', 'the doctor')
+            
+            return (
+                f"I'll reschedule your appointment with {doctor} "
+                f"from {old_date} at {old_time} "
+                f"to {new_date} at {new_time}. "
+                f"Should I proceed?"
+            )
+        
+        else:
+            # Generic confirmation
+            return f"Please confirm: {action}. Proceed?"
+
+    async def _execute_confirmed_action(
+        self,
+        session_id: str,
+        continuation_context: Dict[str, Any],
+        execution_log: ExecutionLog
+    ) -> Tuple[str, ExecutionLog]:
+        """Execute the pending action after user confirmed."""
+        resolved = continuation_context.get('resolved_entities', {})
+        pending_tool = resolved.get('pending_tool')
+        pending_input = resolved.get('pending_tool_input', {})
+        
+        if not pending_tool:
+            logger.warning(f"[{self.agent_name}] No pending tool to execute!")
+            return "I'm sorry, I lost track of what we were doing. Could you repeat your request?", execution_log
+        
+        logger.info(f"[{self.agent_name}] Executing confirmed action: {pending_tool}")
+        
+        # Clear continuation context BEFORE executing
+        self.state_manager.clear_continuation_context(session_id)
+        
+        # Execute the pending tool
+        tool_result = await self._execute_tool(pending_tool, pending_input, execution_log)
+        
+        # Create execution context for response generation
+        exec_context = ExecutionContext(session_id, self.max_iterations, user_request="Confirmed action")
+        exec_context.add_observation("tool", pending_tool, tool_result)
+        
+        if tool_result.get('success'):
+            response = await self._generate_focused_response(session_id, exec_context)
+        else:
+            error = tool_result.get('error', 'The action could not be completed')
+            response = f"I'm sorry, there was an issue: {error}. Would you like to try again?"
+        
+        return response, execution_log
+
+    async def _handle_rejection(
+        self,
+        session_id: str,
+        continuation_context: Dict[str, Any],
+        execution_log: ExecutionLog
+    ) -> Tuple[str, ExecutionLog]:
+        """Handle user rejecting the pending action."""
+        logger.info(f"[{self.agent_name}] User rejected pending action")
+        
+        # Clear continuation context
+        self.state_manager.clear_continuation_context(session_id)
+        
+        return "No problem, I've cancelled that. Is there anything else I can help you with?", execution_log
+
+    async def _handle_modification(
+        self,
+        session_id: str,
+        message: str,
+        context: Dict[str, Any],
+        execution_log: ExecutionLog
+    ) -> Tuple[str, ExecutionLog]:
+        """Handle user wanting to modify before confirming."""
+        logger.info(f"[{self.agent_name}] User wants to modify pending action")
+        
+        continuation_context = context.get('continuation_context', {})
+        resolved = continuation_context.get('resolved_entities', {}).copy()
+        pending_tool = resolved.get('pending_tool')
+        pending_input = resolved.get('pending_tool_input', {}).copy()
+        
+        # Get extracted entities from assessment (new values user provided)
+        new_entities = context.get('entities', {})
+        
+        # Merge new entities into pending input
+        # Map from preference keys to tool input keys
+        entity_mapping = {
+            'time_preference': 'time',
+            'date_preference': 'date',
+            'doctor_preference': 'doctor_name',
+            'procedure_preference': 'procedure',
+            'doctor_id': 'doctor_id',
+            'time': 'time',
+            'date': 'date',
+            'doctor_name': 'doctor_name',
+            'procedure': 'procedure'
+        }
+        
+        updated = False
+        for entity_key, tool_key in entity_mapping.items():
+            if entity_key in new_entities and new_entities[entity_key]:
+                pending_input[tool_key] = new_entities[entity_key]
+                updated = True
+                logger.info(f"[{self.agent_name}] Updated {tool_key} to {new_entities[entity_key]}")
+        
+        if not updated:
+            # Couldn't figure out what to modify - ask for clarification
+            return "I want to make sure I update the right thing. What would you like to change?", execution_log
+        
+        # Update the continuation context with new pending input
+        resolved['pending_tool_input'] = pending_input
+        
+        # Also update details for confirmation message
+        for key in ['time', 'date', 'doctor_name', 'procedure']:
+            if key in pending_input:
+                resolved[key] = pending_input[key]
+        
+        self.state_manager.set_continuation_context(
+            session_id,
+            awaiting="confirmation",
+            options=["yes", "no"],
+            original_request=continuation_context.get('original_request'),
+            resolved_entities=resolved,
+            blocked_criteria=[]
+        )
+        
+        # Generate new confirmation request with updated details
+        summary = ConfirmationSummary(
+            action=resolved.get('pending_action', 'book_appointment'),
+            details={k: v for k, v in resolved.items() if k in ['doctor_name', 'date', 'time', 'procedure']},
+            tool_name=pending_tool,
+            tool_input=pending_input
+        )
+        
+        response = self._generate_confirmation_request(summary)
+        return response, execution_log
 
     def _get_tools_description(self) -> str:
         """Get description of available tools with full parameter details for the prompt."""
@@ -2313,12 +3569,16 @@ DECISION RULES:
         
         This is where the LLM analyzes:
         - What has been done (observations)
-        - What remains to do (criteria)
+        - What remains to do (plan)
         - What to do next (decision)
         """
         logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
         logger.info(f"🧠 [{self.agent_name}] ENTERING _think() - Iteration {exec_context.iteration}")
         logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        plan = exec_context.plan
+        logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        logger.info(f"🧠 [{self.agent_name}] Thinking - Plan status: {plan.status.value}")
+        logger.info(f"🧠 [{self.agent_name}]   Completed: {len(plan.get_completed_task_ids())}/{len(plan.tasks)}")
         
         # ═════════════════════════════════════════════════════════════════════
         # STEP 1: GATHER INPUT CONTEXT
@@ -2328,7 +3588,7 @@ DECISION RULES:
         context = self._context.get(session_id, {})
         logger.info(f"🧠 [{self.agent_name}]   → Session context keys: {list(context.keys())}")
         logger.info(f"🧠 [{self.agent_name}]   → User message: '{message[:100]}{'...' if len(message) > 100 else ''}'")
-        logger.info(f"🧠 [{self.agent_name}]   → User intent: {context.get('user_intent', context.get('user_wants', 'N/A'))}")
+        logger.info(f"🧠 [{self.agent_name}]   → User intent: {context.get('user_intent') or context.get('what_user_means', 'N/A')}")
         logger.info(f"🧠 [{self.agent_name}]   → Routing action: {context.get('routing_action', context.get('action', 'N/A'))}")
         logger.info(f"🧠 [{self.agent_name}]   → Is continuation: {context.get('is_continuation', False)}")
         if context.get('is_continuation'):
@@ -2371,8 +3631,13 @@ DECISION RULES:
         logger.info(f"🧠 [{self.agent_name}] [STEP 2/5] Building thinking prompt...")
         
         prompt = self._build_thinking_prompt(message, context, exec_context)
-        logger.info(f"🧠 [{self.agent_name}]   → Prompt length: {len(prompt)} chars")
-        logger.info(f"🧠 [{self.agent_name}]   → Full thinking prompt:\n{prompt}")
+        
+        # Log complete thinking prompt
+        logger.info("📜" * 80)
+        logger.info(f"🧠 [{self.agent_name}] COMPLETE THINKING PROMPT:")
+        logger.info("📜" * 80)
+        logger.info(prompt)
+        logger.info("📜" * 80)
         
         # ═════════════════════════════════════════════════════════════════════
         # STEP 3: PREPARE LLM CALL
@@ -2425,7 +3690,13 @@ DECISION RULES:
             logger.info(f"🧠 [{self.agent_name}]       • Output tokens: {tokens.output_tokens if hasattr(tokens, 'output_tokens') else 'N/A'}")
             logger.info(f"🧠 [{self.agent_name}]       • Total tokens: {tokens.total_tokens if hasattr(tokens, 'total_tokens') else 'N/A'}")
             logger.info(f"🧠 [{self.agent_name}]   → Response length: {len(response)} chars")
-            logger.info(f"🧠 [{self.agent_name}]   → Raw response:\n{response}")
+            
+            # Log raw LLM response
+            logger.info("💬" * 80)
+            logger.info(f"🧠 [{self.agent_name}] RAW LLM RESPONSE:")
+            logger.info("💬" * 80)
+            logger.info(response)
+            logger.info("💬" * 80)
             
             # Record LLM call with iteration context
             if obs_logger:
@@ -2538,6 +3809,24 @@ DECISION RULES:
         
         logger.info(f"🛠️  [{self.agent_name}]   ✅ Tool found in registry")
         
+        # =========================================================================
+        # NEW: Check if we can skip this call using derived entities
+        # =========================================================================
+        session_id = tool_input.get('session_id')
+        if session_id:
+            skip_result = self._check_derived_entity_cache(session_id, tool_name, tool_input)
+            if skip_result is not None:
+                logger.info(f"[{self.agent_name}] Using cached derived entity for {tool_name}")
+                # Log to execution log
+                execution_log.tools_used.append(ToolExecution(
+                    tool_name=tool_name,
+                    inputs=tool_input,
+                    outputs=skip_result,
+                    success=True,
+                    duration_seconds=0.0
+                ))
+                return skip_result
+        
         # Log inputs
         logger.info(f"🛠️  [{self.agent_name}] Step 2: Tool inputs...")
         logger.info(f"🛠️  [{self.agent_name}]   → Input keys: {list(tool_input.keys())}")
@@ -2602,6 +3891,13 @@ DECISION RULES:
                 duration_seconds=duration_seconds
             ))
             logger.info(f"🛠️  [{self.agent_name}]   ✅ Recorded (total tools: {len(execution_log.tools_used)})")
+            
+            # =====================================================================
+            # NEW: Store derived entities from tool result
+            # =====================================================================
+            session_id = tool_input.get('session_id')
+            if session_id:
+                self._store_derived_entities(session_id, tool_name, tool_input, result)
             
             logger.info(f"🛠️  [{self.agent_name}] ════════════════════════════════════════════════════════")
             logger.info(f"🛠️  [{self.agent_name}] TOOL EXECUTION COMPLETE: {tool_name} ✅")
@@ -2680,6 +3976,39 @@ DECISION RULES:
             result_type=result_type
         )
         logger.info(f"🔧 [{self.agent_name}]   ✅ Observation added (total: {len(exec_context.observations)})")
+        
+        # Step 2.5: Store derived entities
+        self._store_derived_entities(session_id, tool_name, {}, tool_result)
+        
+        # Step 2.6: Update task status if task-based execution
+        task_id = exec_context.task_plan.current_task_id if exec_context.task_plan else None
+        if task_id and exec_context.task_plan:
+            task = exec_context.task_plan.get_task(task_id)
+            
+            if task:
+                if result_type == ToolResultType.SUCCESS:
+                    exec_context.mark_task_complete(task_id, tool_result)
+                    
+                elif result_type == ToolResultType.USER_INPUT_NEEDED:
+                    exec_context.mark_task_blocked(
+                        task_id,
+                        reason=tool_result.get("error", "User input needed"),
+                        options=tool_result.get("alternatives", []),
+                        suggested_response=tool_result.get("suggested_response")
+                    )
+                    
+                elif result_type in [ToolResultType.FATAL, ToolResultType.SYSTEM_ERROR]:
+                    if task.can_retry() and result_type == ToolResultType.SYSTEM_ERROR:
+                        task.retry()
+                        logger.info(f"Retrying task {task_id} (attempt {task.retry_count})")
+                    else:
+                        exec_context.mark_task_failed(task_id, tool_result.get("error", "Task failed"))
+                        
+                elif result_type == ToolResultType.PARTIAL:
+                    # Partial success - task continues or completes based on next step
+                    exec_context.mark_task_complete(task_id, tool_result)
+                
+                exec_context.task_plan.update_metrics()
         
         # Step 3: Handle based on result type
         logger.info(f"🔧 [{self.agent_name}] Step 3: Handling result based on type: {result_type.value}")
@@ -3007,13 +4336,14 @@ DECISION RULES:
     ) -> str:
         """
         Generate response AFTER agent decides to respond.
-        Uses full execution context, user_wants, and tone.
+        Uses full execution context, what_user_means/user_intent, and tone.
         """
         logger.info(f"🅰 [{self.agent_name}] Initializing focused response generation (Option 2)")
         
         context = self._context.get(session_id, {})
         
-        user_wants = context.get("user_wants", context.get("user_intent", ""))
+        # Use user_intent as primary, with fallback to what_user_means
+        user_intent = context.get("user_intent") or context.get("what_user_means", "")
         tone = context.get("tone", "helpful")
         language = context.get("current_language", "en")
         dialect = context.get("current_dialect")
@@ -3026,7 +4356,7 @@ DECISION RULES:
         agent_restrictions = self._extract_key_restrictions(agent_system_prompt)
         
         logger.info(f"👩🏻‍💻 [{self.agent_name}] Focused response inputs:")
-        logger.info(f"👩🏻‍💻   - user_wants: {user_wants}")
+        logger.info(f"👩🏻‍💻   - user_intent: {user_intent}")
         logger.info(f"👩🏻‍💻   - tone: {tone}")
         logger.info(f"👩🏻‍💻   - language: {language}")
         logger.info(f"👩🏻‍💻   - dialect: {dialect}")
@@ -3036,7 +4366,7 @@ DECISION RULES:
         
         system_prompt = f"""Generate a {tone} response for a clinic receptionist.
 
-USER WANTED: {user_wants}
+USER INTENT: {user_intent}
 TONE: {tone}
 LANGUAGE: {language}
 DIALECT: {dialect if dialect else ""}
@@ -3122,6 +4452,428 @@ RULES:
             error_response = "I apologize, but I encountered an issue processing your request. Please try again."
             logger.info(f"🅰 [{self.agent_name}] Returning error fallback response: {error_response}")
             return error_response
+
+    async def _generate_response(
+        self,
+        session_id: str,
+        decision: AgentDecision,
+        response_data: AgentResponseData,
+        exec_context: ExecutionContext
+    ) -> str:
+        """
+        Unified response generator for all decision types.
+        
+        Takes structured response data and generates appropriate user-facing message.
+        """
+        logger.info(f"🎯 [{self.agent_name}] Generating response for decision: {decision.value}")
+        logger.info(f"🎯 [{self.agent_name}]   Response data: {response_data.dict(exclude_none=True)}")
+        
+        context = self._context.get(session_id, {})
+        language = context.get("current_language", "en")
+        dialect = context.get("current_dialect")
+        tone = context.get("tone", "helpful")
+        
+        # Get patient context properly
+        patient_context = PatientContext.from_session(
+            session_id, 
+            self.state_manager,
+            resolved_entities=response_data.resolved_entities
+        )
+        
+        logger.info(f"🎯 [{self.agent_name}] Patient context: {patient_context.get_prompt_context()}")
+        
+        # Format resolved entities
+        known_info = self._format_resolved_entities(response_data.resolved_entities)
+        
+        # Build decision-specific prompt
+        if decision == AgentDecision.COLLECT_INFORMATION:
+            prompt = self._build_collect_info_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            
+        elif decision == AgentDecision.CLARIFY:
+            prompt = self._build_clarify_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            
+        elif decision == AgentDecision.RESPOND_WITH_OPTIONS:
+            prompt = self._build_options_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            
+        elif decision == AgentDecision.RESPOND_IMPOSSIBLE:
+            prompt = self._build_impossible_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            
+        elif decision in [AgentDecision.RESPOND, AgentDecision.RESPOND_COMPLETE]:
+            prompt = self._build_completion_prompt(response_data, exec_context, patient_context, tone, language, dialect)
+            
+        elif decision == AgentDecision.REQUEST_CONFIRMATION:
+            prompt = self._build_confirmation_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            
+        else:
+            # Fallback
+            prompt = self._build_generic_prompt(response_data, exec_context, patient_context, tone, language, dialect)
+        
+        # Generate response
+        try:
+            obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+            llm_start_time = time.time()
+            
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system=prompt,
+                    messages=[{"role": "user", "content": "Generate the response."}],
+                    temperature=0.5,
+                    max_tokens=300
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system=prompt,
+                    messages=[{"role": "user", "content": "Generate the response."}],
+                    temperature=0.5,
+                    max_tokens=300
+                )
+                tokens = TokenUsage()
+            
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            # Record LLM call
+            if obs_logger:
+                try:
+                    obs_logger.record_llm_call(
+                        component=f"agent.{self.agent_name}.generate_response",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_seconds=llm_duration_seconds,
+                        system_prompt_length=len(prompt),
+                        messages_count=1,
+                        temperature=0.5,
+                        max_tokens=300,
+                        error=None
+                    )
+                except Exception as obs_error:
+                    logger.warning(f"🎯 [{self.agent_name}] Error in observability logging (non-critical): {obs_error}")
+            
+            logger.info(f"🎯 [{self.agent_name}] Generated: {response}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"🎯 [{self.agent_name}] Error generating response: {e}")
+            return self._get_fallback_response(decision, response_data)
+
+    def _build_collect_info_prompt(
+        self,
+        response_data: AgentResponseData,
+        known_info: str,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Build prompt for COLLECT_INFORMATION decision."""
+        return f"""Generate a {tone} question to collect missing information.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+
+⚠️  CRITICAL: If patient name is not available, DO NOT invent one!
+
+═══════════════════════════════════════════════════════════════
+WHAT WE ALREADY KNOW
+═══════════════════════════════════════════════════════════════
+{known_info}
+
+═══════════════════════════════════════════════════════════════
+WHAT WE NEED
+═══════════════════════════════════════════════════════════════
+{response_data.information_needed}
+
+SUGGESTED QUESTION:
+{response_data.information_question or f"Ask for {response_data.information_needed}"}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Ask ONLY for the missing information
+- Be conversational and natural
+- DO NOT say "I'll check" or "I'll do X" - nothing has been done yet!
+- DO NOT promise any action
+- DO NOT invent patient names - use only what's in PATIENT CONTEXT
+- Keep it to 1-2 sentences
+
+FORBIDDEN:
+- Inventing names (like "John", "Sarah", etc.) if not in patient context
+- "I'll check availability"
+- "I'll book that for you"  
+- Any promise of future action"""
+
+    def _build_clarify_prompt(
+        self,
+        response_data: AgentResponseData,
+        known_info: str,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Build prompt for CLARIFY decision."""
+        return f"""Generate a {tone} question to clarify ambiguous input.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+
+⚠️  CRITICAL: If patient name is not available, DO NOT invent one!
+
+═══════════════════════════════════════════════════════════════
+WHAT WE ALREADY KNOW
+═══════════════════════════════════════════════════════════════
+{known_info}
+
+═══════════════════════════════════════════════════════════════
+WHAT'S UNCLEAR
+═══════════════════════════════════════════════════════════════
+{response_data.clarification_needed or "Something needs clarification"}
+
+SUGGESTED QUESTION:
+{response_data.clarification_question or "Could you please clarify?"}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Ask a clarifying question
+- Be conversational and natural
+- DO NOT invent patient names
+- Keep it to 1-2 sentences"""
+
+    def _build_options_prompt(
+        self,
+        response_data: AgentResponseData,
+        known_info: str,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Build prompt for RESPOND_WITH_OPTIONS decision."""
+        options_formatted = "\n".join([f"  • {opt}" for opt in response_data.options])
+        
+        return f"""Generate a {tone} response presenting options to the user.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+
+CONTEXT:
+{known_info}
+
+WHY OPTIONS ARE NEEDED:
+{response_data.options_reason or "Original request couldn't be fulfilled exactly"}
+
+OPTIONS TO PRESENT ({response_data.options_context}):
+{options_formatted}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Briefly explain why we're offering alternatives
+- Present the options clearly
+- Ask which they prefer
+- Keep it concise (2-4 sentences)
+- Don't apologize excessively
+- DO NOT invent patient names"""
+
+    def _build_impossible_prompt(
+        self,
+        response_data: AgentResponseData,
+        known_info: str,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Build prompt for RESPOND_IMPOSSIBLE decision."""
+        return f"""Generate a {tone} response explaining why the request cannot be fulfilled.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+
+WHAT WAS ATTEMPTED:
+{known_info}
+
+WHY IT'S NOT POSSIBLE:
+{response_data.failure_reason}
+
+SUGGESTION FOR USER:
+{response_data.failure_suggestion or "No specific suggestion"}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Be empathetic but direct
+- Explain the issue clearly
+- Offer the suggestion if available
+- Don't over-apologize
+- Keep it to 2-3 sentences
+- DO NOT invent patient names"""
+
+    def _build_completion_prompt(
+        self,
+        response_data: AgentResponseData,
+        exec_context: ExecutionContext,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Build prompt for RESPOND_COMPLETE decision."""
+        # Get execution summary from actual tool results
+        execution_summary = self._build_execution_summary(exec_context)
+        
+        details_formatted = "\n".join([
+            f"  • {k}: {v}" for k, v in response_data.completion_details.items() if v
+        ]) if response_data.completion_details else "No details"
+        
+        # Determine how to address patient
+        if patient_context.name:
+            address_instruction = f"You may address the patient as '{patient_context.name}'"
+        else:
+            address_instruction = "DO NOT use any name - patient name is not available"
+        
+        return f"""Generate a {tone} response confirming what was accomplished.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT  
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+{address_instruction}
+
+═══════════════════════════════════════════════════════════════
+WHAT WAS DONE
+═══════════════════════════════════════════════════════════════
+{response_data.completion_summary or "Task completed"}
+
+DETAILS:
+{details_formatted}
+
+EXECUTION LOG:
+{execution_summary}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Confirm the action was completed
+- Include key details (confirmation number, date, time, etc.)
+- Be warm but concise
+- No technical details or UUIDs
+- DO NOT invent patient names
+- 2-3 sentences"""
+
+    def _build_confirmation_prompt(
+        self,
+        response_data: AgentResponseData,
+        known_info: str,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Build prompt for REQUEST_CONFIRMATION decision."""
+        details_formatted = "\n".join([
+            f"  • {k}: {v}" for k, v in response_data.confirmation_details.items() if v
+        ]) if response_data.confirmation_details else "No details"
+        
+        return f"""Generate a {tone} response asking for confirmation before proceeding.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+
+ACTION TO CONFIRM:
+{response_data.confirmation_action}
+
+DETAILS:
+{details_formatted}
+
+SUGGESTED QUESTION:
+{response_data.confirmation_question or "Should I proceed?"}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Summarize what you're about to do
+- Include all relevant details
+- Ask for explicit confirmation
+- Keep it clear and concise
+- DO NOT invent patient names"""
+
+    def _build_generic_prompt(
+        self,
+        response_data: AgentResponseData,
+        exec_context: ExecutionContext,
+        patient_context: PatientContext,
+        tone: str,
+        language: str,
+        dialect: Optional[str]
+    ) -> str:
+        """Fallback generic prompt builder."""
+        execution_summary = self._build_execution_summary(exec_context)
+        known_info = self._format_resolved_entities(response_data.resolved_entities)
+        
+        return f"""Generate a {tone} response.
+
+═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT
+═══════════════════════════════════════════════════════════════
+{patient_context.get_prompt_context()}
+
+CONTEXT:
+{known_info}
+
+EXECUTION LOG:
+{execution_summary}
+
+LANGUAGE: {language}
+DIALECT: {dialect or "standard"}
+
+RULES:
+- Be helpful and natural
+- DO NOT invent patient names
+- Keep it concise"""
+
+    def _format_resolved_entities(self, entities: Dict[str, Any]) -> str:
+        """Format resolved entities for prompts."""
+        if not entities:
+            return "Nothing collected yet."
+        
+        lines = []
+        for key, value in entities.items():
+            if value:
+                # Make keys human-readable
+                readable_key = key.replace("_", " ").title()
+                lines.append(f"  • {readable_key}: {value}")
+        
+        return "\n".join(lines) if lines else "Nothing collected yet."
+
+    def _get_fallback_response(self, decision: AgentDecision, response_data: AgentResponseData) -> str:
+        """Get fallback response if LLM generation fails."""
+        fallbacks = {
+            AgentDecision.COLLECT_INFORMATION: f"Could you please provide your {response_data.information_needed.replace('_', ' ') if response_data.information_needed else 'information'}?",
+            AgentDecision.CLARIFY: response_data.clarification_question or "Could you please clarify?",
+            AgentDecision.RESPOND_WITH_OPTIONS: "Here are some options for you to choose from.",
+            AgentDecision.RESPOND_IMPOSSIBLE: "I'm sorry, but I wasn't able to complete that request.",
+            AgentDecision.RESPOND_COMPLETE: "Your request has been completed.",
+            AgentDecision.REQUEST_CONFIRMATION: "Would you like me to proceed?",
+        }
+        return fallbacks.get(decision, "How can I help you?")
 
     def _build_execution_summary(self, exec_context: ExecutionContext) -> str:
         """Build compact summary of execution for response generation."""

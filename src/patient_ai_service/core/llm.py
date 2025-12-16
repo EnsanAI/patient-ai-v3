@@ -62,26 +62,46 @@ class AnthropicClient(LLMClient):
         temperature: Optional[float] = None,
     ) -> str:
         """Create a message using Claude."""
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens or settings.llm_max_tokens,
-                temperature=temperature or settings.llm_temperature,
-                system=system,
-                messages=messages,
-            )
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens or settings.llm_max_tokens,
+                    temperature=temperature or settings.llm_temperature,
+                    system=system,
+                    messages=messages,
+                )
 
-            # Extract text from response
-            if response.content and len(response.content) > 0:
-                return response.content[0].text
-            return ""
+                # Extract text from response
+                if response.content and len(response.content) > 0:
+                    return response.content[0].text
+                return ""
 
-        except anthropic.APIError as e:
-            logger.error(f"Anthropic API error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error calling Anthropic: {e}")
-            raise
+            except anthropic.OverloadedError as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Anthropic API overloaded (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Anthropic API overloaded after {max_retries + 1} attempts: {e}")
+                    raise
+            except anthropic.RateLimitError as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Anthropic API rate limit hit (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Anthropic API rate limit exceeded after {max_retries + 1} attempts: {e}")
+                    raise
+            except anthropic.APIError as e:
+                logger.error(f"Anthropic API error: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error calling Anthropic: {e}")
+                raise
     
     def create_message_with_usage(
         self,
@@ -92,35 +112,58 @@ class AnthropicClient(LLMClient):
     ) -> Tuple[str, TokenUsage]:
         """Create a message using Claude and return text with token usage."""
         start_time = time.time()
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens or settings.llm_max_tokens,
-                temperature=temperature or settings.llm_temperature,
-                system=system,
-                messages=messages,
-            )
+        
+        # Retry configuration for transient errors
+        max_retries = 3
+        base_delay = 1.0  # seconds
+        
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens or settings.llm_max_tokens,
+                    temperature=temperature or settings.llm_temperature,
+                    system=system,
+                    messages=messages,
+                )
 
-            # Extract token usage
-            tokens = TokenUsage(
-                input_tokens=response.usage.input_tokens if response.usage else 0,
-                output_tokens=response.usage.output_tokens if response.usage else 0,
-                total_tokens=response.usage.input_tokens + response.usage.output_tokens if response.usage else 0
-            )
+                # Extract token usage
+                tokens = TokenUsage(
+                    input_tokens=response.usage.input_tokens if response.usage else 0,
+                    output_tokens=response.usage.output_tokens if response.usage else 0,
+                    total_tokens=response.usage.input_tokens + response.usage.output_tokens if response.usage else 0
+                )
 
-            # Extract text from response
-            text = ""
-            if response.content and len(response.content) > 0:
-                text = response.content[0].text
+                # Extract text from response
+                text = ""
+                if response.content and len(response.content) > 0:
+                    text = response.content[0].text
 
-            return text, tokens
+                return text, tokens
 
-        except anthropic.APIError as e:
-            logger.error(f"Anthropic API error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error calling Anthropic: {e}")
-            raise
+            except anthropic.OverloadedError as e:
+                if attempt < max_retries:
+                    # Exponential backoff: 1s, 2s, 4s
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Anthropic API overloaded (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Anthropic API overloaded after {max_retries + 1} attempts: {e}")
+                    raise
+            except anthropic.RateLimitError as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Anthropic API rate limit hit (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Anthropic API rate limit exceeded after {max_retries + 1} attempts: {e}")
+                    raise
+            except anthropic.APIError as e:
+                logger.error(f"Anthropic API error: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error calling Anthropic: {e}")
+                raise
 
     def create_message_with_tools(
         self,

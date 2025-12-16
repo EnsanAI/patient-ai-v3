@@ -59,6 +59,7 @@ class AgentDecision(str, Enum):
     RESPOND_IMPOSSIBLE = "respond_impossible"   # Task cannot be done
     EXECUTE_RECOVERY = "execute_recovery"       # Execute recovery_action automatically
     COLLECT_INFORMATION = "collect_information" # Exit agentic loop to collect information, passes through focused response generation
+    REQUEST_CONFIRMATION = "request_confirmation"  # Request user confirmation before critical action
 
 
 # =============================================================================
@@ -108,6 +109,144 @@ class Observation(BaseModel):
         return self.result.get("error") or self.result.get("error_message")
 
 
+class ConfirmationSummary(BaseModel):
+    """Summary of action awaiting confirmation."""
+    action: str  # "book_appointment", "cancel_appointment", "reschedule_appointment"
+    details: Dict[str, Any]  # doctor_name, date, time, procedure, etc.
+    tool_name: str  # The tool to call after confirmation
+    tool_input: Dict[str, Any]  # The parameters to pass
+
+
+class AgentResponseData(BaseModel):
+    """
+    Structured response data filled by agent during thinking.
+    
+    Each decision type fills the relevant fields, then a unified
+    response generator creates the final user-facing message.
+    """
+    
+    # ═══════════════════════════════════════════════════════════════
+    # COLLECT_INFORMATION - Need more info from user before proceeding
+    # ═══════════════════════════════════════════════════════════════
+    information_needed: Optional[str] = None  
+    # Examples: "visit_reason", "preferred_time", "doctor_preference"
+    # Human-readable: "What type of appointment do you need?"
+    information_question: Optional[str] = None
+    # The natural question to ask the user
+    
+    # ═══════════════════════════════════════════════════════════════
+    # CLARIFY - Need clarification on ambiguous input
+    # ═══════════════════════════════════════════════════════════════
+    clarification_needed: Optional[str] = None
+    # What's unclear: "time_ambiguous", "doctor_name_unclear"
+    clarification_question: Optional[str] = None
+    # The question to ask: "Did you mean 3pm or 3am?"
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RESPOND_WITH_OPTIONS - Present choices to user
+    # ═══════════════════════════════════════════════════════════════
+    options: Optional[List[Any]] = Field(default_factory=list)
+    # The actual options: ["10:00 AM", "2:00 PM", "4:30 PM"]
+    options_context: Optional[str] = None
+    # What they're choosing: "available_times", "doctors", "dates"
+    options_reason: Optional[str] = None
+    # Why options are needed: "Requested time not available"
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RESPOND_IMPOSSIBLE - Task cannot be completed
+    # ═══════════════════════════════════════════════════════════════
+    failure_reason: Optional[str] = None
+    # Why it failed: "Doctor not found", "No availability this week"
+    failure_suggestion: Optional[str] = None
+    # What user can do: "Try a different doctor", "Check next week"
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RESPOND_COMPLETE / RESPOND - Task completed successfully
+    # ═══════════════════════════════════════════════════════════════
+    completion_summary: Optional[str] = None
+    # What was done: "Booked appointment with Dr. Sarah on Dec 15 at 2pm"
+    completion_details: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    # Structured details: {doctor, date, time, confirmation_number}
+    
+    # ═══════════════════════════════════════════════════════════════
+    # REQUEST_CONFIRMATION - Need user to confirm before action
+    # ═══════════════════════════════════════════════════════════════
+    confirmation_action: Optional[str] = None
+    # What we're about to do: "book_appointment", "cancel_appointment"
+    confirmation_details: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    # Details to confirm: {doctor, date, time, procedure}
+    confirmation_question: Optional[str] = None
+    # The question: "Should I book this appointment?"
+    
+    # ═══════════════════════════════════════════════════════════════
+    # COMMON - Shared across all decision types
+    # ═══════════════════════════════════════════════════════════════
+    resolved_entities: Dict[str, Any] = Field(default_factory=dict)
+    # What we already know: {patient_id, doctor_name, date, time}
+    
+    # For internal tracking
+    raw_message: Optional[str] = None
+    # If agent wants to provide a pre-formed message (fallback)
+
+
+class PatientContext(BaseModel):
+    """Patient context for response generation."""
+    name: Optional[str] = None
+    is_registered: bool = False
+    patient_id: Optional[str] = None
+    
+    @classmethod
+    def from_session(cls, session_id: str, state_manager, resolved_entities: Dict = None) -> 'PatientContext':
+        """Build patient context from session state."""
+        # Try to get from patient state (registered patient)
+        try:
+            patient_state = state_manager.get_global_state(session_id)
+            if patient_state and patient_state.patient_profile and patient_state.patient_profile.patient_id:
+                return cls(
+                    name=patient_state.patient_profile.first_name,
+                    is_registered=True,
+                    patient_id=patient_state.patient_profile.patient_id
+                )
+        except:
+            pass
+        
+        # Not registered - check resolved_entities for collected name
+        if resolved_entities:
+            collected_name = (
+                resolved_entities.get("patient_name") or
+                resolved_entities.get("first_name") or
+                resolved_entities.get("name")
+            )
+            if collected_name:
+                return cls(
+                    name=collected_name,
+                    is_registered=False,
+                    patient_id=None
+                )
+        
+        # No name available
+        return cls(
+            name=None,
+            is_registered=False,
+            patient_id=None
+        )
+    
+    def get_display_name(self) -> str:
+        """Get name for display in prompts."""
+        if self.name:
+            return self.name
+        return "[Name not yet collected]"
+    
+    def get_prompt_context(self) -> str:
+        """Get context string for LLM prompts."""
+        if self.is_registered and self.name:
+            return f"Patient: {self.name} (registered, ID: {self.patient_id})"
+        elif self.name:
+            return f"Patient: {self.name} (not registered yet - name collected during conversation)"
+        else:
+            return "Patient: Not registered, name not yet collected - DO NOT invent a name!"
+
+
 class ThinkingResult(BaseModel):
     """
     Result of the agent's thinking phase.
@@ -128,12 +267,28 @@ class ThinkingResult(BaseModel):
     
     # For RESPOND variants
     response_text: Optional[str] = None
+    is_task_complete: bool = False
     
-    # For CLARIFY
-    clarification_question: Optional[str] = None
+    # NEW: Task tracking
+    current_task_id: Optional[str] = None
+    
+    # Blocking info
+    blocked_options: Optional[List[Any]] = None
+    blocked_reason: Optional[str] = None
+    
+    # Criteria updates (for backward compatibility)
+    criteria_updates: Dict[str, str] = Field(default_factory=dict)
+    
+    # NEW: Structured response data
+    response: AgentResponseData = Field(default_factory=AgentResponseData)
+    
+    # Keep legacy fields for backward compatibility during transition
+    clarification_question: Optional[str] = None  # Deprecated: use response.clarification_question
+    awaiting_info: Optional[str] = None  # Deprecated: use response.information_needed
+    resolved_entities: Optional[Dict[str, Any]] = None  # Deprecated: use response.resolved_entities
+    confirmation_summary: Optional[ConfirmationSummary] = None  # Deprecated: use response.confirmation_*
     
     # Internal flags
-    is_task_complete: bool = False
     detected_result_type: Optional[ToolResultType] = None
 
 

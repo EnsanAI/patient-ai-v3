@@ -99,7 +99,7 @@ class ReasoningDetails(BaseModel):
 
 class PipelineStep(BaseModel):
     """A single step in the orchestrator pipeline."""
-    step_number: int
+    step_number: float  # Changed to float to support decimal steps like 4.5
     step_name: str
     component: str  # "orchestrator", "translation", "reasoning", "agent", etc.
     inputs: Dict[str, Any] = Field(default_factory=dict)

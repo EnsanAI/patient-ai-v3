@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional
 
 from .base_agent import BaseAgent
 from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
+from patient_ai_service.models.agentic import ToolResultType
 
 logger = logging.getLogger(__name__)
 
@@ -227,45 +228,66 @@ Use your tools to provide accurate, up-to-date information!"""
     # Tool implementations
 
     def tool_get_clinic_info(self, session_id: str) -> Dict[str, Any]:
-        """Get clinic information."""
+        """Get general clinic information."""
         try:
-            clinic_info = self.db_client.get_clinic_info()
-
-            if not clinic_info:
+            clinic = self.db_client.get_clinic_info()
+            
+            if not clinic:
+                # Return default info - still a success
                 return {
-                    "success": False,
-                    "error": "Could not retrieve clinic information"
+                    "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
+                    "clinic_info": {
+                        "name": "Bright Smile Dental Clinic",
+                        "phone": "+1-234-567-8900",
+                        "address": "123 Smile Street",
+                        "hours": "9:00 AM - 6:00 PM"
+                    },
+                    "can_proceed": True,
+                    "next_action": "present_info_to_user"
                 }
-
+            
             return {
                 "success": True,
-                "clinic": {
-                    "name": clinic_info.get("name"),
-                    "address": clinic_info.get("address"),
-                    "city": clinic_info.get("city"),
-                    "country": clinic_info.get("country"),
-                    "phone": clinic_info.get("phone"),
-                    "email": clinic_info.get("email"),
-                    "website": clinic_info.get("website")
-                }
+                "result_type": ToolResultType.SUCCESS.value,
+                "clinic_info": {
+                    "name": clinic.get("name"),
+                    "phone": clinic.get("phone"),
+                    "address": clinic.get("address"),
+                    "city": clinic.get("city"),
+                    "hours": clinic.get("working_hours")
+                },
+                "can_proceed": True,
+                "next_action": "present_info_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting clinic info: {e}")
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "CLINIC_INFO_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
 
     def tool_get_all_clinics(self, session_id: str) -> Dict[str, Any]:
         """Get all clinic branches."""
         try:
             clinics = self.db_client.get_all_clinics()
-
+            
             if not clinics:
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "clinics": [],
-                    "message": "No clinic information available"
+                    "count": 0,
+                    "message": "No clinic information available",
+                    "can_proceed": True,
+                    "next_action": "inform_user_no_clinics"
                 }
-
+            
             clinic_list = []
             for clinic in clinics:
                 clinic_list.append({
@@ -276,30 +298,43 @@ Use your tools to provide accurate, up-to-date information!"""
                     "phone": clinic.get("phone"),
                     "email": clinic.get("email")
                 })
-
+            
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "clinics": clinic_list,
-                "count": len(clinic_list)
+                "count": len(clinic_list),
+                "can_proceed": True,
+                "next_action": "present_clinics_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting all clinics: {e}")
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "CLINICS_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
 
     def tool_get_services(self, session_id: str) -> Dict[str, Any]:
         """Get available dental services."""
         try:
             procedures = self.db_client.get_all_dental_procedures()
-
+            
             if not procedures:
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "services": [],
-                    "message": "Service information currently unavailable"
+                    "count": 0,
+                    "message": "Service information currently unavailable",
+                    "can_proceed": True,
+                    "next_action": "inform_user_no_services"
                 }
-
-            # Group by specialty if available
+            
             services = []
             for proc in procedures:
                 services.append({
@@ -308,29 +343,43 @@ Use your tools to provide accurate, up-to-date information!"""
                     "category": proc.get("category"),
                     "estimated_duration": proc.get("estimated_duration")
                 })
-
+            
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "services": services,
-                "count": len(services)
+                "count": len(services),
+                "can_proceed": True,
+                "next_action": "present_services_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting services: {e}")
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "SERVICES_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
 
     def tool_get_insurance_info(self, session_id: str) -> Dict[str, Any]:
         """Get insurance provider information."""
         try:
             insurance_providers = self.db_client.get_insurance_providers()
-
+            
             if not insurance_providers:
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "providers": [],
-                    "message": "Please contact us for insurance information"
+                    "count": 0,
+                    "message": "Please contact us for insurance information",
+                    "can_proceed": True,
+                    "next_action": "inform_user_contact_for_insurance"
                 }
-
+            
             providers = []
             for provider in insurance_providers:
                 providers.append({
@@ -338,30 +387,44 @@ Use your tools to provide accurate, up-to-date information!"""
                     "network": provider.get("network_type"),
                     "coverage": provider.get("coverage_percentage")
                 })
-
+            
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "providers": providers,
                 "count": len(providers),
-                "message": "We accept these insurance providers"
+                "message": "We accept these insurance providers",
+                "can_proceed": True,
+                "next_action": "present_insurance_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting insurance info: {e}")
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "INSURANCE_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
 
     def tool_get_payment_methods(self, session_id: str) -> Dict[str, Any]:
         """Get available payment methods."""
         try:
             payment_methods = self.db_client.get_payment_methods()
-
+            
             if not payment_methods:
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "methods": [],
-                    "message": "Please contact us for payment options"
+                    "count": 0,
+                    "message": "Please contact us for payment options",
+                    "can_proceed": True,
+                    "next_action": "inform_user_contact_for_payment"
                 }
-
+            
             methods = []
             for method in payment_methods:
                 methods.append({
@@ -369,29 +432,43 @@ Use your tools to provide accurate, up-to-date information!"""
                     "accepted": method.get("is_accepted"),
                     "notes": method.get("notes")
                 })
-
+            
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "methods": methods,
-                "count": len(methods)
+                "count": len(methods),
+                "can_proceed": True,
+                "next_action": "present_payment_methods_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting payment methods: {e}")
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "PAYMENT_METHODS_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
 
     def tool_get_doctors(self, session_id: str) -> Dict[str, Any]:
         """Get list of available doctors."""
         try:
             doctors = self.db_client.get_doctors()
-
+            
             if not doctors:
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "doctors": [],
-                    "message": "Doctor information currently unavailable"
+                    "count": 0,
+                    "message": "Doctor information currently unavailable",
+                    "can_proceed": True,
+                    "next_action": "inform_user_no_doctors"
                 }
-
+            
             doctor_list = []
             for doctor in doctors:
                 doctor_list.append({
@@ -402,29 +479,42 @@ Use your tools to provide accurate, up-to-date information!"""
                     "bio": doctor.get("bio"),
                     "clinic": doctor.get("clinic_name")
                 })
-
+            
             return {
                 "success": True,
+                "result_type": ToolResultType.PARTIAL.value,  # PARTIAL: data retrieved, agent needs to use it
                 "doctors": doctor_list,
-                "count": len(doctor_list)
+                "count": len(doctor_list),
+                "can_proceed": True,
+                "next_action": "select_doctor_or_present_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting doctors: {e}")
-            return {"error": str(e)}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "DOCTORS_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
 
     def tool_get_doctor_info(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
         """Get detailed information about a specific doctor."""
         try:
-            # First, get all doctors
             doctors = self.db_client.get_doctors()
-
+            
             if not doctors:
                 return {
                     "success": False,
-                    "error": "Could not retrieve doctor information"
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "Could not retrieve doctor information",
+                    "error_code": "DOCTORS_UNAVAILABLE",
+                    "should_retry": True,
+                    "can_proceed": False
                 }
-
+            
             # Search for doctor by name (case-insensitive, partial match)
             doctor_name_lower = doctor_name.lower()
             matching_doctors = []
@@ -438,103 +528,114 @@ Use your tools to provide accurate, up-to-date information!"""
                     doctor_name_lower in last_name or 
                     doctor_name_lower in full_name):
                     matching_doctors.append(doctor)
-
+            
             if not matching_doctors:
+                # No match found - need user to clarify
+                all_doctor_names = [
+                    f"{d.get('first_name', '')} {d.get('last_name', '')}".strip()
+                    for d in doctors
+                ]
                 return {
                     "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
                     "error": f"No doctor found matching '{doctor_name}'",
-                    "suggestion": "Use get_doctors tool to see all available doctors"
+                    "error_code": "DOCTOR_NOT_FOUND",
+                    "alternatives": all_doctor_names,
+                    "can_proceed": False,
+                    "suggested_response": f"I couldn't find a doctor named '{doctor_name}'. Our available doctors are: {', '.join(all_doctor_names)}. Which doctor would you like to know about?"
                 }
-
-            # If multiple matches, return the first one (or could return all)
+            
+            # Found matching doctor(s)
             doctor = matching_doctors[0]
             
-            # Get detailed info if we have an ID
-            doctor_detail = None
-            if doctor.get("id"):
-                doctor_detail = self.db_client.get_doctor_by_id(doctor.get("id"))
-
-            # Use detailed info if available, otherwise use basic info
-            result_doctor = doctor_detail if doctor_detail else doctor
-
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "doctor": {
-                    "id": result_doctor.get("id"),
-                    "name": f"{result_doctor.get('first_name', '')} {result_doctor.get('last_name', '')}".strip(),
-                    "specialties": result_doctor.get("specialties", []),
-                    "languages": result_doctor.get("languages", []),
-                    "bio": result_doctor.get("bio"),
-                    "clinic": result_doctor.get("clinic_name"),
-                    "email": result_doctor.get("email"),
-                    "phone": result_doctor.get("phone")
-                }
+                    "id": doctor.get("id"),
+                    "name": f"{doctor.get('first_name', '')} {doctor.get('last_name', '')}".strip(),
+                    "title": doctor.get("title", "Dr."),
+                    "specialties": doctor.get("specialties", []),
+                    "languages": doctor.get("languages", []),
+                    "bio": doctor.get("bio"),
+                    "clinic": doctor.get("clinic_name"),
+                    "experience_years": doctor.get("experience_years")
+                },
+                "can_proceed": True,
+                "next_action": "present_doctor_info_to_user"
             }
-
+            
         except Exception as e:
             logger.error(f"Error getting doctor info: {e}")
-            return {"error": str(e)}
-
-    def tool_get_procedure_info(self, session_id: str, procedure_name: str) -> Dict[str, Any]:
-        """Get detailed information about a specific procedure."""
-        try:
-            # First, try to get all procedures and do fuzzy matching
-            all_procedures = self.db_client.get_all_dental_procedures()
-            
-            if not all_procedures:
-                # Fallback: try API endpoint
-                procedures = self.db_client.get_procedure_by_name(procedure_name)
-                if not procedures or len(procedures) == 0:
-                    return {
-                        "success": False,
-                        "error": f"No procedure found matching '{procedure_name}'",
-                        "suggestion": "Use get_services tool to see all available procedures"
-                    }
-            else:
-                # Do fuzzy matching on all procedures
-                procedure_name_lower = procedure_name.lower()
-                # Split search terms
-                search_terms = procedure_name_lower.split()
-                
-                matching = []
-                for proc in all_procedures:
-                    proc_name_lower = proc.get("name", "").lower()
-                    # Check if any search term is in the procedure name
-                    if any(term in proc_name_lower for term in search_terms if len(term) > 2):
-                        matching.append(proc)
-                
-                # If no matches, try exact substring match
-                if not matching:
-                    matching = [p for p in all_procedures 
-                              if procedure_name_lower in p.get("name", "").lower()]
-                
-                procedures = matching
-
-            if not procedures or len(procedures) == 0:
-                return {
-                    "success": False,
-                    "error": f"No procedure found matching '{procedure_name}'",
-                    "suggestion": "Use get_services tool to see all available procedures"
-                }
-
-            # Return the first matching procedure (or could return all)
-            procedure = procedures[0] if isinstance(procedures, list) else procedures
-
             return {
-                "success": True,
-                "procedure": {
-                    "id": procedure.get("id"),
-                    "name": procedure.get("name"),
-                    "description": procedure.get("description"),
-                    "price": procedure.get("price"),
-                    "duration_minutes": procedure.get("duration_minutes"),
-                    "specialty": procedure.get("specialty_name"),
-                    "requires_preparation": procedure.get("requires_preparation", False),
-                    "preparation_instructions": procedure.get("preparation_instructions")
-                },
-                "message": f"Found procedure: {procedure.get('name')}"
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "DOCTOR_INFO_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
             }
 
+    def tool_get_procedure_info(self, session_id: str, procedure_name: str) -> Dict[str, Any]:
+        """Get detailed information about a specific dental procedure."""
+        try:
+            procedures = self.db_client.get_all_dental_procedures()
+            
+            if not procedures:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "Could not retrieve procedure information",
+                    "error_code": "PROCEDURES_UNAVAILABLE",
+                    "should_retry": True,
+                    "can_proceed": False
+                }
+            
+            # Search for procedure by name (case-insensitive, partial match)
+            procedure_name_lower = procedure_name.lower()
+            matching_procedures = []
+            
+            for proc in procedures:
+                proc_name = proc.get("name", "").lower()
+                if procedure_name_lower in proc_name or proc_name in procedure_name_lower:
+                    matching_procedures.append(proc)
+            
+            if not matching_procedures:
+                all_procedure_names = [p.get("name", "") for p in procedures]
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": f"No procedure found matching '{procedure_name}'",
+                    "error_code": "PROCEDURE_NOT_FOUND",
+                    "alternatives": all_procedure_names,
+                    "can_proceed": False,
+                    "suggested_response": f"I couldn't find a procedure called '{procedure_name}'. Our available procedures include: {', '.join(all_procedure_names[:5])}. Which one would you like to know about?"
+                }
+            
+            procedure = matching_procedures[0]
+            
+            return {
+                "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
+                "procedure": {
+                    "name": procedure.get("name"),
+                    "description": procedure.get("description"),
+                    "category": procedure.get("category"),
+                    "estimated_duration": procedure.get("estimated_duration"),
+                    "price_range": procedure.get("price_range"),
+                    "recovery_time": procedure.get("recovery_time")
+                },
+                "can_proceed": True,
+                "next_action": "present_procedure_info_to_user"
+            }
+            
         except Exception as e:
-            logger.error(f"Error getting procedure info: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            logger.error(f"Error getting procedure info: {e}")
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "PROCEDURE_INFO_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }

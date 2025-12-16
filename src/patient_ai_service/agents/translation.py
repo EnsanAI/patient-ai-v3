@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional, Tuple
 from .base_agent import BaseAgent
 from patient_ai_service.models.enums import Language
 from patient_ai_service.core.config import settings
+from patient_ai_service.core.script_detector import fast_detect_language
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,26 @@ Language code:"""
         from patient_ai_service.core.observability import get_observability_logger
         from patient_ai_service.models.observability import TokenUsage
 
+        # ═══════════════════════════════════════════════════════════════════
+        # FAST PATH: Script detection for obvious cases
+        # ═══════════════════════════════════════════════════════════════════
+        lang, dialect, skip_llm = fast_detect_language(text)
+        
+        if skip_llm:
+            if lang == "en":
+                # English - no translation needed
+                logger.info(f"[FAST PATH] Script detection: English, skipping LLM")
+                return text, "en", dialect, True
+            elif lang == "ar":
+                # Arabic - need translation but skip dialect detection
+                logger.info(f"[FAST PATH] Script detection: Arabic (ae), translating without dialect LLM")
+                # Still need to translate Arabic to English, but with known dialect
+                english_text = await self._translate_arabic_to_english(text, session_id)
+                return english_text, "ar", "ae", True
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # NORMAL PATH: LLM-based detection and translation
+        # ═══════════════════════════════════════════════════════════════════
         try:
             prompt = f"""Analyze this text and perform detection + translation in ONE response.
 
@@ -232,6 +253,72 @@ Response:"""
         except Exception as e:
             logger.error(f"Error in detect_and_translate: {e}")
             return text, "en", None, False  # Fallback: return original, mark as failed
+
+    async def _translate_arabic_to_english(self, text: str, session_id: Optional[str] = None) -> str:
+        """
+        Translate Arabic text to English without dialect detection.
+        Used when script detection already identified Arabic.
+        
+        Args:
+            text: Arabic text to translate
+            session_id: Optional session ID for observability
+            
+        Returns:
+            English translation
+        """
+        import time
+        from patient_ai_service.core.observability import get_observability_logger
+        from patient_ai_service.models.observability import TokenUsage
+        
+        prompt = f"""Translate this Arabic text to English.
+Preserve meaning and any dental/medical terminology.
+
+Arabic text: "{text}"
+
+English translation:"""
+
+        try:
+            llm_start_time = time.time()
+            
+            if hasattr(self.llm_client, 'create_message_with_usage'):
+                response, tokens = self.llm_client.create_message_with_usage(
+                    system="You are a professional Arabic to English translator for a dental clinic. Translate accurately and naturally.",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=500
+                )
+            else:
+                response = self.llm_client.create_message(
+                    system="You are a professional Arabic to English translator for a dental clinic. Translate accurately and naturally.",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=500
+                )
+                tokens = TokenUsage()
+            
+            llm_duration_seconds = time.time() - llm_start_time
+            
+            # Record LLM call for observability
+            if session_id and settings.enable_observability:
+                obs_logger = get_observability_logger(session_id)
+                if obs_logger:
+                    obs_logger.record_llm_call(
+                        component="translation.arabic_to_english_fast",
+                        provider=settings.llm_provider.value,
+                        model=settings.get_llm_model(),
+                        tokens=tokens,
+                        duration_seconds=llm_duration_seconds,
+                        system_prompt_length=100,
+                        messages_count=1,
+                        temperature=0.3,
+                        max_tokens=500
+                    )
+            
+            return response.strip()
+            
+        except Exception as e:
+            logger.error(f"Error in Arabic translation: {e}")
+            return text  # Return original if translation fails
 
     async def detect_language_and_dialect(self, text: str) -> Tuple[str, Optional[str]]:
         """

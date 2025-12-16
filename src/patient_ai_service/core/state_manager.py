@@ -21,6 +21,10 @@ from patient_ai_service.models.state import (
     PatientProfile,
 )
 from patient_ai_service.models.agentic import CriterionState
+from patient_ai_service.models.patient_entities import PatientEntities, EntitySource
+from patient_ai_service.models.derived_entities import DerivedEntitiesManager
+from patient_ai_service.models.entity_state import EntityState
+from patient_ai_service.models.agent_plan import AgentPlan, PlanStatus
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -652,6 +656,26 @@ class StateManager:
         """
         state = self.get_agentic_state(session_id)
 
+        #region agent log
+        try:
+            import time as _time, json as _json
+            with open("/Users/omar/Downloads/The Future/carebot_dev/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({
+                    "sessionId": session_id,
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "state_manager.set_continuation_context",
+                    "message": "set_continuation_context",
+                    "data": {
+                        "awaiting": awaiting,
+                        "options_count": len(options or []),
+                    },
+                    "timestamp": int(_time.time() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        #endregion
+
         state.continuation_context = ContinuationContext(
             awaiting=awaiting,
             presented_options=options or [],
@@ -667,6 +691,15 @@ class StateManager:
 
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
+
+        # Sync awaiting to reasoning_state so SituationAssessor can read it next turn
+        reasoning_state = self.get_reasoning_state(session_id)
+        reasoning_state.update_awaiting(awaiting, options or [])
+        # Also sync active_agent from global_state
+        global_state = self.get_global_state(session_id)
+        if global_state.active_agent:
+            reasoning_state.active_agent = global_state.active_agent
+        self.save_reasoning_state(session_id, reasoning_state)
 
         logger.info(f"Set continuation context: awaiting={awaiting}, options={len(options or [])}")
 
@@ -700,6 +733,11 @@ class StateManager:
         state.pending_user_options = []
         state.last_updated_at = datetime.utcnow()
         self._save_state(session_id, "agentic_state", state)
+
+        # Also clear in reasoning_state
+        reasoning_state = self.get_reasoning_state(session_id)
+        reasoning_state.clear_awaiting()
+        self.save_reasoning_state(session_id, reasoning_state)
 
     # Completion Checking
 
@@ -850,6 +888,255 @@ class StateManager:
 
         return context
 
+    # =========================================================================
+    # ENTITY STATE MANAGEMENT (NEW)
+    # =========================================================================
+    
+    def get_entity_state(self, session_id: str) -> EntityState:
+        """
+        Get entity state for a session.
+        
+        Creates new state if not exists.
+        """
+        key = self._make_key(session_id, "entity_state")
+        data = self.backend.get(key)
+        
+        if data:
+            try:
+                state_dict = json.loads(data)
+                return EntityState(**state_dict)
+            except Exception as e:
+                logger.error(f"Error deserializing entity state: {e}")
+        
+        # Create new state
+        logger.info(f"Creating new entity state for session: {session_id}")
+        return EntityState.create(session_id)
+    
+    def save_entity_state(self, session_id: str, entity_state: EntityState):
+        """Save entity state."""
+        self._save_state(session_id, "entity_state", entity_state)
+    
+    def update_patient_preference(
+        self,
+        session_id: str,
+        field_path: str,
+        value: Any,
+        source: EntitySource = EntitySource.USER_STATED,
+        confidence: float = 1.0
+    ) -> Dict[str, Any]:
+        """
+        Update a patient preference and handle invalidation.
+        
+        Convenience method that handles load/save.
+        
+        Returns:
+            Dict with changed, change, invalidated info
+        """
+        entity_state = self.get_entity_state(session_id)
+        result = entity_state.update_patient_preference(field_path, value, source, confidence)
+        self.save_entity_state(session_id, entity_state)
+        
+        if result["changed"]:
+            logger.info("📦 [EntityState] ════════════════════════════════════════════════════════")
+            logger.info(f"📦 [EntityState] ✅ Preference updated: {field_path} = {value}")
+            if result.get("invalidated"):
+                logger.info(f"📦 [EntityState]   🔄 Invalidated {len(result['invalidated'])} derived entities: {result['invalidated']}")
+        
+        return result
+    
+    def store_tool_result(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_params: Dict[str, Any],
+        tool_result: Dict[str, Any]
+    ) -> List[str]:
+        """
+        Process a tool result and store derived entities.
+        
+        Returns:
+            List of derived entity keys that were stored
+        """
+        entity_state = self.get_entity_state(session_id)
+        stored = entity_state.store_tool_result(tool_name, tool_params, tool_result)
+        self.save_entity_state(session_id, entity_state)
+        
+        stored_keys = [e.key for e in stored]
+        if stored_keys:
+            logger.info("📦 [EntityState] ════════════════════════════════════════════════════════")
+            logger.info(f"📦 [EntityState] ✅ Stored {len(stored_keys)} derived entities from {tool_name}:")
+            for key in stored_keys:
+                logger.info(f"📦 [EntityState]   • {key}")
+        
+        return stored_keys
+    
+    def get_valid_derived_entity(
+        self,
+        session_id: str,
+        key: str
+    ) -> Optional[Any]:
+        """
+        Get a valid derived entity value.
+        
+        Returns None if entity doesn't exist, is invalid, or is stale.
+        """
+        entity_state = self.get_entity_state(session_id)
+        entity = entity_state.derived.get_valid_entity(key, entity_state.patient)
+        
+        if entity:
+            return entity.value
+        return None
+    
+    def get_booking_readiness(self, session_id: str) -> Dict[str, Any]:
+        """Get booking readiness status."""
+        entity_state = self.get_entity_state(session_id)
+        return entity_state.get_booking_readiness()
+    
+    def get_entity_display(self, session_id: str) -> str:
+        """Get entity state display for agent prompt."""
+        entity_state = self.get_entity_state(session_id)
+        return entity_state.get_agent_context_display()
+    
+    def clear_derived_entities(self, session_id: str):
+        """Clear all derived entities for a session."""
+        entity_state = self.get_entity_state(session_id)
+        entity_state.derived.clear()
+        self.save_entity_state(session_id, entity_state)
+        logger.info(f"Cleared derived entities for session: {session_id}")
+
+    # =========================================================================
+    # AGENT PLAN PERSISTENCE (NEW - Phase 2)
+    # =========================================================================
+    
+    def get_agent_plan(
+        self,
+        session_id: str,
+        agent_name: str
+    ) -> Optional[AgentPlan]:
+        """
+        Get the current plan for an agent.
+        
+        Returns None if no plan exists or plan is terminal (complete/failed/abandoned).
+        
+        Args:
+            session_id: Session identifier
+            agent_name: Name of the agent (e.g., "appointment_manager", "registration")
+            
+        Returns:
+            AgentPlan if exists and not terminal, None otherwise
+        """
+        plan_key = self._make_key(session_id, f"plan:{agent_name}")
+        data = self.backend.get(plan_key)
+        
+        if not data:
+            return None
+        
+        try:
+            plan_data = json.loads(data)
+            plan = AgentPlan(**plan_data)
+            
+            # Don't return terminal plans
+            if plan.is_terminal():
+                logger.debug(f"📋 [StateManager] Plan for {agent_name} is terminal ({plan.status.value}), returning None")
+                return None
+            
+            logger.debug(f"📋 [StateManager] Retrieved plan for {agent_name}: {plan.get_summary()}")
+            return plan
+            
+        except Exception as e:
+            logger.error(f"📋 [StateManager] Error deserializing plan for {agent_name}: {e}")
+            return None
+    
+    def store_agent_plan(
+        self,
+        session_id: str,
+        plan: AgentPlan
+    ):
+        """
+        Store an agent's plan.
+        
+        Args:
+            session_id: Session identifier
+            plan: AgentPlan to store
+        """
+        if not isinstance(plan, AgentPlan):
+            logger.error(f"📋 [StateManager] Invalid plan type: {type(plan)}")
+            return
+        
+        plan_key = self._make_key(session_id, f"plan:{plan.agent_name}")
+        data = json.dumps(plan.model_dump(), default=str)
+        self.backend.set(plan_key, data, ttl=self.ttl)
+        
+        logger.info(f"📋 [StateManager] Stored plan for {plan.agent_name}: {plan.get_summary()}")
+    
+    def get_any_active_plan(
+        self,
+        session_id: str
+    ) -> Optional[AgentPlan]:
+        """
+        Get any active (non-terminal) plan for the session.
+        
+        Checks all known agents and returns the first active plan found.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            First active AgentPlan found, or None if no active plans
+        """
+        known_agents = [
+            "appointment_manager",
+            "registration",
+            "general_assistant",
+            "emergency_response",
+            "medical_inquiry"
+        ]
+        
+        for agent_name in known_agents:
+            plan = self.get_agent_plan(session_id, agent_name)
+            if plan and not plan.is_terminal():
+                logger.debug(f"📋 [StateManager] Found active plan for {agent_name}")
+                return plan
+        
+        logger.debug(f"📋 [StateManager] No active plans found for session: {session_id}")
+        return None
+    
+    def abandon_all_plans(
+        self,
+        session_id: str,
+        reason: str = "topic_change"
+    ):
+        """
+        Abandon all active plans for a session.
+        
+        Marks all non-terminal plans as abandoned with the given reason.
+        
+        Args:
+            session_id: Session identifier
+            reason: Reason for abandoning (e.g., "topic_change", "user_request")
+        """
+        known_agents = [
+            "appointment_manager",
+            "registration",
+            "general_assistant",
+            "emergency_response",
+            "medical_inquiry"
+        ]
+
+        abandoned_count = 0
+        for agent_name in known_agents:
+            plan = self.get_agent_plan(session_id, agent_name)
+            if plan and not plan.is_terminal():
+                plan.mark_abandoned(reason)
+                self.store_agent_plan(session_id, plan)
+                logger.info(f"📋 [StateManager] Abandoned {agent_name} plan: {reason}")
+                abandoned_count += 1
+        
+        if abandoned_count > 0:
+            logger.info(f"📋 [StateManager] Abandoned {abandoned_count} plan(s) for session {session_id}")
+        else:
+            logger.debug(f"📋 [StateManager] No active plans to abandon for session {session_id}")
+
     def export_session(self, session_id: str) -> Dict[str, Any]:
         """Export all state for a session."""
         return {
@@ -860,7 +1147,57 @@ class StateManager:
             "registration_state": self.get_registration_state(session_id).model_dump(),
             "translation_state": self.get_translation_state(session_id).model_dump(),
             "agentic_state": self.get_agentic_state(session_id).model_dump(),
+            "entity_state": self.get_entity_state(session_id).model_dump(),  # NEW
         }
+
+    def save_task_plan(self, session_id: str, plan: 'TaskPlan'):
+        """Save task plan for continuation."""
+        from patient_ai_service.models.task_plan import TaskPlan
+        import json
+        
+        logger.info("📋 [TaskPlan] ════════════════════════════════════════════════════════")
+        logger.info(f"📋 [TaskPlan] 💾 Saving task plan for session: {session_id}")
+        logger.info(f"📋 [TaskPlan]   Objective: {plan.objective}")
+        logger.info(f"📋 [TaskPlan]   Tasks: {len(plan.tasks)}")
+        for i, task in enumerate(plan.tasks, 1):
+            logger.info(f"📋 [TaskPlan]   {i}. {task.action} ({task.status.value})")
+        
+        key = self._make_key(session_id, "task_plan")
+        data = json.dumps(plan.model_dump(), default=str)
+        self.backend.set(key, data, ttl=self.ttl)
+        logger.info(f"📋 [TaskPlan] ✅ Task plan saved")
+
+    def get_task_plan(self, session_id: str) -> Optional['TaskPlan']:
+        """Get saved task plan for continuation."""
+        from patient_ai_service.models.task_plan import TaskPlan
+        import json
+        
+        key = self._make_key(session_id, "task_plan")
+        data = self.backend.get(key)
+        
+        if data:
+            try:
+                plan_dict = json.loads(data)
+                plan = TaskPlan(**plan_dict)
+                logger.info("📋 [TaskPlan] ════════════════════════════════════════════════════════")
+                logger.info(f"📋 [TaskPlan] 📥 Loaded task plan for session: {session_id}")
+                logger.info(f"📋 [TaskPlan]   Objective: {plan.objective}")
+                logger.info(f"📋 [TaskPlan]   Tasks: {len(plan.tasks)}")
+                blocked = [t for t in plan.tasks if t.status.value == "blocked"]
+                if blocked:
+                    logger.info(f"📋 [TaskPlan]   ⚠️  Blocked tasks: {len(blocked)}")
+                return plan
+            except Exception as e:
+                logger.warning(f"📋 [TaskPlan] ❌ Error loading task plan: {e}")
+        
+        logger.debug(f"📋 [TaskPlan] No task plan found for session: {session_id}")
+        return None
+
+    def clear_task_plan(self, session_id: str):
+        """Clear saved task plan."""
+        logger.info(f"📋 [TaskPlan] 🗑️  Clearing task plan for session: {session_id}")
+        key = self._make_key(session_id, "task_plan")
+        self.backend.delete(key)
 
     def clear_session(self, session_id: str):
         """Clear all state for a session."""
@@ -872,6 +1209,7 @@ class StateManager:
             "registration_state",
             "translation_state",
             "agentic_state",
+            "entity_state",  # NEW
         ]
 
         for state_type in state_types:
@@ -879,6 +1217,30 @@ class StateManager:
             self.backend.delete(key)
 
         logger.info(f"Cleared all state for session: {session_id}")
+
+    def get_reasoning_state(self, session_id: str) -> 'ReasoningState':
+        """Get reasoning state for session."""
+        from patient_ai_service.models.reasoning_state import ReasoningState
+
+        key = f"session:{session_id}:reasoning_state"
+        data = self.backend.get(key)
+
+        if data:
+            try:
+                state_dict = json.loads(data)
+                return ReasoningState(**state_dict)
+            except Exception as e:
+                logger.warning(f"Error loading reasoning state: {e}")
+
+        return ReasoningState(session_id=session_id)
+
+    def save_reasoning_state(self, session_id: str, state: 'ReasoningState'):
+        """Save reasoning state."""
+        from patient_ai_service.models.reasoning_state import ReasoningState
+
+        key = f"session:{session_id}:reasoning_state"
+        data = json.dumps(state.model_dump(), default=str)
+        self.backend.set(key, data, ttl=self.ttl)
 
 
 # Global state manager instance

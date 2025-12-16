@@ -63,8 +63,9 @@ class TaskContext(BaseModel):
     Structured context for agent execution.
     """
     user_intent: str = ""
+    objective: str = ""  # NEW: High-level goal for agent
     entities: Dict[str, Any] = Field(default_factory=dict)
-    success_criteria: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)  # Keep but will be outcome-based
     constraints: List[str] = Field(default_factory=list)
     prior_context: Optional[str] = None
     
@@ -79,7 +80,7 @@ class ResponseGuidance(BaseModel):
     tone: str = "helpful"  # "helpful", "empathetic", "urgent", "professional"
     task_context: TaskContext = Field(default_factory=TaskContext)
     minimal_context: Dict[str, Any] = Field(default_factory=dict)
-    plan: str = ""  # Short step-by-step plan/command for the agent to follow (deprecated)
+    # plan: str = ""  # REMOVED - agents generate their own task plans
 
 
 class ReasoningOutput(BaseModel):
@@ -564,30 +565,31 @@ class ReasoningEngine:
             logger.info("=" * 80)
             logger.info("REASONING OUTPUT (Full Structure):")
             logger.info("=" * 80)
-            logger.info(f"UNDERSTANDING:")
-            logger.info(f"  - what_user_means: {output.understanding.what_user_means}")
-            logger.info(f"  - is_continuation: {output.understanding.is_continuation}")
-            logger.info(f"  - sentiment: {output.understanding.sentiment}")
-            logger.info(f"  - is_conversation_restart: {output.understanding.is_conversation_restart}")
-            logger.info(f"ROUTING:")
-            logger.info(f"  - agent: {output.routing.agent}")
-            logger.info(f"  - action: {output.routing.action}")
-            logger.info(f"  - urgency: {output.routing.urgency}")
-            logger.info(f"MEMORY_UPDATES:")
-            logger.info(f"  - new_facts: {json.dumps(output.memory_updates.new_facts, indent=4) if output.memory_updates.new_facts else '(empty)'}")
-            logger.info(f"  - system_action: '{output.memory_updates.system_action}' {'(EMPTY - should be filled!)' if not output.memory_updates.system_action else ''}")
-            logger.info(f"  - awaiting: '{output.memory_updates.awaiting}' {'(EMPTY - OK if nothing needed)' if not output.memory_updates.awaiting else ''}")
-            logger.info(f"RESPONSE_GUIDANCE:")
-            logger.info(f"  - tone: {output.response_guidance.tone}")
-            logger.info(f"  - minimal_context: {json.dumps(output.response_guidance.minimal_context, indent=4)}")
-            logger.info(f"  - task_context.user_intent: {output.response_guidance.task_context.user_intent}")
-            logger.info(f"  - task_context.entities: {json.dumps(output.response_guidance.task_context.entities, indent=4)}")
-            logger.info(f"  - task_context.success_criteria: {output.response_guidance.task_context.success_criteria}")
-            logger.info(f"  - task_context.is_continuation: {output.response_guidance.task_context.is_continuation}")
-            logger.info(f"  - plan: {output.response_guidance.plan}")
-            logger.info(f"REASONING_CHAIN:")
-            for i, step in enumerate(output.reasoning_chain, 1):
-                logger.info(f"  {i}. {step}")
+            # Commented out individual field logging - using raw output instead
+            # logger.info(f"UNDERSTANDING:")
+            # logger.info(f"  - what_user_means: {output.understanding.what_user_means}")
+            # logger.info(f"  - is_continuation: {output.understanding.is_continuation}")
+            # logger.info(f"  - sentiment: {output.understanding.sentiment}")
+            # logger.info(f"  - is_conversation_restart: {output.understanding.is_conversation_restart}")
+            # logger.info(f"ROUTING:")
+            # logger.info(f"  - agent: {output.routing.agent}")
+            # logger.info(f"  - action: {output.routing.action}")
+            # logger.info(f"  - urgency: {output.routing.urgency}")
+            # logger.info(f"MEMORY_UPDATES:")
+            # logger.info(f"  - new_facts: {json.dumps(output.memory_updates.new_facts, indent=4) if output.memory_updates.new_facts else '(empty)'}")
+            # logger.info(f"  - system_action: '{output.memory_updates.system_action}' {'(EMPTY - should be filled!)' if not output.memory_updates.system_action else ''}")
+            # logger.info(f"  - awaiting: '{output.memory_updates.awaiting}' {'(EMPTY - OK if nothing needed)' if not output.memory_updates.awaiting else ''}")
+            # logger.info(f"RESPONSE_GUIDANCE:")
+            # logger.info(f"  - tone: {output.response_guidance.tone}")
+            # logger.info(f"  - minimal_context: {json.dumps(output.response_guidance.minimal_context, indent=4)}")
+            # logger.info(f"  - task_context.user_intent: {output.response_guidance.task_context.user_intent}")
+            # logger.info(f"  - task_context.objective: {output.response_guidance.task_context.objective}")
+            # logger.info(f"  - task_context.entities: {json.dumps(output.response_guidance.task_context.entities, indent=4)}")
+            # logger.info(f"  - task_context.success_criteria: {output.response_guidance.task_context.success_criteria}")
+            # logger.info(f"  - task_context.is_continuation: {output.response_guidance.task_context.is_continuation}")
+            # logger.info(f"REASONING_CHAIN:")
+            # for i, step in enumerate(output.reasoning_chain, 1):
+            #     logger.info(f"  {i}. {step}")
             logger.info("=" * 80)
 
             return output
@@ -709,7 +711,7 @@ IMPORTANT PRINCIPLES:
 - The goal is to HELP, not to categorize
 
 VALID JSON EXAMPLE:
-{"understanding":{"what_user_means":"User wants to cancel appointments","is_continuation":false,"continuation_type":null,"selected_option":null,"sentiment":"neutral","is_conversation_restart":false},"routing":{"agent":"appointment_manager","action":"cancel_appointments","urgency":"routine"},"memory_updates":{"new_facts":{},"system_action":"","awaiting":""},"response_guidance":{"tone":"helpful","task_context":{"user_intent":"cancel appointments","entities":{},"success_criteria":[],"constraints":[],"prior_context":null,"is_continuation":false,"continuation_type":null,"selected_option":null,"continuation_context":{}},"minimal_context":{"user_wants":"cancel appointments","action":"cancel"},"plan":"1. Get appointments, 2. Cancel them"},"reasoning_chain":["User wants to cancel","Route to appointment_manager"]}
+{"understanding":{"what_user_means":"User wants to cancel appointments","is_continuation":false,"continuation_type":null,"selected_option":null,"sentiment":"neutral","is_conversation_restart":false},"routing":{"agent":"appointment_manager","action":"cancel_appointments","urgency":"routine"},"memory_updates":{"new_facts":{},"system_action":"","awaiting":""},"response_guidance":{"tone":"helpful","task_context":{"user_intent":"cancel appointments","objective":"Cancel the user's appointments","entities":{},"success_criteria":[],"constraints":[],"prior_context":null,"is_continuation":false,"continuation_type":null,"selected_option":null,"continuation_context":{}},"minimal_context":{"what_user_means":"User wants to cancel appointments","action":"cancel"}},"reasoning_chain":["User wants to cancel","Route to appointment_manager"]}
 
 Output ONLY the JSON object. No markdown, no explanation, just JSON."""
 
@@ -796,42 +798,44 @@ YOUR TASK
 
 Analyze and respond with ONLY a valid JSON object.
 
-CRITICAL RULES:
-- Output ONLY the JSON object, no other text
-- Do NOT include comments (no // or # characters)
-- Use lowercase true/false for booleans (not True/False)
-- Use null for missing values (not None or "null")
+CRITICAL: Do NOT generate step-by-step plans. The agent will decide HOW to execute.
+You only determine WHAT the user wants and WHERE to route.
 
-JSON STRUCTURE (IMPORTANT: No comments allowed in JSON output):
+JSON STRUCTURE:
 
 {{
     "understanding": {{
         "what_user_means": "Plain English explanation of what user actually wants",
         "selected_option": "latest value user selected or null",
-        "sentiment": "iput user mood or feeling",
+        "sentiment": "user mood or feeling"
     }},
     "routing": {{
         "agent": "appointment_manager/registration/general_assistant/medical_inquiry/emergency_response",
+        "action": "process_request/book_appointment/register_patient/answer_inquiry/handle_emergency",
+        "urgency": "routine/urgent/emergency"
     }},
     "memory_updates": {{
         "new_facts": {{}},
-        "awaiting": "What the system is waiting for from the user. Examples: 'date_selection', 'time_confirmation', 'doctor_choice', 'user_info', 'confirmation', 'appointment_id'. Use empty string '' if not waiting for anything. REQUIRED - always provide this (even if empty)."
+        "awaiting": "What system is waiting for (e.g., 'time_selection', 'confirmation') or empty string"
     }},
     "response_guidance": {{
         "tone": "decide tone for response generation based on user tone",
         "task_context": {{
-            "user_intent": "What user wants (incorporate continuation context if resuming)",
-            "success_criteria": [],
-            "constraints": [],
-            "prior_context": "Relevant context including previous options",
-            "selected_option": "The option user selected",
+            "user_intent": "What user wants in plain English",
+            "objective": "REQUIRED - ALWAYS FILL THIS: Specific goal for agent. Examples: 'Book teeth cleaning with Dr. Sarah on Dec 15 at 2pm', 'Cancel appointment #123', 'Register new patient for future appointments', 'List available appointment times for Dr. Ahmed tomorrow'",
+            "entities": {{
+                "doctor_preference": "extracted doctor name or null",
+                "date_preference": "extracted date or null",
+                "time_preference": "extracted time or null",
+                "procedure_preference": "extracted procedure or null"
+            }},
+            "constraints": ["any constraints like 'must be afternoon'"],
+            "prior_context": "relevant prior context"
         }},
         "minimal_context": {{
-            "user_wants": "Brief what user wants",
-            "action": "Suggested action",
-            "prior_context": "Any relevant prior context"
-        }},
-        "plan": "Short step-by-step plan for the agent."
+            "what_user_means": "Brief what user means (should match understanding.what_user_means)",
+            "action": "Suggested action"
+        }}
 }}
 
 RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
@@ -869,6 +873,12 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                         continuation_context, continuation_detection
                     )
 
+            # Log complete raw output from LLM
+            logger.info("👷🏿‍♂️" * 80)
+            logger.info("RAW LLM OUTPUT (Complete JSON):")
+            logger.info(json.dumps(data, indent=2, default=str))
+            logger.info("👷🏿‍♂️" * 80)
+
             # Parse nested structures
             understanding_data = data.get("understanding", {})
             routing_data = data.get("routing", {})
@@ -897,6 +907,23 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             understanding_data["selected_option"] = selected_option
 
             understanding = UnderstandingResult(**understanding_data)
+            
+            # Ensure routing has required fields
+            if not routing_data.get("action"):
+                # Infer action from agent if missing
+                agent = routing_data.get("agent", "general_assistant")
+                if agent == "appointment_manager":
+                    routing_data["action"] = "process_request"
+                elif agent == "registration":
+                    routing_data["action"] = "register_patient"
+                elif agent == "medical_inquiry":
+                    routing_data["action"] = "answer_inquiry"
+                elif agent == "emergency_response":
+                    routing_data["action"] = "handle_emergency"
+                else:
+                    routing_data["action"] = "process_message"
+                logger.warning(f"Missing 'action' in routing, inferred: {routing_data['action']}")
+            
             routing = RoutingResult(**routing_data)
             memory_updates = MemoryUpdate(**memory_data)
 
@@ -938,6 +965,30 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             if task_context_data.get("constraints") is None:
                 task_context_data["constraints"] = []
 
+            # Ensure objective is filled - CRITICAL for agent execution
+            if not task_context_data.get("objective"):
+                # Generate objective from user_intent and action
+                user_intent = task_context_data.get("user_intent", understanding.what_user_means)
+                action = routing_data.get("action", "process_request")
+                
+                # Create a specific objective based on action
+                if action == "book_appointment":
+                    task_context_data["objective"] = f"Book an appointment for: {user_intent}"
+                elif action == "cancel_appointment":
+                    task_context_data["objective"] = f"Cancel appointment: {user_intent}"
+                elif action == "reschedule_appointment":
+                    task_context_data["objective"] = f"Reschedule appointment: {user_intent}"
+                elif action == "register_patient":
+                    task_context_data["objective"] = f"Register new patient: {user_intent}"
+                elif action == "check_availability":
+                    task_context_data["objective"] = f"Check availability for: {user_intent}"
+                elif action == "list_appointments":
+                    task_context_data["objective"] = f"List appointments: {user_intent}"
+                else:
+                    task_context_data["objective"] = user_intent
+                
+                logger.warning(f"⚠️ [ReasoningEngine] Objective was empty, generated: {task_context_data['objective']}")
+            
             # Create TaskContext
             task_context = TaskContext(**task_context_data)
 
@@ -952,14 +1003,13 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             # Extract fields from guidance_data with safe defaults
             tone = guidance_data.get("tone", "helpful")
             minimal_context = guidance_data.get("minimal_context", {})
-            plan = guidance_data.get("plan", "")
+            # plan removed - agents generate their own task plans
             
             # Create ResponseGuidance object
             response_guidance = ResponseGuidance(
                 tone=tone,
                 task_context=task_context,
-                minimal_context=minimal_context,
-                plan=plan
+                minimal_context=minimal_context
             )
 
             # Create output
@@ -1286,7 +1336,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                         continuation_context=continuation_context or {}
                     ),
                     minimal_context={
-                        "user_wants": action.replace("_", " "),
+                        "what_user_means": f"User wants to {action.replace('_', ' ')}",
                         "action": action,
                         "original_message": user_message
                     }
@@ -1323,7 +1373,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                 ),
                 response_guidance=ResponseGuidance(
                     tone="helpful",
-                    minimal_context={"user_wants": "register", "action": "collect_info"}
+                    minimal_context={"what_user_means": "User wants to register", "action": "collect_info"}
                 ),
                 reasoning_chain=[
                     "JSON parsing failed, using smart fallback",
@@ -1358,7 +1408,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                 ),
                 response_guidance=ResponseGuidance(
                     tone="empathetic",
-                    minimal_context={"user_wants": "medical information", "action": "provide_info"}
+                    minimal_context={"what_user_means": "User has a dental/medical question", "action": "provide_info"}
                 ),
                 reasoning_chain=[
                     "JSON parsing failed, using smart fallback",
@@ -1395,7 +1445,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                     ),
                     response_guidance=ResponseGuidance(
                         tone="helpful",
-                        minimal_context={"user_wants": "register", "action": "collect_info"}
+                        minimal_context={"what_user_means": "User wants to register", "action": "collect_info"}
                     ),
                     reasoning_chain=[
                         "JSON parsing failed, using smart fallback",
@@ -1431,7 +1481,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                             continuation_context=continuation_context or {}
                         ),
                         minimal_context={
-                            "user_wants": "confirm action",
+                            "what_user_means": "User confirms appointment action",
                             "action": "continue_flow",
                             "prior_context": last_action
                         }
@@ -1476,7 +1526,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                         continuation_context=continuation_context
                     ),
                     minimal_context={
-                        "user_wants": "continue previous action",
+                        "what_user_means": "User responding to previous request",
                         "action": "handle_continuation",
                         "prior_context": awaiting
                     }
@@ -1512,7 +1562,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             ),
             response_guidance=ResponseGuidance(
                 tone="urgent",
-                minimal_context={"user_wants": "emergency help", "action": "assess_emergency"}
+                minimal_context={"what_user_means": "User has a dental emergency", "action": "assess_emergency"}
             ),
             reasoning_chain=["Emergency keywords detected", "Route to emergency response"]
         )
@@ -1557,7 +1607,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                     prior_context="Reasoning fallback was used - treat message with care"
                 ),
                 minimal_context={
-                    "user_wants": "assistance",
+                    "what_user_means": "User needs assistance",
                     "action": "help_user",
                     "fallback_reason": "reasoning_parse_failure",
                     "original_message": user_message
@@ -1617,7 +1667,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                 ),
                 response_guidance=ResponseGuidance(
                     tone="urgent",
-                    minimal_context={"user_wants": "emergency help", "action": "assess_emergency"}
+                    minimal_context={"what_user_means": "User has a dental emergency", "action": "assess_emergency"}
                 ),
                 reasoning_chain=["Emergency keywords detected", "Route to emergency response"]
             )
@@ -1645,7 +1695,7 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
                 ),
                 response_guidance=ResponseGuidance(
                     tone="helpful",
-                    minimal_context={"user_wants": "register", "action": "collect_info"}
+                    minimal_context={"what_user_means": "User wants to register", "action": "collect_info"}
                 ),
                 reasoning_chain=["User affirmed", "Last action was registration proposal", "Start registration"]
             )

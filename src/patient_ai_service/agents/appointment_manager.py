@@ -68,11 +68,13 @@ class AppointmentManagerAgent(BaseAgent):
             logger.info(f"  - new_facts: {json.dumps(reasoning.memory_updates.new_facts, indent=2)}")
         if reasoning.response_guidance.minimal_context:
             logger.info(f"Response Guidance: {json.dumps(reasoning.response_guidance.minimal_context, indent=2)}")
-        if reasoning.response_guidance.plan:
+        # Plan was removed in Phase 1 - use objective instead
+        objective = reasoning.response_guidance.task_context.objective if reasoning.response_guidance.task_context else None
+        if objective:
             logger.info("=" * 80)
-            logger.info("📋 PLAN FOR APPOINTMENT MANAGER:")
+            logger.info("📋 OBJECTIVE FOR APPOINTMENT MANAGER:")
             logger.info("=" * 80)
-            logger.info(reasoning.response_guidance.plan)
+            logger.info(objective)
             logger.info("=" * 80)
         logger.info("=" * 80)
         
@@ -89,15 +91,16 @@ class AppointmentManagerAgent(BaseAgent):
         elif "book" in action or "schedule" in action or "appointment" in action:
             operation_type = "booking"
 
-        # Store the plan from reasoning for use in system prompt
-        plan_from_reasoning = reasoning.response_guidance.plan if reasoning.response_guidance.plan else ""
+        # Store the objective from reasoning for use in system prompt (plan was removed in Phase 1)
+        task_context = reasoning.response_guidance.task_context
+        objective_from_reasoning = task_context.objective if task_context and task_context.objective else ""
         
         # Initialize appointment workflow state
         self.state_manager.update_appointment_state(
             session_id,
             workflow_step="gathering_info",
             operation_type=operation_type,
-            reasoning_plan=plan_from_reasoning  # Store plan in state
+            reasoning_objective=objective_from_reasoning  # Store objective in state (plan was removed in Phase 1)
         )
 
         logger.info(f"Appointment workflow initialized: operation_type={operation_type}, session={session_id}")
@@ -369,8 +372,8 @@ class AppointmentManagerAgent(BaseAgent):
         
         registration_status = "✅ Registered" if patient_registered else "❌ Not Registered - Registration Required"
         
-        # Get plan from state (stored in on_activated)
-        reasoning_plan = getattr(agent_state, 'reasoning_plan', '') or ''
+        # Get objective from state (stored in on_activated) - plan was removed in Phase 1
+        reasoning_objective = getattr(agent_state, 'reasoning_objective', '') or ''
         
         context = f"""You are an appointment manager for Bright Smile Dental Clinic.
 
@@ -384,7 +387,7 @@ PATIENT CONTEXT:
 {"=" * 80}
 REASONING ENGINE GUIDANCE:
 {"=" * 80}
-{reasoning_plan if reasoning_plan else "No specific plan provided."}
+{reasoning_objective if reasoning_objective else "No specific objective provided."}
 {"=" * 80}
 
 YOUR ORCHESTRATION PHILOSOPHY:
@@ -684,10 +687,11 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             duration_ms = (time_module.time() - start_time) * 1000
             result = {
                 "success": True,
-                "result_type": ToolResultType.PARTIAL.value,  # Still need to check availability and book
+                "result_type": ToolResultType.PARTIAL.value,  # Data retrieved, more steps needed
                 "doctors": doctor_list,
                 "count": len(doctor_list),
-                "next_step": "check_availability",
+                "can_proceed": True,
+                "next_action": "select_doctor_from_list_or_check_availability",
                 "message": f"Found {len(doctor_list)} doctor(s)"
             }
             
@@ -2603,10 +2607,11 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 output = {
                     "success": False,
                     "result_type": ToolResultType.RECOVERABLE.value,
-                    "error": "appointment_not_found",
-                    "error_message": f"Appointment {appointment_id} not found",
-                    "recovery_action": "get_patient_appointments",
-                    "suggested_response": "I couldn't find that appointment. Let me show you your scheduled appointments."
+                    "error": result.get("error", "Failed to cancel appointment") if isinstance(result, dict) else "Failed to cancel appointment",
+                    "error_code": "CANCEL_FAILED",
+                    "should_retry": True,
+                    "can_proceed": False,
+                    "recovery_action": "verify_appointment_exists"
                 }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2666,20 +2671,11 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 output = {
                     "success": True,
                     "result_type": ToolResultType.SUCCESS.value,
-                    "cancelled": True,
                     "appointment_id": appointment_id,
-                    "cancelled_appointment": {
-                        "date": apt_date,
-                        "time": apt_time,
-                        "doctor": appointment.get("doctor_name") if appointment else None,
-                        "reason": appointment.get("reason") if appointment else None
-                    } if appointment else None,
-                    "satisfies_criteria": [
-                        "appointment cancelled",
-                        f"appointment {appointment_id} cancelled"
-                    ],
-                    "suggested_response": f"I've cancelled your appointment{f' on {apt_date} at {apt_time}' if apt_date and apt_time else ''}. Is there anything else I can help with?",
-                    "message": f"Appointment {appointment_id} cancelled successfully"
+                    "status": "cancelled",
+                    "message": "Appointment cancelled successfully",
+                    "can_proceed": True,
+                    "next_action": "confirm_cancellation_to_user"
                 }
                 logger.info(f"Output: success=True, result_type={output['result_type']}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2689,11 +2685,12 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 duration_ms = (time_module.time() - start_time) * 1000
                 output = {
                     "success": False,
-                    "result_type": ToolResultType.SYSTEM_ERROR.value,
-                    "error": "cancellation_failed",
-                    "recovery_action": "tool_cancel_appointment",
+                    "result_type": ToolResultType.RECOVERABLE.value,
+                    "error": result.get("error", "Failed to cancel appointment") if isinstance(result, dict) else "Failed to cancel appointment",
+                    "error_code": "CANCEL_FAILED",
                     "should_retry": True,
-                    "message": "Failed to cancel appointment"
+                    "can_proceed": False,
+                    "recovery_action": "verify_appointment_exists"
                 }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2737,14 +2734,45 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             except:
                 appointment = None
 
+            if not appointment_id:
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": "Appointment ID is required",
+                    "error_code": "MISSING_APPOINTMENT_ID",
+                    "can_proceed": False,
+                    "suggested_response": "Which appointment would you like to reschedule?"
+                }
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
+
             if not appointment:
                 duration_ms = (time_module.time() - start_time) * 1000
                 output = {
                     "success": False,
-                    "result_type": ToolResultType.RECOVERABLE.value,
-                    "error": "appointment_not_found",
-                    "recovery_action": "get_patient_appointments",
-                    "suggested_response": "I couldn't find that appointment. Let me show you your scheduled appointments."
+                    "result_type": ToolResultType.FATAL.value,
+                    "error": "Appointment not found",
+                    "error_code": "APPOINTMENT_NOT_FOUND",
+                    "can_proceed": False,
+                    "suggested_response": "I couldn't find that appointment. Would you like to check your appointments first?"
+                }
+                logger.info(f"Output: {output}")
+                logger.info(f"Time taken: {duration_ms:.2f}ms")
+                logger.info("=" * 80)
+                return output
+
+            if not new_date or not new_time:
+                duration_ms = (time_module.time() - start_time) * 1000
+                output = {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": "New date and time are required",
+                    "error_code": "MISSING_NEW_DATETIME",
+                    "can_proceed": False,
+                    "suggested_response": "When would you like to reschedule this appointment to?"
                 }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2770,15 +2798,13 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                         alternatives = self._find_closest_times(target_time, available_times)
                         duration_ms = (time_module.time() - start_time) * 1000
                         output = {
-                            "success": True,
+                            "success": False,
                             "result_type": ToolResultType.USER_INPUT_NEEDED.value,
-                            "error": "new_time_unavailable",
-                            "requested_time": target_time,
-                            "requested_date": target_date,
-                            "available": False,
+                            "error": f"The requested time {target_time} is not available",
+                            "error_code": "TIME_NOT_AVAILABLE",
                             "alternatives": alternatives,
-                            "blocks_criteria": "appointment rescheduled",
-                            "suggested_response": f"{target_time} on {target_date} isn't available. Would {alternatives[0] if alternatives else 'another time'} work?"
+                            "can_proceed": False,
+                            "suggested_response": f"I'm sorry, {new_time} isn't available on {new_date}. Would any of these times work: {', '.join(alternatives[:3])}?"
                         }
                         logger.info(f"Output: {output}")
                         logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2808,23 +2834,12 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 output = {
                     "success": True,
                     "result_type": ToolResultType.SUCCESS.value,
-                    "rescheduled": True,
                     "appointment_id": appointment_id,
-                    "appointment": result,
-                    "previous": {
-                        "date": prev_date,
-                        "time": prev_time
-                    },
-                    "new": {
-                        "date": target_date,
-                        "time": target_time
-                    },
-                    "satisfies_criteria": [
-                        "appointment rescheduled",
-                        f"appointment {appointment_id} rescheduled"
-                    ],
-                    "suggested_response": f"Done! I've rescheduled your appointment from {prev_date} {prev_time} to {target_date} at {target_time}.",
-                    "message": f"Appointment rescheduled to {target_date} at {target_time}"
+                    "new_date": target_date,
+                    "new_time": target_time,
+                    "message": "Appointment rescheduled successfully",
+                    "can_proceed": True,
+                    "next_action": "confirm_reschedule_to_user"
                 }
                 logger.info(f"Output: success=True, result_type={output['result_type']}, appointment_id={result.get('id', 'N/A')}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
@@ -2835,9 +2850,10 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 output = {
                     "success": False,
                     "result_type": ToolResultType.SYSTEM_ERROR.value,
-                    "error": "reschedule_failed",
+                    "error": result.get("error", "Failed to reschedule") if isinstance(result, dict) else "Failed to reschedule",
+                    "error_code": "RESCHEDULE_FAILED",
                     "should_retry": True,
-                    "message": "Failed to reschedule appointment"
+                    "can_proceed": False
                 }
                 logger.info(f"Output: {output}")
                 logger.info(f"Time taken: {duration_ms:.2f}ms")
