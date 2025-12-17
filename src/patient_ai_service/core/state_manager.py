@@ -871,7 +871,9 @@ class StateManager:
             "patient_profile": global_state.patient_profile.model_dump(),
             "conversation_stage": global_state.conversation_stage,
             "detected_language": global_state.detected_language,
-            "entities_collected": global_state.entities_collected,
+            # Backward-compatible alias: keep entities_collected in context,
+            # but source it from the canonical resolved_entities.
+            "entities_collected": getattr(global_state, "resolved_entities", {}) or global_state.entities_collected,
         }
 
         # Add agent-specific state

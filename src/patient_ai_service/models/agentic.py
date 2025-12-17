@@ -291,6 +291,10 @@ class ThinkingResult(BaseModel):
     # Internal flags
     detected_result_type: Optional[ToolResultType] = None
 
+    # NEW: Updated, session-scoped resolved entities after this thinking step.
+    # This is the canonical conversation memory to be persisted in GlobalState.
+    updated_resolved_entities: Dict[str, Any] = Field(default_factory=dict)
+
 
 class CompletionCheck(BaseModel):
     """

@@ -104,6 +104,11 @@ The tool will automatically normalize date formats and handle existing users."""
             }
         )
 
+    def _get_agent_instructions(self) -> str:
+        """Registration-specific behavioral instructions."""
+        return """MANDATORY: Always confirm ALL details with user before calling register_patient.
+Show: name, phone, date_of_birth, gender. ONCE confirmed, call register_patient with ALL 5 fields immediately."""
+
     def _get_system_prompt(self, session_id: str) -> str:
         """Generate simplified registration system prompt."""
         global_state = self.state_manager.get_global_state(session_id)

@@ -34,6 +34,10 @@ class MedicalInquiryAgent(BaseAgent):
         super().__init__(agent_name="MedicalInquiry", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
+    def _get_agent_instructions(self) -> str:
+        """Medical inquiry-specific behavioral instructions."""
+        return """CRITICAL: You are NOT a doctor. NEVER provide medical advice, tips, or recommendation."""
+
     def _register_tools(self):
         """Register medical inquiry tools."""
 

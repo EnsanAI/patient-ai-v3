@@ -147,7 +147,12 @@ class GlobalState(BaseModel):
     conversation_stage: ConversationStage = ConversationStage.INITIAL
     active_agent: Optional[str] = None
     intent_history: List[str] = Field(default_factory=list)
+    # Deprecated: use resolved_entities for conversation-scoped resolved facts/preferences
     entities_collected: Dict[str, Any] = Field(default_factory=dict)
+    # Canonical conversation-scoped resolved entities for the session.
+    # This is updated by the agent `_think` loop and used as dynamic, non-persistent
+    # conversational memory (preferences, choices, clarified entities, etc.).
+    resolved_entities: Dict[str, Any] = Field(default_factory=dict)
     conversation_summary: str = ""
 
     # [NEW] Unified language context (replaces detected_language)

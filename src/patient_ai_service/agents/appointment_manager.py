@@ -105,6 +105,10 @@ class AppointmentManagerAgent(BaseAgent):
 
         logger.info(f"Appointment workflow initialized: operation_type={operation_type}, session={session_id}")
 
+    def _get_agent_instructions(self) -> str:
+        """Appointment-specific behavioral instructions."""
+        return """MANDATORY: Confirm with user before scheduling, rescheduling, cancelling or updating appointment in anyway. ONCE confirmed, call the appropriate tool immediately."""
+
     def _register_tools(self):
         """Register appointment-related tools."""
 

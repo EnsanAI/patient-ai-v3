@@ -773,9 +773,17 @@ class BaseAgent(ABC):
     
     async def _generate_plan_with_llm(self, plan: AgentPlan):
         """Use LLM to generate tasks for the plan."""
-        
+
         tools_desc = self._get_tools_description()
-        
+
+        # Get agent-specific instructions (only add section if instructions exist)
+        agent_instructions = self._get_agent_instructions()
+        instructions_section = f"""
+AGENT-SPECIFIC INSTRUCTIONS (FOLLOW STRICTLY):
+{agent_instructions}
+
+""" if agent_instructions else ""
+
         prompt = f"""You are the {self.agent_name} agent. Generate an execution plan.
 
 OBJECTIVE: {plan.objective}
@@ -783,7 +791,7 @@ OBJECTIVE: {plan.objective}
 KNOWN ENTITIES:
 {json.dumps(plan.initial_entities, indent=2, default=str)}
 
-AVAILABLE TOOLS:
+{instructions_section}AVAILABLE TOOLS:
 {tools_desc}
 
 Generate a plan as JSON:
@@ -1060,6 +1068,22 @@ Output ONLY valid JSON."""
             
             logger.info(f"[{self.agent_name}] Decision: {thinking.decision}")
             logger.info(f"[{self.agent_name}] Reasoning: {thinking.reasoning[:100]}...")
+
+            # Persist updated resolved entities to global state, if provided
+            if getattr(thinking, "updated_resolved_entities", None):
+                try:
+                    self.state_manager.update_global_state(
+                        session_id,
+                        resolved_entities=thinking.updated_resolved_entities
+                    )
+                    logger.info(
+                        f"✍️ [{self.agent_name}]   → Updated global resolved_entities: "
+                        f"{list(thinking.updated_resolved_entities.keys())}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.agent_name}] ⚠️ Failed to persist resolved_entities: {e}"
+                    )
             
             # -----------------------------------------------------------------
             # ACT: Execute based on decision
@@ -1317,7 +1341,11 @@ Output ONLY valid JSON."""
                 
                 # Save continuation context using response data
                 awaiting = thinking.response.clarification_needed or thinking.awaiting_info or "clarification"
-                resolved = thinking.response.resolved_entities or thinking.resolved_entities or self._extract_resolved_entities(exec_context)
+                # Use updated_resolved_entities as the canonical view if available
+                resolved = thinking.updated_resolved_entities or \
+                    thinking.response.resolved_entities or \
+                    thinking.resolved_entities or \
+                    self._extract_resolved_entities(exec_context)
                 
                 self.state_manager.set_continuation_context(
                     session_id,
@@ -1353,7 +1381,11 @@ Output ONLY valid JSON."""
                 
                 # Save continuation context using response data
                 awaiting = thinking.response.information_needed or thinking.awaiting_info or "user_information"
-                resolved = thinking.response.resolved_entities or thinking.resolved_entities or self._extract_resolved_entities(exec_context)
+                # Use updated_resolved_entities as the canonical view if available
+                resolved = thinking.updated_resolved_entities or \
+                    thinking.response.resolved_entities or \
+                    thinking.resolved_entities or \
+                    self._extract_resolved_entities(exec_context)
                 
                 self.state_manager.set_continuation_context(
                     session_id,
@@ -2622,6 +2654,20 @@ FORBIDDEN:
 
     # ==================== NEW AGENTIC HELPER METHODS ====================
 
+    def _get_agent_instructions(self) -> str:
+        """
+        Get agent-specific instructions for planning and thinking.
+
+        Override in specialized agents to add custom behavioral rules like:
+        - "Always confirm details before executing"
+        - "Never provide medical advice"
+        - "Ask for missing information before proceeding"
+
+        Returns:
+            String with agent-specific instructions (empty for default behavior)
+        """
+        return ""  # Default: no special instructions
+
     def _get_thinking_system_prompt(self) -> str:
         """Get system prompt for thinking phase."""
         return f"""You are the thinking module for {self.agent_name}.
@@ -2765,15 +2811,15 @@ RETRY:
         prior_context = context.get('prior_context', 'None')
         routing_action = context.get('routing_action', context.get('action', 'Not specified'))
         
-        # NEW: Get entities_collected from GlobalState
+        # Get resolved_entities from GlobalState (conversation-scoped memory)
         global_state = self.state_manager.get_global_state(exec_context.session_id)
-        entities_collected = global_state.entities_collected
+        resolved_entities = getattr(global_state, "resolved_entities", {}) or {}
         
         logger.info(f"📝 [{self.agent_name}]   → User intent: {user_intent}")
         logger.info(f"📝 [{self.agent_name}]   → Routing action: {routing_action}")
         logger.info(f"📝 [{self.agent_name}]   → Prior context: {prior_context}")
         logger.info(f"📝 [{self.agent_name}]   → Entities: {list(entities.keys()) if entities else 'None'}")
-        logger.info(f"📝 [{self.agent_name}]   → Entities collected: {list(entities_collected.keys()) if entities_collected else 'None'}")
+        logger.info(f"✍️ [{self.agent_name}]   → Resolved entities: {list(resolved_entities.keys()) if resolved_entities else 'None'}")
         logger.info(f"📝 [{self.agent_name}]   → Constraints: {len(constraints)} constraint(s)")
         
         # Check for continuation
@@ -2829,10 +2875,26 @@ DO NOT start from scratch. BUILD ON what was already resolved.
         observations_summary = exec_context.get_observations_summary()
         logger.info(f"📝 [{self.agent_name}]   ✅ Observations summary ({len(observations_summary)} chars)")
         logger.debug(f"📝 [{self.agent_name}]   → Observations:\n{observations_summary}")
-        
+
+        # Get agent-specific instructions (only add section if instructions exist)
+        logger.info(f"📝 [{self.agent_name}] Step 6.5: Getting agent-specific instructions...")
+        agent_instructions = self._get_agent_instructions()
+        instructions_section = f"""
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  AGENT-SPECIFIC INSTRUCTIONS (FOLLOW STRICTLY)
+═══════════════════════════════════════════════════════════════════════════════
+
+{agent_instructions}
+
+""" if agent_instructions else ""
+        if agent_instructions:
+            logger.info(f"📝 [{self.agent_name}]   ✅ Agent instructions ({len(agent_instructions)} chars)")
+        else:
+            logger.info(f"📝 [{self.agent_name}]   → No agent-specific instructions")
+
         # Build the final prompt
         logger.info(f"📝 [{self.agent_name}] Step 7: Assembling final prompt...")
-        
+
         prompt = f"""
 ═══════════════════════════════════════════════════════════════════════════════
 🎯 REASONING ENGINE ANALYSIS (Your Instructions)
@@ -2844,11 +2906,13 @@ What User Really Wants: {user_intent}
 Recommended Action: {routing_action}
 Prior Context: {prior_context}
 
+{instructions_section}
+
 Entities Identified (from reasoning):
 {json.dumps(entities, indent=2, default=str) if entities else '(none)'}
 
-Collected Entities (from conversation):
-{json.dumps(entities_collected, indent=2, default=str) if entities_collected else '(none)'}
+Resolved Entities (from previous conversation turns):
+{json.dumps(resolved_entities, indent=2, default=str) if resolved_entities else '(none)'}
 
 Constraints:
 {chr(10).join(f'  - {c}' for c in constraints) if constraints else '  (none)'}
@@ -2920,7 +2984,12 @@ Respond with JSON:
     // RESPONSE DATA - Fill based on decision type
     // ═══════════════════════════════════════════════════════════════
     "response": {{
-        // Always fill resolved_entities with what we know
+        // Always fill resolved_entities with EVERYTHING you know so far:
+        //
+        // - Include all relevant facts collected in this conversation
+        // - Merge in new information from the current turn
+        // - Overwrite values that changed (e.g., new doctor preference)
+        // - Remove entries that are no longer valid for the current plan
         "resolved_entities": {{
             "patient_id": "...",
             "doctor_name": "...",
@@ -3155,7 +3224,7 @@ DECISION RULES:
                 awaiting_info = data.get("awaiting_info")
                 resolved_entities = data.get("resolved_entities", {})
                 logger.info(f"🔍 [{self.agent_name}]   → Awaiting info: {awaiting_info}")
-                logger.info(f"🔍 [{self.agent_name}]   → Resolved entities: {list(resolved_entities.keys()) if resolved_entities else 'None'}")
+                logger.info(f"✍️ [{self.agent_name}]   → Resolved entities (from thinking JSON): {list(resolved_entities.keys()) if resolved_entities else 'None'}")
             
             # Extract confirmation_summary for REQUEST_CONFIRMATION (legacy)
             confirmation_summary = None
@@ -3203,6 +3272,21 @@ DECISION RULES:
             
             # Build result
             logger.info(f"🔍 [{self.agent_name}] Step 9: Building ThinkingResult object...")
+
+            # Determine updated_resolved_entities for persistent conversation memory.
+            # Priority order:
+            # 1) response.resolved_entities if present
+            # 2) legacy resolved_entities field if present
+            # 3) fall back to existing global_state.resolved_entities (no change)
+            global_state = self.state_manager.get_global_state(exec_context.session_id)
+            previous_resolved = getattr(global_state, "resolved_entities", {}) or {}
+            updated_resolved = previous_resolved.copy()
+
+            if response_data.resolved_entities:
+                updated_resolved.update(response_data.resolved_entities)
+            elif resolved_entities:
+                updated_resolved.update(resolved_entities)
+
             result = ThinkingResult(
                 analysis=analysis,
                 task_status=assessment,
@@ -3216,7 +3300,8 @@ DECISION RULES:
                 awaiting_info=awaiting_info,  # Legacy
                 resolved_entities=resolved_entities,  # Legacy
                 confirmation_summary=confirmation_summary,  # Legacy
-                response=response_data  # NEW structured response
+                response=response_data,  # NEW structured response
+                updated_resolved_entities=updated_resolved
             )
             
             logger.info(f"🔍 [{self.agent_name}]   ✅ ThinkingResult created successfully")
