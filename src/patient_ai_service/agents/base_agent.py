@@ -3716,14 +3716,7 @@ DECISION RULES:
         logger.info(f"🧠 [{self.agent_name}] [STEP 2/5] Building thinking prompt...")
         
         prompt = self._build_thinking_prompt(message, context, exec_context)
-        
-        # Log complete thinking prompt
-        logger.info("📜" * 80)
-        logger.info(f"🧠 [{self.agent_name}] COMPLETE THINKING PROMPT:")
-        logger.info("📜" * 80)
-        logger.info(prompt)
-        logger.info("📜" * 80)
-        
+                
         # ═════════════════════════════════════════════════════════════════════
         # STEP 3: PREPARE LLM CALL
         # ═════════════════════════════════════════════════════════════════════

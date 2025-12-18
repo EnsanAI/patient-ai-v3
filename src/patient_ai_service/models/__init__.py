@@ -52,6 +52,12 @@ from .agent_plan import (
     PlanAction,
 )
 
+from .unified_reasoning import (
+    RouteType,
+    PlanDecision,
+    UnifiedReasoningOutput,
+)
+
 __all__ = [
     # Enums
     "IntentType",
@@ -91,4 +97,8 @@ __all__ = [
     "PlanTask",
     "AgentPlan",
     "PlanAction",
+    # Unified Reasoning
+    "RouteType",
+    "PlanDecision",
+    "UnifiedReasoningOutput",
 ]

@@ -18,8 +18,8 @@ class ArchitectureV2Settings(BaseSettings):
     """Settings for the enhanced architecture."""
     
     # Feature flags
-    enable_situation_assessor: bool = True
-    enable_focused_handling: bool = True
+    enable_situation_assessor: bool = True  # DEPRECATED: Replaced by unified_reasoning
+    enable_focused_handling: bool = True  # DEPRECATED: Replaced by unified_reasoning
     enable_task_plans: bool = True
     enable_entity_caching: bool = True
     enable_script_detection: bool = True

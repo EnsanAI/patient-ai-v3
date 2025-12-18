@@ -41,6 +41,11 @@ from .reasoning import (
     get_reasoning_engine,
     reset_reasoning_engine,
 )
+from .unified_reasoning import (
+    UnifiedReasoning,
+    get_unified_reasoning,
+    reset_unified_reasoning,
+)
 
 __all__ = [
     # Config
@@ -79,4 +84,8 @@ __all__ = [
     "ResponseGuidance",
     "get_reasoning_engine",
     "reset_reasoning_engine",
+    # Unified Reasoning
+    "UnifiedReasoning",
+    "get_unified_reasoning",
+    "reset_unified_reasoning",
 ]

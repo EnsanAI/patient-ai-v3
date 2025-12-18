@@ -594,8 +594,10 @@ class ObservabilityLogger:
         step_mapping = {
             "translation.detect_and_translate": (2, "Translation (Input) [OPTIMIZED]"),
             "memory.summarize": (3, "Add to Memory"),
-            "situation_assessor": (4, "Situation Assessment"),
+            "unified_reasoning": (4, "Unified Reasoning"),
+            "situation_assessor": (4, "Situation Assessment"),  # Legacy - deprecated
             "reasoning": (4, "Reasoning"),  # Legacy - may be used in comprehensive reasoning path
+            "conversational_fast_path": (5, "Fast-Path Response"),
             "agent.": (8, "Agent Execution"),  # Prefix match for all agent calls
             "validation": (9, "Validation"),
             "finalization": (11, "Finalization"),
