@@ -54,6 +54,8 @@ class UnifiedReasoning:
         patient_info: Dict[str, Any],
         active_agent: Optional[str],
         awaiting: Optional[str],
+        awaiting_context: Optional[str],              # NEW
+        pending_action: Optional[Dict[str, Any]],     # NEW
         recent_turns: List[Dict[str, str]],
         existing_plan: Optional[AgentPlan]
     ) -> UnifiedReasoningOutput:
@@ -66,6 +68,8 @@ class UnifiedReasoning:
             patient_info: Patient profile info
             active_agent: Currently active agent (if any)
             awaiting: What we're waiting for (if any)
+            awaiting_context: Human-readable summary of what we're awaiting (NEW)
+            pending_action: Structured pending action details for confirmations (NEW)
             recent_turns: Recent conversation turns
             existing_plan: Current active plan (if any)
 
@@ -79,6 +83,8 @@ class UnifiedReasoning:
         logger.info(f"[UnifiedReasoning] Message: {message[:100]}...")
         logger.info(f"[UnifiedReasoning] Active agent: {active_agent}")
         logger.info(f"[UnifiedReasoning] Awaiting: {awaiting}")
+        logger.info(f"[UnifiedReasoning] Awaiting context: {awaiting_context}")  # NEW
+        logger.info(f"[UnifiedReasoning] Has pending action: {pending_action is not None}")  # NEW
         logger.info(f"[UnifiedReasoning] Has plan: {existing_plan is not None}")
 
         # Get observability logger
@@ -90,6 +96,8 @@ class UnifiedReasoning:
             patient_info=patient_info,
             active_agent=active_agent,
             awaiting=awaiting,
+            awaiting_context=awaiting_context,    # NEW
+            pending_action=pending_action,         # NEW
             recent_turns=recent_turns,
             existing_plan=existing_plan
         )
@@ -241,8 +249,18 @@ FOR AGENT ROUTING:
   "what_user_means": "Plain English explanation of what user actually wants",
   "objective": "Goal for the agent (empty if resume)",
   "is_continuation": true|false,
-  "continuation_type": "selection|confirmation|direct_answer|rejection|modification|null"
+  "continuation_type": "selection|confirmation|direct_answer|rejection|modification|null",
+  "routing_action": "execute_confirmed_action|null"
 }
+
+IMPORTANT: When a pending action is awaiting confirmation:
+- If user confirms (yes, yeah, sure, okay, etc.) → routing_action MUST be "execute_confirmed_action"
+- If user rejects (no, cancel, etc.) → routing_action is null (agent will think normally)
+- If user modifies (yes but..., change to..., etc.) → routing_action is null (agent will think normally)
+- Otherwise → routing_action is null
+
+Note: Only explicit confirmations get special routing. Rejections and modifications
+go through normal agent thinking where _think() will decide the appropriate response.
 
 JSON only. No explanation outside JSON."""
 
@@ -252,6 +270,8 @@ JSON only. No explanation outside JSON."""
         patient_info: Dict[str, Any],
         active_agent: Optional[str],
         awaiting: Optional[str],
+        awaiting_context: Optional[str],              # NEW
+        pending_action: Optional[Dict[str, Any]],     # NEW
         recent_turns: List[Dict[str, str]],
         existing_plan: Optional[AgentPlan]
     ) -> str:
@@ -297,6 +317,46 @@ ROUTING RULES FOR UNREGISTERED PATIENTS:
 
 """
 
+        # NEW: Build pending action section for confirmations
+        pending_action_section = ""
+        if awaiting == "confirmation" and pending_action:
+            pending_action_section = f"""
+═══════════════════════════════════════════════════════════════════════════════
+PENDING ACTION AWAITING CONFIRMATION
+═══════════════════════════════════════════════════════════════════════════════
+
+ACTION TYPE: {pending_action.get('action_type', 'unknown')}
+SUMMARY: {pending_action.get('summary', awaiting_context or 'Pending action')}
+TOOL TO EXECUTE: {pending_action.get('tool', 'unknown')}
+TOOL PARAMETERS: {json.dumps(pending_action.get('tool_input', {}), default=str)}
+
+ROUTING RULES FOR THIS CONFIRMATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If user CONFIRMS (yes, yeah, sure, okay, do it, proceed, confirm, go ahead, yep, yup, absolutely, please do):
+  → routing_action: "execute_confirmed_action"
+  → situation_type: "confirmation"
+
+If user REJECTS (no, nope, cancel, nevermind, don't, stop, forget it, actually no):
+  → routing_action: null (let agent think normally)
+  → situation_type: "rejection"
+  → continuation_type: "rejection"
+  → plan_decision: "resume"
+
+If user MODIFIES (yes but at 4pm, change to Dr. X, different day, make it earlier):
+  → routing_action: null (let agent think normally)
+  → situation_type: "modification"
+  → continuation_type: "modification"
+  → plan_decision: "resume"
+  → Extract the modification in objective/what_user_means
+
+If user asks something UNRELATED (what are your hours?, who is Dr. X?, something completely different):
+  → routing_action: null
+  → situation_type: "new_intent" or "topic_shift"
+  → Route to appropriate agent (this abandons the pending action)
+
+"""
+
         return f"""═══════════════════════════════════════════════════════════════════════════════
 CONTEXT
 ═══════════════════════════════════════════════════════════════════════════════
@@ -307,10 +367,12 @@ PATIENT: {patient_name} (ID: {patient_id}, Registered: {"Yes" if is_registered e
 
 ACTIVE AGENT: {active_agent or "None"}
 AWAITING: {awaiting or "Nothing"}
+AWAITING CONTEXT: {awaiting_context or "N/A"}
 
 RECENT CONVERSATION:
 {turns_formatted}
 {registration_status_section}
+{pending_action_section}
 {plan_context}
 
 Analyze and respond with JSON only."""
@@ -392,7 +454,8 @@ Analyze and respond with JSON only."""
             what_user_means=data.get("what_user_means", ""),
             objective=data.get("objective", ""),
             is_continuation=data.get("is_continuation", False),
-            continuation_type=data.get("continuation_type")
+            continuation_type=data.get("continuation_type"),
+            routing_action=data.get("routing_action")  # NEW
         )
 
 

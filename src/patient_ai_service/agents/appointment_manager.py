@@ -2,7 +2,7 @@
 Appointment Manager Agent.
 
 Handles appointment booking, rescheduling, cancellation, and checking.
-"""
+""" v 1.0.0 - Initial version of appointment manager agent
 
 import logging
 import asyncio
@@ -18,7 +18,6 @@ from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
 from patient_ai_service.models.agentic import ToolResultType
 
 logger = logging.getLogger(__name__)
-
 
 class AppointmentManagerAgent(BaseAgent):
     """

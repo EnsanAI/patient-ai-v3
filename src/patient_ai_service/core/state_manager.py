@@ -60,6 +60,20 @@ class ContinuationContext(BaseModel):
     # What we're waiting for
     awaiting: str = ""  # "time_selection", "doctor_selection", "confirmation", etc.
     
+    # NEW: Human-readable explanation of what we're awaiting
+    awaiting_context: Optional[str] = None
+    # Example: "Confirming appointment booking with Dr. Smith on Dec 20 at 3pm"
+    
+    # NEW: Pending action details (for confirmations)
+    pending_action: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    # Structure:
+    # {
+    #   "tool": "book_appointment",
+    #   "tool_input": {"doctor_id": "...", "date": "...", "time": "..."},
+    #   "action_type": "booking",  # booking, cancellation, reschedule, registration
+    #   "summary": "Book appointment with Dr. Smith on December 20th at 3pm"
+    # }
+    
     # Options we presented
     presented_options: List[Any] = Field(default_factory=list)
     
@@ -646,6 +660,8 @@ class StateManager:
         self,
         session_id: str,
         awaiting: str,
+        awaiting_context: Optional[str] = None,        # NEW
+        pending_action: Optional[Dict[str, Any]] = None,  # NEW
         options: List[Any] = None,
         original_request: str = None,
         resolved_entities: Dict[str, Any] = None,
@@ -653,6 +669,16 @@ class StateManager:
     ):
         """
         Set continuation context for resuming after user input.
+        
+        Args:
+            session_id: Session identifier
+            awaiting: What we're waiting for (e.g., "confirmation", "time_selection")
+            awaiting_context: Human-readable summary of what we're awaiting (NEW)
+            pending_action: Structured pending action details for confirmations (NEW)
+            options: Options presented to user
+            original_request: User's original request
+            resolved_entities: Entities resolved so far
+            blocked_criteria: Blocked success criteria
         """
         state = self.get_agentic_state(session_id)
 
@@ -668,6 +694,8 @@ class StateManager:
                     "message": "set_continuation_context",
                     "data": {
                         "awaiting": awaiting,
+                        "awaiting_context": awaiting_context,  # NEW
+                        "has_pending_action": pending_action is not None,  # NEW
                         "options_count": len(options or []),
                     },
                     "timestamp": int(_time.time() * 1000),
@@ -678,6 +706,8 @@ class StateManager:
 
         state.continuation_context = ContinuationContext(
             awaiting=awaiting,
+            awaiting_context=awaiting_context,           # NEW
+            pending_action=pending_action or {},         # NEW
             presented_options=options or [],
             original_request=original_request,
             resolved_entities=resolved_entities or {},

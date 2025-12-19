@@ -955,16 +955,55 @@ Output ONLY valid JSON."""
         routing_action = context.get('routing_action', '')
         continuation_context = context.get('continuation_context', {})
         
-        # Handle confirmation-related actions directly (no agentic loop needed)
+        # ═══════════════════════════════════════════════════════════════════════
+        # NON-BRAINER PRE-EXECUTION
+        # ═══════════════════════════════════════════════════════════════════════
+        # When user confirms with "yes", we don't need to think - just do it.
+        # Execute the pending tool immediately, then let normal flow review.
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        pre_executed_observation = None  # Will hold (type, name, result) if we pre-execute
+        
         if routing_action == 'execute_confirmed_action':
-            return await self._execute_confirmed_action(session_id, continuation_context, execution_log)
+            # Extract pending action from continuation context
+            pending_action = continuation_context.get('pending_action', {})
+            pending_tool = (
+                pending_action.get('tool') or 
+                continuation_context.get('resolved_entities', {}).get('pending_tool')
+            )
+            pending_tool_input = (
+                pending_action.get('tool_input') or 
+                continuation_context.get('resolved_entities', {}).get('pending_tool_input', {})
+            )
+            
+            if pending_tool:
+                logger.info(f"[{self.agent_name}] ⚡ NON-BRAINER: Executing confirmed action: {pending_tool}")
+                logger.info(f"[{self.agent_name}] ⚡ Input: {json.dumps(pending_tool_input, default=str)}")
+                
+                # Ensure session_id in tool input
+                if "session_id" not in pending_tool_input:
+                    pending_tool_input["session_id"] = session_id
+                
+                # Execute immediately - no thinking required
+                tool_result = await self._execute_tool(pending_tool, pending_tool_input, execution_log)
+                
+                logger.info(f"[{self.agent_name}] ⚡ Result: success={tool_result.get('success')}")
+                
+                # Store for injection into exec_context later
+                pre_executed_observation = ("tool", pending_tool, tool_result)
+                
+                # Clear continuation context - action has been taken
+                self.state_manager.clear_continuation_context(session_id)
+            else:
+                logger.warning(f"[{self.agent_name}] execute_confirmed_action but no pending_tool found!")
         
-        elif routing_action == 'handle_rejection':
-            return await self._handle_rejection(session_id, continuation_context, execution_log)
-        
-        elif routing_action == 'handle_modification':
-            # Modification needs to update pending action with new entities, then re-confirm
-            return await self._handle_modification(session_id, message, context, execution_log)
+        # NOTE: Rejection and modification are NOT special-cased here
+        # They go through normal planning and thinking loop
+        # UnifiedReasoning will set:
+        #   - situation_type: "rejection" or "modification"
+        #   - continuation_type: "rejection" or "modification"
+        #   - plan_decision: "resume"
+        # The agent's _think() will see pending_action context and decide appropriately
         
         # ═══════════════════════════════════════════════════════════════
         # PLAN LIFECYCLE MANAGEMENT (Phase 4)
@@ -1039,6 +1078,24 @@ Output ONLY valid JSON."""
         if continuation:
             exec_context.continuation_context = continuation
             logger.info(f"Resuming with continuation context: {list(continuation.keys())}")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # INJECT PRE-EXECUTED OBSERVATION (if we did a non-brainer execution)
+        # ═══════════════════════════════════════════════════════════════════════
+        if pre_executed_observation:
+            obs_type, obs_name, obs_result = pre_executed_observation
+            exec_context.add_observation(obs_type, obs_name, obs_result)
+            logger.info(f"[{self.agent_name}] 💉 Injected pre-executed observation: {obs_name}")
+            
+            # Also mark the corresponding task as complete if it exists in plan
+            if plan and obs_result.get('success'):
+                from patient_ai_service.models.agent_plan import TaskStatus
+                # Find and mark matching task
+                for task in plan.tasks:
+                    if task.tool == obs_name and task.status == TaskStatus.PENDING:
+                        plan.mark_task_complete(task.task_id, obs_result)
+                        logger.info(f"[{self.agent_name}] 📋 Marked task {task.task_id} complete from pre-execution")
+                        break
         
         logger.info(f"[{self.agent_name}] Starting agentic loop for session {session_id}")
         logger.info(f"[{self.agent_name}] Message: {message[:100]}...")
@@ -1434,10 +1491,12 @@ Output ONLY valid JSON."""
                 
                 # Build confirmation details from response or legacy summary
                 if thinking.response.confirmation_action:
-                    confirmation_details = thinking.response.confirmation_details
+                    confirmation_details = thinking.response.confirmation_details or {}
                     confirmation_action = thinking.response.confirmation_action
-                    pending_tool = None
-                    pending_tool_input = {}
+                    # Infer tool name from action (e.g., "book_appointment" -> "book_appointment")
+                    pending_tool = confirmation_action if "_" in confirmation_action else None
+                    # Build tool input from confirmation details
+                    pending_tool_input = confirmation_details.copy()
                 else:
                     # Legacy: use confirmation_summary
                     summary = thinking.confirmation_summary
@@ -1453,13 +1512,31 @@ Output ONLY valid JSON."""
                         pending_tool = None
                         pending_tool_input = {}
                 
+                # NEW: Build human-readable summary for UnifiedReasoning
+                awaiting_context = self._build_confirmation_summary(
+                    confirmation_action,
+                    confirmation_details,
+                    pending_tool
+                )
+                
+                # NEW: Build structured pending_action dict
+                pending_action = {
+                    "tool": pending_tool,
+                    "tool_input": pending_tool_input,
+                    "action_type": self._get_action_type(confirmation_action),
+                    "summary": awaiting_context
+                }
+                
                 # Save the pending action so we can execute it after confirmation
                 self.state_manager.set_continuation_context(
                     session_id,
                     awaiting="confirmation",
+                    awaiting_context=awaiting_context,  # NEW
+                    pending_action=pending_action,       # NEW
                     options=["yes", "no", "confirm", "cancel"],
                     original_request=exec_context.user_request,
                     resolved_entities={
+                        # Keep for backward compatibility
                         "pending_action": confirmation_action,
                         "pending_tool": pending_tool,
                         "pending_tool_input": pending_tool_input,
@@ -3398,172 +3475,49 @@ DECISION RULES:
             logger.info(f"🛑 [{self.agent_name}] Plan marked BLOCKED and stored: {reason}")
         else:
             logger.warning(f"📋 [{self.agent_name}] No plan to mark blocked (awaiting={awaiting})")
-
-    def _generate_confirmation_request(self, summary: ConfirmationSummary) -> str:
-        """Generate a confirmation request message for the user."""
-        action = summary.action
-        details = summary.details
+    
+    def _build_confirmation_summary(
+        self, 
+        action: str, 
+        details: Dict[str, Any],
+        tool: Optional[str]
+    ) -> str:
+        """Build human-readable confirmation summary for UnifiedReasoning."""
+        if action == "book_appointment" or tool == "book_appointment":
+            doctor = details.get("doctor_name", "the doctor")
+            date = details.get("date", "the selected date")
+            time = details.get("time", "the selected time")
+            return f"Confirm booking appointment with {doctor} on {date} at {time}"
         
-        if action == "book_appointment":
-            doctor = details.get('doctor_name', 'the doctor')
-            date = details.get('date', '')
-            time = details.get('time', '')
-            procedure = details.get('procedure', 'your appointment')
-            
-            return (
-                f"I'm ready to book your {procedure} with {doctor} "
-                f"on {date} at {time}. "
-                f"Should I confirm this booking?"
-            )
+        elif action == "cancel_appointment" or tool == "cancel_appointment":
+            appt_id = details.get("appointment_id", "the appointment")
+            return f"Confirm cancellation of appointment {appt_id}"
         
-        elif action == "cancel_appointment":
-            doctor = details.get('doctor_name', 'the doctor')
-            date = details.get('date', '')
-            time = details.get('time', '')
-            
-            return (
-                f"I'll cancel your appointment with {doctor} "
-                f"on {date} at {time}. "
-                f"Are you sure you want to cancel?"
-            )
+        elif action == "reschedule_appointment" or tool == "reschedule_appointment":
+            new_date = details.get("new_date", details.get("date", ""))
+            new_time = details.get("new_time", details.get("time", ""))
+            return f"Confirm rescheduling appointment to {new_date} at {new_time}"
         
-        elif action == "reschedule_appointment":
-            old_date = details.get('old_date', '')
-            old_time = details.get('old_time', '')
-            new_date = details.get('new_date', details.get('date', ''))
-            new_time = details.get('new_time', details.get('time', ''))
-            doctor = details.get('doctor_name', 'the doctor')
-            
-            return (
-                f"I'll reschedule your appointment with {doctor} "
-                f"from {old_date} at {old_time} "
-                f"to {new_date} at {new_time}. "
-                f"Should I proceed?"
-            )
+        elif action == "register_patient" or tool == "register_patient":
+            name = details.get("name", details.get("first_name", "patient"))
+            return f"Confirm registration for {name}"
         
         else:
-            # Generic confirmation
-            return f"Please confirm: {action}. Proceed?"
-
-    async def _execute_confirmed_action(
-        self,
-        session_id: str,
-        continuation_context: Dict[str, Any],
-        execution_log: ExecutionLog
-    ) -> Tuple[str, ExecutionLog]:
-        """Execute the pending action after user confirmed."""
-        resolved = continuation_context.get('resolved_entities', {})
-        pending_tool = resolved.get('pending_tool')
-        pending_input = resolved.get('pending_tool_input', {})
-        
-        if not pending_tool:
-            logger.warning(f"[{self.agent_name}] No pending tool to execute!")
-            return "I'm sorry, I lost track of what we were doing. Could you repeat your request?", execution_log
-        
-        logger.info(f"[{self.agent_name}] Executing confirmed action: {pending_tool}")
-        
-        # Clear continuation context BEFORE executing
-        self.state_manager.clear_continuation_context(session_id)
-        
-        # Execute the pending tool
-        tool_result = await self._execute_tool(pending_tool, pending_input, execution_log)
-        
-        # Create execution context for response generation
-        exec_context = ExecutionContext(session_id, self.max_iterations, user_request="Confirmed action")
-        exec_context.add_observation("tool", pending_tool, tool_result)
-        
-        if tool_result.get('success'):
-            response = await self._generate_focused_response(session_id, exec_context)
+            return f"Confirm action: {action}"
+    
+    def _get_action_type(self, action: str) -> str:
+        """Map action to action_type category."""
+        action_lower = action.lower()
+        if "book" in action_lower:
+            return "booking"
+        elif "cancel" in action_lower:
+            return "cancellation"
+        elif "reschedule" in action_lower:
+            return "reschedule"
+        elif "register" in action_lower:
+            return "registration"
         else:
-            error = tool_result.get('error', 'The action could not be completed')
-            response = f"I'm sorry, there was an issue: {error}. Would you like to try again?"
-        
-        return response, execution_log
-
-    async def _handle_rejection(
-        self,
-        session_id: str,
-        continuation_context: Dict[str, Any],
-        execution_log: ExecutionLog
-    ) -> Tuple[str, ExecutionLog]:
-        """Handle user rejecting the pending action."""
-        logger.info(f"[{self.agent_name}] User rejected pending action")
-        
-        # Clear continuation context
-        self.state_manager.clear_continuation_context(session_id)
-        
-        return "No problem, I've cancelled that. Is there anything else I can help you with?", execution_log
-
-    async def _handle_modification(
-        self,
-        session_id: str,
-        message: str,
-        context: Dict[str, Any],
-        execution_log: ExecutionLog
-    ) -> Tuple[str, ExecutionLog]:
-        """Handle user wanting to modify before confirming."""
-        logger.info(f"[{self.agent_name}] User wants to modify pending action")
-        
-        continuation_context = context.get('continuation_context', {})
-        resolved = continuation_context.get('resolved_entities', {}).copy()
-        pending_tool = resolved.get('pending_tool')
-        pending_input = resolved.get('pending_tool_input', {}).copy()
-        
-        # Get extracted entities from assessment (new values user provided)
-        new_entities = context.get('entities', {})
-        
-        # Merge new entities into pending input
-        # Map from preference keys to tool input keys
-        entity_mapping = {
-            'time_preference': 'time',
-            'date_preference': 'date',
-            'doctor_preference': 'doctor_name',
-            'procedure_preference': 'procedure',
-            'doctor_id': 'doctor_id',
-            'time': 'time',
-            'date': 'date',
-            'doctor_name': 'doctor_name',
-            'procedure': 'procedure'
-        }
-        
-        updated = False
-        for entity_key, tool_key in entity_mapping.items():
-            if entity_key in new_entities and new_entities[entity_key]:
-                pending_input[tool_key] = new_entities[entity_key]
-                updated = True
-                logger.info(f"[{self.agent_name}] Updated {tool_key} to {new_entities[entity_key]}")
-        
-        if not updated:
-            # Couldn't figure out what to modify - ask for clarification
-            return "I want to make sure I update the right thing. What would you like to change?", execution_log
-        
-        # Update the continuation context with new pending input
-        resolved['pending_tool_input'] = pending_input
-        
-        # Also update details for confirmation message
-        for key in ['time', 'date', 'doctor_name', 'procedure']:
-            if key in pending_input:
-                resolved[key] = pending_input[key]
-        
-        self.state_manager.set_continuation_context(
-            session_id,
-            awaiting="confirmation",
-            options=["yes", "no"],
-            original_request=continuation_context.get('original_request'),
-            resolved_entities=resolved,
-            blocked_criteria=[]
-        )
-        
-        # Generate new confirmation request with updated details
-        summary = ConfirmationSummary(
-            action=resolved.get('pending_action', 'book_appointment'),
-            details={k: v for k, v in resolved.items() if k in ['doctor_name', 'date', 'time', 'procedure']},
-            tool_name=pending_tool,
-            tool_input=pending_input
-        )
-        
-        response = self._generate_confirmation_request(summary)
-        return response, execution_log
+            return "action"
 
     def _get_tools_description(self) -> str:
         """Get description of available tools with full parameter details for the prompt."""
@@ -4406,130 +4360,6 @@ DECISION RULES:
             return " ".join(parts) + " Would you like me to continue?"
         
         return "I'm still working on your request. Could you please provide more details or try a simpler request?"
-
-    async def _generate_focused_response(
-        self,
-        session_id: str,
-        exec_context: ExecutionContext
-    ) -> str:
-        """
-        Generate response AFTER agent decides to respond.
-        Uses full execution context, what_user_means/user_intent, and tone.
-        """
-        logger.info(f"🅰 [{self.agent_name}] Initializing focused response generation (Option 2)")
-        
-        context = self._context.get(session_id, {})
-        
-        # Use user_intent as primary, with fallback to what_user_means
-        user_intent = context.get("user_intent") or context.get("what_user_means", "")
-        tone = context.get("tone", "helpful")
-        language = context.get("current_language", "en")
-        dialect = context.get("current_dialect")
-        
-        execution_summary = self._build_execution_summary(exec_context)
-        
-        # Get agent's system prompt to include critical restrictions
-        agent_system_prompt = self._get_system_prompt(session_id)
-        # Extract key restrictions section if present (for registration agent, this is critical)
-        agent_restrictions = self._extract_key_restrictions(agent_system_prompt)
-        
-        logger.info(f"👩🏻‍💻 [{self.agent_name}] Focused response inputs:")
-        logger.info(f"👩🏻‍💻   - user_intent: {user_intent}")
-        logger.info(f"👩🏻‍💻   - tone: {tone}")
-        logger.info(f"👩🏻‍💻   - language: {language}")
-        logger.info(f"👩🏻‍💻   - dialect: {dialect}")
-        logger.info(f"👩🏻‍💻   - execution_summary: {execution_summary}")
-        logger.info(f"👩🏻‍💻   - observations_count: {len(exec_context.observations)}")
-        logger.info(f"👩🏻‍💻   - agent_restrictions: {agent_restrictions[:200] if agent_restrictions else 'None'}...")
-        
-        system_prompt = f"""Generate a {tone} response for a clinic receptionist.
-
-USER INTENT: {user_intent}
-TONE: {tone}
-LANGUAGE: {language}
-DIALECT: {dialect if dialect else ""}
-
-WHAT HAPPENED:
-{execution_summary}
-
-{agent_restrictions if agent_restrictions else ""}
-
-RULES:
-- Report what actually happened (based on execution results above)
-- Be {tone} and super natural
-- Don't be overly friendly, just warm
-- Don't sound redundant
-- No JSON, UUIDs, or technical details
-- Use user's language preference
-- Keep it concise (2-4 sentences)
-- **CRITICAL**: If this is a registration agent asking for information, ONLY ask for the required fields specified in the agent restrictions above. DO NOT ask for optional fields like email, insurance, allergies, medications, etc."""
-
-        logger.info(f"🅰 [{self.agent_name}] System prompt length: {len(system_prompt)} chars")
-        logger.debug(f"🅰 [{self.agent_name}] Full system prompt:\n{system_prompt}")
-
-        # Get observability logger
-        obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
-        llm_start_time = time.time()
-        
-        logger.info(f"🅰 [{self.agent_name}] Calling LLM for focused response generation...")
-
-        try:
-            # Try to get token usage if available
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": "Generate the response."}],
-                    temperature=0.5,
-                    max_tokens=300
-                )
-            else:
-                response = self.llm_client.create_message(
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": "Generate the response."}],
-                    temperature=0.5,
-                    max_tokens=300
-                )
-                tokens = TokenUsage()
-
-            llm_duration_seconds = time.time() - llm_start_time
-
-            # Logging with error handling - don't let logging errors prevent response return
-            try:
-                logger.info(f"🅰 [{self.agent_name}] LLM call completed in {llm_duration_seconds:.2f}s")
-                logger.info(f"🅰 [{self.agent_name}] Token usage - input: {tokens.input_tokens}, output: {tokens.output_tokens}, total: {tokens.total_tokens}")
-                logger.info(f"🅰 [{self.agent_name}] Generated response ({len(response)} chars): {response}")
-                logger.debug(f"🅰 [{self.agent_name}] Full response text:\n{response}")
-            except Exception as log_error:
-                # Logging error shouldn't prevent response return
-                logger.warning(f"🅰 [{self.agent_name}] Error in logging (non-critical): {log_error}")
-
-            # Record LLM call
-            try:
-                if obs_logger:
-                    obs_logger.record_llm_call(
-                        component=f"agent.{self.agent_name}.generate_focused_response",
-                        provider=settings.llm_provider.value,
-                        model=settings.get_llm_model(),
-                        tokens=tokens,
-                        duration_seconds=llm_duration_seconds,
-                        system_prompt_length=len(system_prompt),
-                        messages_count=1,
-                        temperature=0.5,
-                        max_tokens=300,
-                        error=None
-                    )
-            except Exception as obs_error:
-                # Observability logging error shouldn't prevent response return
-                logger.warning(f"🅰 [{self.agent_name}] Error in observability logging (non-critical): {obs_error}")
-
-            logger.info(f"🅰 [{self.agent_name}] Focused response generation completed successfully")
-            return response
-
-        except Exception as e:
-            logger.error(f"🅰 [{self.agent_name}] Error generating focused response: {e}", exc_info=True)
-            error_response = "I apologize, but I encountered an issue processing your request. Please try again."
-            logger.info(f"🅰 [{self.agent_name}] Returning error fallback response: {error_response}")
-            return error_response
 
     async def _generate_response(
         self,

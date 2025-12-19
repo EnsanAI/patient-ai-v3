@@ -471,6 +471,8 @@ Your response:"""
             # Get continuation context
             continuation_context = self.state_manager.get_continuation_context(session_id)
             awaiting = continuation_context.get("awaiting") if continuation_context else None
+            awaiting_context = continuation_context.get("awaiting_context") if continuation_context else None  # NEW
+            pending_action = continuation_context.get("pending_action") if continuation_context else None      # NEW
 
             # Get existing plan
             existing_plan = self.state_manager.get_any_active_plan(session_id)
@@ -486,6 +488,8 @@ Your response:"""
                     patient_info=patient_info,
                     active_agent=global_state.active_agent,
                     awaiting=awaiting,
+                    awaiting_context=awaiting_context,    # NEW
+                    pending_action=pending_action,         # NEW
                     recent_turns=recent_turns,
                     existing_plan=existing_plan
                 )
@@ -1368,10 +1372,10 @@ Your response:"""
             sentiment="neutral"
         )
 
-        # Build routing
+        # Build routing - USE routing_action IF PROVIDED (takes precedence)
         routing = RoutingResult(
             agent=unified_output.agent or "general_assistant",
-            action=unified_output.continuation_type or "new_request",
+            action=unified_output.routing_action or unified_output.continuation_type or "new_request",  # CHANGED
             urgency="emergency" if unified_output.situation_type == SituationType.EMERGENCY else "routine"
         )
 

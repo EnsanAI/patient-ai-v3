@@ -46,6 +46,11 @@ class UnifiedReasoningOutput(BaseModel):
     objective: Optional[str] = None
     is_continuation: bool = False
     continuation_type: Optional[str] = None
+    
+    # NEW: Direct routing action for confirmations only
+    routing_action: Optional[str] = None
+    # Values: "execute_confirmed_action", None
+    # Note: rejection and modification have routing_action=None and go through normal thinking
 
     @classmethod
     def fast_path(cls, situation_type: SituationType) -> "UnifiedReasoningOutput":
