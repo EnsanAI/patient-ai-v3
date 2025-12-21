@@ -280,6 +280,7 @@ class AgentPlan(BaseModel):
 
 class PlanAction(str, Enum):
     """What the orchestrator tells the agent to do with plans."""
+    NO_PLAN = "no_plan"                 # Skip planning entirely (fast-path, general assistant)
     CREATE_NEW = "create_new"           # Generate a new plan
     RESUME = "resume"                   # Continue existing plan
     UPDATE_AND_RESUME = "update_resume" # Add new info, then resume

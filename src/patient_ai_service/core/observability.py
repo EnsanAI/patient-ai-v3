@@ -338,6 +338,7 @@ class ObservabilityLogger:
         messages_count: int = 0,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        function_name: Optional[str] = None,
         error: Optional[str] = None
     ) -> LLMCall:
         """Record an LLM call."""
@@ -352,6 +353,7 @@ class ObservabilityLogger:
         
         llm_call = LLMCall(
             component=component,
+            function_name=function_name,
             provider=provider,
             model=model,
             system_prompt_length=system_prompt_length,
@@ -607,6 +609,7 @@ class ObservabilityLogger:
         # Group LLM calls by step
         step_costs = {}  # step_number -> {name, llm_calls, total_cost, total_tokens, duration}
         agent_calls = []  # Special handling for agent calls
+        unmatched_calls = []  # Track unmatched calls for debugging
 
         for llm_call in self._llm_calls:
             component = llm_call.component
@@ -633,6 +636,9 @@ class ObservabilityLogger:
                     step_costs[step_num]["duration"] += llm_call.duration_seconds
                     matched = True
                     break
+            
+            if not matched:
+                unmatched_calls.append(llm_call)
 
         # Get pipeline steps for duration info
         pipeline_steps = {step['step_number']: step for step in observability.pipeline.get('steps', [])}
@@ -649,6 +655,7 @@ class ObservabilityLogger:
 
             for llm_call in step_data['llm_calls']:
                 logger.info(f"    - {llm_call.component}")
+                logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                 logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
                            f"(total: {llm_call.tokens.total_tokens})")
                 if settings.cost_tracking_enabled:
@@ -676,6 +683,7 @@ class ObservabilityLogger:
                 logger.info(f"\n  Thinking Iterations: {len(think_calls)}")
                 for idx, llm_call in enumerate(think_calls, 1):
                     logger.info(f"\n    Iteration {idx}:")
+                    logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                     logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
                     logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
                                f"(total: {llm_call.tokens.total_tokens})")
@@ -687,6 +695,7 @@ class ObservabilityLogger:
                 logger.info(f"\n  Final Response Generation:")
                 for llm_call in response_calls:
                     logger.info(f"    Component: {llm_call.component}")
+                    logger.info(f"    Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                     logger.info(f"    Duration: {self._format_duration(llm_call.duration_seconds)}")
                     logger.info(f"    Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
                                f"(total: {llm_call.tokens.total_tokens})")
@@ -698,6 +707,7 @@ class ObservabilityLogger:
                 logger.info(f"\n  Other Agent Operations:")
                 for llm_call in other_calls:
                     logger.info(f"    {llm_call.component}")
+                    logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                     logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
                     logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
                                f"(total: {llm_call.tokens.total_tokens})")
@@ -707,6 +717,16 @@ class ObservabilityLogger:
             # Agent total
             if observability.agent and settings.cost_tracking_enabled:
                 logger.info(f"\n  Agent Total Cost: ${observability.agent.total_cost.total_cost_usd:.6f}")
+
+        # Log unmatched LLM calls (for debugging)
+        if unmatched_calls:
+            logger.warning(f"\n⚠️  Unmatched LLM Calls (not mapped to any step):")
+            for llm_call in unmatched_calls:
+                logger.warning(f"  - Component: {llm_call.component}")
+                logger.warning(f"    Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
+                logger.warning(f"    Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} (total: {llm_call.tokens.total_tokens})")
+                if settings.cost_tracking_enabled:
+                    logger.warning(f"    Cost: ${llm_call.cost.total_cost_usd:.6f}")
 
         # Steps with no LLM calls (just show duration)
         for step_num, step in sorted(pipeline_steps.items()):
@@ -781,7 +801,7 @@ class ObservabilityLogger:
             llm_call = observability.reasoning.llm_call
             logger.info(f"\n1. REASONING REQUEST:")
             logger.info(f"   Component: {llm_call.component}")
-            logger.info(f"   Model: {llm_call.model}")
+            logger.info(f"   Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
             logger.info(f"   Tokens: {llm_call.tokens.total_tokens} "
                        f"(Input: {llm_call.tokens.input_tokens}, "
                        f"Output: {llm_call.tokens.output_tokens})")
@@ -795,6 +815,7 @@ class ObservabilityLogger:
             logger.info(f"\n2. AGENT LLM CALLS ({len(observability.agent.llm_calls)} requests):")
             for idx, llm_call in enumerate(observability.agent.llm_calls, 1):
                 logger.info(f"   {idx}. {llm_call.component} - {llm_call.model}")
+                logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                 logger.info(f"      Tokens: {llm_call.tokens.total_tokens} "
                            f"(Input: {llm_call.tokens.input_tokens}, "
                            f"Output: {llm_call.tokens.output_tokens})")
@@ -820,7 +841,7 @@ class ObservabilityLogger:
             logger.info(f"   Retries: {observability.validation.retry_count}")
             if observability.validation.llm_call:
                 llm_call = observability.validation.llm_call
-                logger.info(f"   Model: {llm_call.model}")
+                logger.info(f"   Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                 logger.info(f"   Tokens: {llm_call.tokens.total_tokens}")
                 logger.info(f"   Duration: {self._format_duration(llm_call.duration_seconds)}")
                 if settings.cost_tracking_enabled:
@@ -834,7 +855,7 @@ class ObservabilityLogger:
             logger.info(f"   Rewritten: {observability.finalization.was_rewritten}")
             if observability.finalization.llm_call:
                 llm_call = observability.finalization.llm_call
-                logger.info(f"   Model: {llm_call.model}")
+                logger.info(f"   Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                 logger.info(f"   Tokens: {llm_call.tokens.total_tokens}")
                 logger.info(f"   Duration: {self._format_duration(llm_call.duration_seconds)}")
                 if settings.cost_tracking_enabled:
@@ -908,9 +929,11 @@ class ObservabilityLogger:
         # LLM calls
         logger.info("\nLLM Calls:")
         for llm_call in self._llm_calls:
-            logger.info(f"  {llm_call.component}: {llm_call.model} - "
-                       f"{llm_call.tokens.total_tokens} tokens, "
-                       f"{self._format_duration(llm_call.duration_seconds)}")
+            logger.info(f"  {llm_call.component}:")
+            logger.info(f"    Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
+            logger.info(f"    Tokens: {llm_call.tokens.total_tokens} "
+                       f"(Input: {llm_call.tokens.input_tokens}, Output: {llm_call.tokens.output_tokens}), "
+                       f"Duration: {self._format_duration(llm_call.duration_seconds)}")
             if settings.cost_tracking_enabled:
                 logger.info(f"    Cost: ${llm_call.cost.total_cost_usd:.6f}")
 

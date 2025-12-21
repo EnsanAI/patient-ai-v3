@@ -46,6 +46,14 @@ from .unified_reasoning import (
     get_unified_reasoning,
     reset_unified_reasoning,
 )
+from .llm_config import (
+    LLMConfig,
+    LLMConfigManager,
+    get_llm_config_manager,
+    get_llm_config,
+    get_hierarchical_llm_client,
+    reset_llm_config_manager,
+)
 
 __all__ = [
     # Config
@@ -88,4 +96,11 @@ __all__ = [
     "UnifiedReasoning",
     "get_unified_reasoning",
     "reset_unified_reasoning",
+    # LLM Configuration
+    "LLMConfig",
+    "LLMConfigManager",
+    "get_llm_config_manager",
+    "get_llm_config",
+    "get_hierarchical_llm_client",
+    "reset_llm_config_manager",
 ]

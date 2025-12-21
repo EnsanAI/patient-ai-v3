@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from patient_ai_service.core.llm import LLMClient, get_llm_client
 from patient_ai_service.core.config import settings
+from patient_ai_service.core.llm_config import get_llm_config_manager
 from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.core.conversation_memory import (
     ConversationMemoryManager,
@@ -301,6 +302,7 @@ class ReasoningEngine:
         self.memory_manager = memory_manager or get_conversation_memory_manager()
         self.state_manager = get_state_manager()
         self.test_mode = test_mode
+        self.llm_config_manager = get_llm_config_manager()
 
         # For deterministic testing
         self._test_responses: Dict[str, ReasoningOutput] = {}
@@ -443,18 +445,24 @@ class ReasoningEngine:
             
             # Single LLM call does everything
             llm_start_time = time.time()
-            reasoning_temp = settings.reasoning_temperature
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            # Get hierarchical LLM config for reasoning agent
+            llm_config = self.llm_config_manager.get_config(agent_name="reasoning")
+            llm_client = self.llm_config_manager.get_client(agent_name="reasoning")
+            reasoning_temp = llm_config.temperature
+            
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=self._get_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=reasoning_temp
+                    temperature=reasoning_temp,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=self._get_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=reasoning_temp
+                    temperature=reasoning_temp,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
@@ -464,14 +472,15 @@ class ReasoningEngine:
             if obs_logger:
                 llm_call = obs_logger.record_llm_call(
                     component="reasoning",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(self._get_system_prompt()),
                     messages_count=1,
                     temperature=reasoning_temp,
-                    max_tokens=settings.llm_max_tokens
+                    max_tokens=llm_config.max_tokens,
+                    function_name="reason"
                 )
             
             # Record reasoning step
@@ -1756,39 +1765,51 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             )
 
             # Call LLM for validation (low temperature for consistency)
+            # Get hierarchical LLM config for validation
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="reasoning",
+                function_name="validate_response"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="reasoning",
+                function_name="validate_response"
+            )
+
             obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
             llm_start_time = time.time()
 
-            validation_temp = settings.validation_temperature
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=self._get_validation_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=validation_temp
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=self._get_validation_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=validation_temp
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
-            
+
             llm_duration_seconds = time.time() - llm_start_time
-            
-            # Record LLM call
+
+            # Record LLM call with hierarchical config
             llm_call = None
             if obs_logger:
                 llm_call = obs_logger.record_llm_call(
                     component="validation",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(self._get_validation_system_prompt()),
                     messages_count=1,
-                    temperature=0.2,
-                    max_tokens=settings.llm_max_tokens
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="validate_response"
                 )
 
             # Parse validation response
@@ -1872,39 +1893,51 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             )
 
             # Call LLM for finalization (slightly higher temp for natural edits)
+            # Get hierarchical LLM config for finalization
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="reasoning",
+                function_name="finalize_response"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="reasoning",
+                function_name="finalize_response"
+            )
+
             obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
             llm_start_time = time.time()
 
-            finalization_temp = settings.finalization_temperature
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=self._get_finalization_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=finalization_temp
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=self._get_finalization_system_prompt(),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=finalization_temp
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
-            
+
             llm_duration_seconds = time.time() - llm_start_time
-            
-            # Record LLM call
+
+            # Record LLM call with hierarchical config
             llm_call = None
             if obs_logger:
                 llm_call = obs_logger.record_llm_call(
                     component="finalization",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(self._get_finalization_system_prompt()),
                     messages_count=1,
-                    temperature=finalization_temp,
-                    max_tokens=settings.llm_max_tokens
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="finalize_response"
                 )
 
             # Parse finalization response

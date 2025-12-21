@@ -2,7 +2,7 @@
 Appointment Manager Agent.
 
 Handles appointment booking, rescheduling, cancellation, and checking.
-""" v 1.0.0 - Initial version of appointment manager agent
+"""
 
 import logging
 import asyncio

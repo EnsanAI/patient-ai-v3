@@ -37,6 +37,11 @@ from patient_ai_service.core.llm import LLMClient
 from patient_ai_service.core.state_manager import StateManager
 from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.core.config import settings
+from patient_ai_service.core.llm_config import (
+    LLMConfig,
+    LLMConfigManager,
+    get_llm_config_manager,
+)
 from patient_ai_service.models.validation import ExecutionLog, ToolExecution
 from patient_ai_service.models.observability import (
     LLMCall,
@@ -256,6 +261,51 @@ class ExecutionContext:
             return ToolResultType.PARTIAL
         
         return ToolResultType.PARTIAL  # Default
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert ExecutionContext to a JSON-serializable dictionary."""
+        from datetime import datetime
+        
+        def serialize_value(v):
+            """Recursively serialize values for JSON."""
+            if isinstance(v, datetime):
+                return v.isoformat()
+            elif isinstance(v, dict):
+                return {k: serialize_value(val) for k, val in v.items()}
+            elif isinstance(v, list):
+                return [serialize_value(item) for item in v]
+            elif hasattr(v, 'dict') or hasattr(v, 'model_dump'):  # Pydantic models
+                try:
+                    return v.model_dump() if hasattr(v, 'model_dump') else v.dict()
+                except:
+                    return str(v)
+            elif hasattr(v, '__dict__'):
+                return {k: serialize_value(val) for k, val in v.__dict__.items()}
+            else:
+                return v
+        
+        result = {
+            "session_id": self.session_id,
+            "max_iterations": self.max_iterations,
+            "iteration": self.iteration,
+            "user_request": self.user_request,
+            "observations": [serialize_value(obs) for obs in self.observations],
+            "criteria": {k: serialize_value(v) for k, v in self.criteria.items()},
+            "pending_user_options": serialize_value(self.pending_user_options),
+            "suggested_response": self.suggested_response,
+            "continuation_context": serialize_value(self.continuation_context),
+            "fatal_error": serialize_value(self.fatal_error),
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
+            "recovery_attempts": serialize_value(self.recovery_attempts),
+            "recovery_executed": self.recovery_executed,
+            "tool_calls": self.tool_calls,
+            "llm_calls": self.llm_calls,
+            "started_at": serialize_value(self.started_at),
+            "task_context": serialize_value(self.task_context),
+            "plan": serialize_value(self.plan) if self.plan else None,
+        }
+        return result
     
     def get_observations_summary(self) -> str:
         """Get a formatted summary of all observations for the thinking prompt."""
@@ -639,6 +689,10 @@ class BaseAgent(ABC):
         self.state_manager = state_manager or get_state_manager()
         self.max_iterations = max_iterations or self.DEFAULT_MAX_ITERATIONS
 
+        # Hierarchical LLM config support
+        self._config_agent_name = self._normalize_agent_name(agent_name)
+        self._llm_config_manager: Optional[LLMConfigManager] = None  # Lazy loaded
+
         # Conversation history per session
         self.conversation_history: Dict[str, List[Dict[str, str]]] = {}
 
@@ -687,6 +741,77 @@ class BaseAgent(ABC):
     def set_context(self, session_id: str, context: Dict[str, Any]):
         """Set minimal context for this session."""
         self._context[session_id] = context
+
+    # ==================== HIERARCHICAL LLM CONFIG HELPERS ====================
+
+    @staticmethod
+    def _normalize_agent_name(agent_name: str) -> str:
+        """
+        Convert CamelCase agent name to snake_case for config lookup.
+        
+        Examples:
+            "AppointmentManagerAgent" → "appointment_manager"
+            "MedicalInquiryAgent" → "medical_inquiry"
+            "TranslationAgent" → "translation"
+            "appointment_manager" → "appointment_manager" (no change)
+        
+        Args:
+            agent_name: Agent name in any format
+        
+        Returns:
+            Normalized snake_case agent name
+        """
+        if not agent_name:
+            return agent_name
+        
+        # If already snake_case, return as-is
+        if '_' in agent_name and agent_name.islower():
+            return agent_name
+        
+        # Use LLMConfigManager's normalization method
+        return LLMConfigManager._normalize_agent_name(agent_name)
+    
+    def _get_llm_config_manager(self) -> LLMConfigManager:
+        """Get or create LLMConfigManager instance (lazy loading)."""
+        if self._llm_config_manager is None:
+            self._llm_config_manager = get_llm_config_manager()
+        return self._llm_config_manager
+    
+    def _get_llm_config_for_function(self, function_name: str) -> LLMConfig:
+        """
+        Get hierarchically-resolved LLM config for a specific function.
+        
+        Resolution order: function → agent → global
+        
+        Args:
+            function_name: Function name (e.g., "_think", "_verify_task_completion")
+        
+        Returns:
+            LLMConfig with resolved values
+        """
+        config_manager = self._get_llm_config_manager()
+        return config_manager.get_config(
+            agent_name=self._config_agent_name,
+            function_name=function_name
+        )
+    
+    def _get_llm_client_for_function(self, function_name: str) -> LLMClient:
+        """
+        Get hierarchically-configured LLM client for a specific function.
+        
+        Clients are cached by provider+model combination.
+        
+        Args:
+            function_name: Function name (e.g., "_think", "_verify_task_completion")
+        
+        Returns:
+            Cached LLMClient instance configured for this function
+        """
+        config_manager = self._get_llm_config_manager()
+        return config_manager.get_client(
+            agent_name=self._config_agent_name,
+            function_name=function_name
+        )
         logger.debug(f"Set context for {self.agent_name} session {session_id}: {context}")
 
 
@@ -818,21 +943,35 @@ Output ONLY valid JSON."""
         # Get observability logger
         obs_logger = get_observability_logger(plan.session_id) if settings.enable_observability else None
         
+        # Log the built prompts
+        system_prompt = "You are a task planner. Output only valid JSON."
+        logger.info("=" * 80)
+        logger.info(f"🗺️ [{self.agent_name}] BUILT PLAN PROMPTS:")
+        logger.info("=" * 80)
+        logger.info(f"🗺️ [{self.agent_name}] System Prompt:\n{system_prompt}")
+        logger.info("-" * 80)
+        logger.info(f"🗺️ [{self.agent_name}] User Prompt:\n{prompt}")
+        logger.info("=" * 80)
+        
+        # Get hierarchical LLM config for plan generation
+        # Note: plan generation doesn't have a specific function name, so use agent-level config
+        llm_config = self._get_llm_config_for_function("_think")  # Use _think config as closest match
+        plan_temperature = llm_config.temperature
+        plan_max_tokens = llm_config.max_tokens
+        llm_client = self._get_llm_client_for_function("_think")
+        
         # Make LLM call with token tracking
         llm_start_time = time.time()
-        system_prompt = "You are a task planner. Output only valid JSON."
-        plan_temperature = 0.2
-        plan_max_tokens = 500
         
-        if hasattr(self.llm_client, 'create_message_with_usage'):
-            response, tokens = self.llm_client.create_message_with_usage(
+        if hasattr(llm_client, 'create_message_with_usage'):
+            response, tokens = llm_client.create_message_with_usage(
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=plan_temperature,
                 max_tokens=plan_max_tokens
             )
         else:
-            response = self.llm_client.create_message(
+            response = llm_client.create_message(
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=plan_temperature,
@@ -842,18 +981,26 @@ Output ONLY valid JSON."""
         
         llm_duration_seconds = time.time() - llm_start_time
         
+        # Log the raw LLM response
+        logger.info("=" * 80)
+        logger.info(f"🗺️ [{self.agent_name}] RAW LLM RESPONSE:")
+        logger.info("=" * 80)
+        logger.info(f"🗺️ [{self.agent_name}] Response Content:\n{response}")
+        logger.info("=" * 80)
+        
         # Record LLM call
         if obs_logger:
             llm_call = obs_logger.record_llm_call(
                 component=f"agent.{self.agent_name}.plan",
-                provider=settings.llm_provider.value,
-                model=settings.get_llm_model(),
+                provider=llm_config.provider,
+                model=llm_config.model,
                 tokens=tokens,
                 duration_seconds=llm_duration_seconds,
                 system_prompt_length=len(system_prompt),
                 messages_count=1,
                 temperature=plan_temperature,
-                max_tokens=plan_max_tokens
+                max_tokens=plan_max_tokens,
+                function_name="_create_task_plan"
             )
             
             # Full observability logging for token calculation
@@ -862,8 +1009,8 @@ Output ONLY valid JSON."""
             logger.info(f"📋 [{self.agent_name}]   Output tokens: {tokens.output_tokens}")
             logger.info(f"📋 [{self.agent_name}]   Total tokens: {tokens.total_tokens}")
             logger.info(f"📋 [{self.agent_name}]   LLM Duration: {llm_duration_seconds * 1000:.2f}ms ({llm_duration_seconds:.3f}s)")
-            logger.info(f"📋 [{self.agent_name}]   Model: {settings.get_llm_model()}")
-            logger.info(f"📋 [{self.agent_name}]   Provider: {settings.llm_provider.value}")
+            logger.info(f"📋 [{self.agent_name}]   Model: {llm_config.model}")
+            logger.info(f"📋 [{self.agent_name}]   Provider: {llm_config.provider}")
             logger.info(f"📋 [{self.agent_name}]   Temperature: {plan_temperature}")
             logger.info(f"📋 [{self.agent_name}]   Max tokens: {plan_max_tokens}")
             logger.info(f"📋 [{self.agent_name}]   System prompt length: {len(system_prompt)} chars")
@@ -931,6 +1078,12 @@ Output ONLY valid JSON."""
         response, execution_log = await self.process_message(session_id, user_message, execution_log)
         return response, execution_log
 
+    def _log_execution_summary(self, exec_context: ExecutionContext):
+        """Log execution summary as JSON."""
+        exec_summary = exec_context.to_dict()
+        exec_summary_json = json.dumps(exec_summary, indent=2, default=str)
+        logger.info(f"🧱 [{self.agent_name}] EXECUTION SUMMARY:\n{exec_summary_json}")
+    
     async def process_message(
         self,
         session_id: str,
@@ -978,7 +1131,7 @@ Output ONLY valid JSON."""
             
             if pending_tool:
                 logger.info(f"[{self.agent_name}] ⚡ NON-BRAINER: Executing confirmed action: {pending_tool}")
-                logger.info(f"[{self.agent_name}] ⚡ Input: {json.dumps(pending_tool_input, default=str)}")
+                logger.info(f"[{self.agent_name}] ⚡ Input: {json.dumps(pending_tool_input, default=str) if pending_tool_input else '{}'}")
                 
                 # Ensure session_id in tool input
                 if "session_id" not in pending_tool_input:
@@ -1010,9 +1163,14 @@ Output ONLY valid JSON."""
         # ═══════════════════════════════════════════════════════════════
         plan_action_str = context.get("plan_action", "create_new")
         existing_plan_data = context.get("existing_plan")
-        
+
         plan = None
-        if plan_action_str == "create_new" or plan_action_str == "abandon_create":
+        if plan_action_str == "no_plan":
+            # Skip planning entirely (fast-path or general assistant)
+            logger.info(f"📋 [{self.agent_name}] Skipping plan creation (no_plan action)")
+            plan = None
+
+        elif plan_action_str == "create_new" or plan_action_str == "abandon_create":
             # Generate new plan
             logger.info(f"📋 [{self.agent_name}] Creating new plan...")
             plan = await self._plan(
@@ -1022,13 +1180,13 @@ Output ONLY valid JSON."""
                 constraints=context.get("constraints", [])
             )
             self.state_manager.store_agent_plan(session_id, plan)
-            
+
         elif plan_action_str in ["resume", "update_resume"]:
             # Load existing plan
             if existing_plan_data:
                 plan = AgentPlan(**existing_plan_data)
                 logger.info(f"📋 [{self.agent_name}] Resuming plan: {plan.get_summary()}")
-                
+
                 if plan_action_str == "update_resume":
                     # Add new entities from this turn
                     new_entities = context.get("entities", {})
@@ -1093,8 +1251,8 @@ Output ONLY valid JSON."""
                 # Find and mark matching task
                 for task in plan.tasks:
                     if task.tool == obs_name and task.status == TaskStatus.PENDING:
-                        plan.mark_task_complete(task.task_id, obs_result)
-                        logger.info(f"[{self.agent_name}] 📋 Marked task {task.task_id} complete from pre-execution")
+                        plan.mark_task_complete(task.id, obs_result)
+                        logger.info(f"[{self.agent_name}] 📋 Marked task {task.id} complete from pre-execution")
                         break
         
         logger.info(f"[{self.agent_name}] Starting agentic loop for session {session_id}")
@@ -1103,6 +1261,10 @@ Output ONLY valid JSON."""
             logger.info(f"[{self.agent_name}] Plan: {exec_context.plan.objective} ({len(exec_context.plan.tasks)} tasks)")
         else:
             logger.warning(f"[{self.agent_name}] No plan in execution context!")
+        
+        # Log execution context as JSON
+        exec_context_json = json.dumps(exec_context.to_dict(), indent=2, default=str)
+        logger.info(f"🧱 [{self.agent_name}] EXECUTION CONTEXT:\n{exec_context_json}")
         
         # =====================================================================
         # MAIN AGENTIC LOOP
@@ -1371,6 +1533,7 @@ Output ONLY valid JSON."""
                     thinking.response,
                     exec_context
                 )
+                self._log_execution_summary(exec_context)
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_COMPLETE:
@@ -1381,6 +1544,7 @@ Output ONLY valid JSON."""
                     thinking.response,
                     exec_context
                 )
+                self._log_execution_summary(exec_context)
                 return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_IMPOSSIBLE:
@@ -1589,6 +1753,9 @@ Output ONLY valid JSON."""
             status="max_iterations",
             iteration=exec_context.iteration
         )
+        
+        # Log execution summary as JSON
+        self._log_execution_summary(exec_context)
         
         return response, execution_log
 
@@ -2401,21 +2568,27 @@ Respond with JSON:
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
         llm_start_time = time.time()
-        verification_temperature = 0.1
+        
+        # Get hierarchical LLM config for _verify_task_completion function
+        llm_config = self._get_llm_config_for_function("_verify_task_completion")
+        verification_temperature = llm_config.temperature
+        llm_client = self._get_llm_client_for_function("_verify_task_completion")
 
         try:
             # Try to get token usage if available
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=system_prompt,
                     messages=[{"role": "user", "content": "Verify task completion."}],
-                    temperature=verification_temperature
+                    temperature=verification_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=system_prompt,
                     messages=[{"role": "user", "content": "Verify task completion."}],
-                    temperature=verification_temperature
+                    temperature=verification_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
@@ -2425,14 +2598,15 @@ Respond with JSON:
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.verify_completion",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
                     temperature=verification_temperature,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="_verify_task_completion",
                     error=None
                 )
 
@@ -2455,14 +2629,15 @@ Respond with JSON:
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.verify_completion",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=TokenUsage(),
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
                     temperature=verification_temperature,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="_verify_task_completion",
                     error=str(e)
                 )
             
@@ -2534,29 +2709,35 @@ FORBIDDEN:
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
         llm_start_time = time.time()
-        response_temperature = 0.5
+        
+        # Get hierarchical LLM config for _generate_response function
+        llm_config = self._get_llm_config_for_function("_generate_response")
+        response_temperature = llm_config.temperature
+        llm_client = self._get_llm_client_for_function("_generate_response")
 
         try:
             user_message = f"Generate a response for: {execution_context.user_request}"
             
             # Try to get token usage if available
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=system_prompt,
                     messages=[{
                         "role": "user",
                         "content": user_message
                     }],
-                    temperature=response_temperature
+                    temperature=response_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=system_prompt,
                     messages=[{
                         "role": "user",
                         "content": user_message
                     }],
-                    temperature=response_temperature
+                    temperature=response_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
@@ -2566,14 +2747,15 @@ FORBIDDEN:
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.generate_response",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
                     temperature=response_temperature,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="_generate_response",
                     error=None
                 )
 
@@ -2586,14 +2768,15 @@ FORBIDDEN:
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.generate_response",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=TokenUsage(),
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
                     temperature=response_temperature,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="_generate_response",
                     error=str(e)
                 )
             
@@ -3616,8 +3799,11 @@ DECISION RULES:
         logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
         plan = exec_context.plan
         logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
-        logger.info(f"🧠 [{self.agent_name}] Thinking - Plan status: {plan.status.value}")
-        logger.info(f"🧠 [{self.agent_name}]   Completed: {len(plan.get_completed_task_ids())}/{len(plan.tasks)}")
+        if plan:
+            logger.info(f"🧠 [{self.agent_name}] Thinking - Plan status: {plan.status.value}")
+            logger.info(f"🧠 [{self.agent_name}]   Completed: {len(plan.get_completed_task_ids())}/{len(plan.tasks)}")
+        else:
+            logger.info(f"🧠 [{self.agent_name}] Thinking - No plan (no_plan action)")
         
         # ═════════════════════════════════════════════════════════════════════
         # STEP 1: GATHER INPUT CONTEXT
@@ -3679,11 +3865,14 @@ DECISION RULES:
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
         
-        # Call LLM (use default temperature, can be overridden)
-        thinking_temperature = getattr(self, 'thinking_temperature', 0.3)
+        # Get hierarchical LLM config for _think function
+        llm_config = self._get_llm_config_for_function("_think")
+        thinking_temperature = llm_config.temperature
+        llm_client = self._get_llm_client_for_function("_think")
+        
         system_prompt = self._get_thinking_system_prompt()
-        logger.info(f"🧠 [{self.agent_name}]   → Model: {settings.get_llm_model()}")
-        logger.info(f"🧠 [{self.agent_name}]   → Provider: {settings.llm_provider.value}")
+        logger.info(f"🧠 [{self.agent_name}]   → Model: {llm_config.model}")
+        logger.info(f"🧠 [{self.agent_name}]   → Provider: {llm_config.provider}")
         logger.info(f"🧠 [{self.agent_name}]   → Temperature: {thinking_temperature}")
         logger.info(f"🧠 [{self.agent_name}]   → System prompt length: {len(system_prompt)} chars")
         logger.debug(f"🧠 [{self.agent_name}]   → System prompt:\n{system_prompt}")
@@ -3698,19 +3887,21 @@ DECISION RULES:
             logger.info(f"🧠 [{self.agent_name}] [STEP 4/5] Executing LLM call...")
             
             # Try to get token usage if available
-            if hasattr(self.llm_client, 'create_message_with_usage'):
+            if hasattr(llm_client, 'create_message_with_usage'):
                 logger.info(f"🧠 [{self.agent_name}]   → Using create_message_with_usage (token tracking enabled)")
-                response, tokens = self.llm_client.create_message_with_usage(
+                response, tokens = llm_client.create_message_with_usage(
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=thinking_temperature
+                    temperature=thinking_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
                 logger.info(f"🧠 [{self.agent_name}]   → Using create_message (no token tracking)")
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=thinking_temperature
+                    temperature=thinking_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
             
@@ -3734,14 +3925,15 @@ DECISION RULES:
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.think",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
                     temperature=thinking_temperature,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="_think",
                     error=None
                 )
             
@@ -3794,14 +3986,15 @@ DECISION RULES:
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.think",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=TokenUsage(),
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
                     temperature=thinking_temperature,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="_think",
                     error=str(e)
                 )
             
@@ -3869,20 +4062,29 @@ DECISION RULES:
                 value_str = value_str[:100] + "..."
             logger.info(f"🛠️  [{self.agent_name}]       • {key}: {value_str}")
         logger.debug(f"🛠️  [{self.agent_name}]   → Full inputs (debug):\n{json.dumps(tool_input, indent=4, default=str)}")
-        
+
+        # Filter out metadata fields that should not be passed to tool method
+        # These fields are for agent reasoning/logging but not actual tool parameters
+        metadata_fields = {'tool_name', 'action_description'}
+        clean_tool_input = {k: v for k, v in tool_input.items() if k not in metadata_fields}
+
+        if len(clean_tool_input) != len(tool_input):
+            filtered_keys = [k for k in tool_input.keys() if k in metadata_fields]
+            logger.info(f"🛠️  [{self.agent_name}]   → Filtered out metadata fields: {filtered_keys}")
+
         tool_method = self._tools[tool_name]
         start_time = time.time()
         logger.info(f"🛠️  [{self.agent_name}] Step 3: Calling tool method at {datetime.utcnow().isoformat()}...")
-        
+
         try:
             # Call tool (may be sync or async)
             import asyncio
             if asyncio.iscoroutinefunction(tool_method):
                 logger.info(f"🛠️  [{self.agent_name}]   → Tool is async, awaiting...")
-                result = await tool_method(**tool_input)
+                result = await tool_method(**clean_tool_input)
             else:
                 logger.info(f"🛠️  [{self.agent_name}]   → Tool is sync, calling directly...")
-                result = tool_method(**tool_input)
+                result = tool_method(**clean_tool_input)
             
             duration_seconds = time.time() - start_time
             logger.info(f"🛠️  [{self.agent_name}]   ✅ Tool executed in {duration_seconds:.3f}s")
@@ -4416,53 +4618,138 @@ DECISION RULES:
             # Fallback
             prompt = self._build_generic_prompt(response_data, exec_context, patient_context, tone, language, dialect)
         
+        # Log all inputs and built prompt
+        logger.info("=" * 80)
+        logger.info(f"💬 [{self.agent_name}] UNIFIED RESPONSE GENERATOR - INPUTS:")
+        logger.info("=" * 80)
+        inputs = {
+            "decision": decision.value,
+            "response_data": response_data.dict(exclude_none=True),
+            "session_id": session_id,
+            "language": language,
+            "dialect": dialect,
+            "tone": tone,
+            "patient_context": patient_context.get_prompt_context(),
+            "known_info": known_info,
+            "exec_context_summary": {
+                "iteration": exec_context.iteration,
+                "tool_calls": exec_context.tool_calls,
+                "llm_calls": exec_context.llm_calls,
+                "observations_count": len(exec_context.observations),
+                "criteria_count": len(exec_context.criteria),
+            }
+        }
+        logger.info(f"💬 [{self.agent_name}] Inputs JSON:\n{json.dumps(inputs, indent=2, default=str)}")
+        logger.info("=" * 80)
+        logger.info(f"💬 [{self.agent_name}] BUILT PROMPT:")
+        logger.info("=" * 80)
+        logger.info(f"💬 [{self.agent_name}] System Prompt:\n{prompt}")
+        logger.info("=" * 80)
+        
         # Generate response
         try:
             obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
             llm_start_time = time.time()
             
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            # Get hierarchical LLM config for _generate_focused_response function
+            # (This method serves as the focused response generator)
+            llm_config = self._get_llm_config_for_function("_generate_focused_response")
+            response_temperature = llm_config.temperature
+            llm_client = self._get_llm_client_for_function("_generate_focused_response")
+            
+            user_message = "Generate the response."
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=prompt,
-                    messages=[{"role": "user", "content": "Generate the response."}],
-                    temperature=0.5,
-                    max_tokens=300
+                    messages=[{"role": "user", "content": user_message}],
+                    temperature=response_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=prompt,
-                    messages=[{"role": "user", "content": "Generate the response."}],
-                    temperature=0.5,
-                    max_tokens=300
+                    messages=[{"role": "user", "content": user_message}],
+                    temperature=response_temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
             
             llm_duration_seconds = time.time() - llm_start_time
+            
+            # Log raw LLM response
+            logger.info("=" * 80)
+            logger.info(f"💬 [{self.agent_name}] RAW LLM RESPONSE:")
+            logger.info("=" * 80)
+            logger.info(f"💬 [{self.agent_name}] Response Content:\n{response}")
+            logger.info("=" * 80)
             
             # Record LLM call
             if obs_logger:
                 try:
                     obs_logger.record_llm_call(
                         component=f"agent.{self.agent_name}.generate_response",
-                        provider=settings.llm_provider.value,
-                        model=settings.get_llm_model(),
+                        provider=llm_config.provider,
+                        model=llm_config.model,
                         tokens=tokens,
                         duration_seconds=llm_duration_seconds,
                         system_prompt_length=len(prompt),
                         messages_count=1,
-                        temperature=0.5,
-                        max_tokens=300,
+                        temperature=response_temperature,
+                        max_tokens=llm_config.max_tokens,
+                        function_name="_generate_focused_response",
                         error=None
                     )
                 except Exception as obs_error:
                     logger.warning(f"🎯 [{self.agent_name}] Error in observability logging (non-critical): {obs_error}")
             
-            logger.info(f"🎯 [{self.agent_name}] Generated: {response}")
-            return response
+            # Clean response to remove any formatting, analysis, or extra content
+            cleaned_response = self._clean_response_text(response)
+            
+            logger.info(f"🎯 [{self.agent_name}] Generated: {cleaned_response}")
+            return cleaned_response
             
         except Exception as e:
             logger.error(f"🎯 [{self.agent_name}] Error generating response: {e}")
             return self._get_fallback_response(decision, response_data)
+    
+    def _clean_response_text(self, text: str) -> str:
+        """Clean response text to remove formatting, analysis, and extra content."""
+        import re
+        
+        # Remove markdown headers
+        text = re.sub(r'^#+\s+.*$', '', text, flags=re.MULTILINE)
+        
+        # Remove "Generated Response" or similar headers
+        text = re.sub(r'^.*Generated Response.*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
+        
+        # Remove sections like "**Arabic (UAE Dialect):**" and keep only the content after it
+        if "**Arabic" in text or "Arabic (UAE Dialect):" in text:
+            # Extract text after Arabic section marker
+            match = re.search(r'(?:Arabic.*?:|Arabic \(.*?\):)\s*\n\s*(.+?)(?:\n\s*---|\n\s*\*\*|$)', text, re.DOTALL | re.IGNORECASE)
+            if match:
+                text = match.group(1).strip()
+        
+        # Remove "English Translation:" section and everything after it
+        if "English Translation:" in text or "**English Translation:**" in text:
+            text = re.split(r'(?:English Translation|English translation):', text, flags=re.IGNORECASE)[0].strip()
+        
+        # Remove "Analysis:" section and everything after it
+        if "Analysis:" in text or "**Analysis:**" in text:
+            text = re.split(r'Analysis:', text, flags=re.IGNORECASE)[0].strip()
+        
+        # Remove markdown formatting (**, ---, etc.)
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # Remove bold
+        text = re.sub(r'^---+\s*$', '', text, flags=re.MULTILINE)  # Remove horizontal rules
+        text = re.sub(r'^✅\s*', '', text, flags=re.MULTILINE)  # Remove checkmarks
+        
+        # Remove quoted text markers
+        text = text.strip('"').strip("'")
+        
+        # Clean up extra whitespace
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)  # Multiple newlines to double
+        text = text.strip()
+        
+        return text
 
     def _build_collect_info_prompt(
         self,
@@ -4474,30 +4761,33 @@ DECISION RULES:
         dialect: Optional[str]
     ) -> str:
         """Build prompt for COLLECT_INFORMATION decision."""
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
+        
         return f"""Generate a {tone} question to collect missing information.
 
-═══════════════════════════════════════════════════════════════
-PATIENT CONTEXT
-═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT:
 {patient_context.get_prompt_context()}
 
 ⚠️  CRITICAL: If patient name is not available, DO NOT invent one!
 
-═══════════════════════════════════════════════════════════════
-WHAT WE ALREADY KNOW
-═══════════════════════════════════════════════════════════════
+WHAT WE ALREADY KNOW:
 {known_info}
 
-═══════════════════════════════════════════════════════════════
-WHAT WE NEED
-═══════════════════════════════════════════════════════════════
+WHAT WE NEED:
 {response_data.information_needed}
 
 SUGGESTED QUESTION:
 {response_data.information_question or f"Ask for {response_data.information_needed}"}
-
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
 
 RULES:
 - Ask ONLY for the missing information
@@ -4506,12 +4796,12 @@ RULES:
 - DO NOT promise any action
 - DO NOT invent patient names - use only what's in PATIENT CONTEXT
 - Keep it to 1-2 sentences
+- {lang_instruction}
 
-FORBIDDEN:
-- Inventing names (like "John", "Sarah", etc.) if not in patient context
-- "I'll check availability"
-- "I'll book that for you"  
-- Any promise of future action"""
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _build_clarify_prompt(
         self,
@@ -4523,36 +4813,45 @@ FORBIDDEN:
         dialect: Optional[str]
     ) -> str:
         """Build prompt for CLARIFY decision."""
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
+        
         return f"""Generate a {tone} question to clarify ambiguous input.
 
-═══════════════════════════════════════════════════════════════
-PATIENT CONTEXT
-═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT:
 {patient_context.get_prompt_context()}
 
 ⚠️  CRITICAL: If patient name is not available, DO NOT invent one!
 
-═══════════════════════════════════════════════════════════════
-WHAT WE ALREADY KNOW
-═══════════════════════════════════════════════════════════════
+WHAT WE ALREADY KNOW:
 {known_info}
 
-═══════════════════════════════════════════════════════════════
-WHAT'S UNCLEAR
-═══════════════════════════════════════════════════════════════
+WHAT'S UNCLEAR:
 {response_data.clarification_needed or "Something needs clarification"}
 
 SUGGESTED QUESTION:
 {response_data.clarification_question or "Could you please clarify?"}
 
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
-
 RULES:
 - Ask a clarifying question
 - Be conversational and natural
 - DO NOT invent patient names
-- Keep it to 1-2 sentences"""
+- Keep it to 1-2 sentences
+- {lang_instruction}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _build_options_prompt(
         self,
@@ -4565,6 +4864,18 @@ RULES:
     ) -> str:
         """Build prompt for RESPOND_WITH_OPTIONS decision."""
         options_formatted = "\n".join([f"  • {opt}" for opt in response_data.options])
+        
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
         
         return f"""Generate a {tone} response presenting options to the user.
 
@@ -4582,16 +4893,19 @@ WHY OPTIONS ARE NEEDED:
 OPTIONS TO PRESENT ({response_data.options_context}):
 {options_formatted}
 
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
-
 RULES:
 - Briefly explain why we're offering alternatives
 - Present the options clearly
 - Ask which they prefer
 - Keep it concise (2-4 sentences)
 - Don't apologize excessively
-- DO NOT invent patient names"""
+- DO NOT invent patient names
+- {lang_instruction}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _build_impossible_prompt(
         self,
@@ -4603,11 +4917,21 @@ RULES:
         dialect: Optional[str]
     ) -> str:
         """Build prompt for RESPOND_IMPOSSIBLE decision."""
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
+        
         return f"""Generate a {tone} response explaining why the request cannot be fulfilled.
 
-═══════════════════════════════════════════════════════════════
-PATIENT CONTEXT
-═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT:
 {patient_context.get_prompt_context()}
 
 WHAT WAS ATTEMPTED:
@@ -4619,16 +4943,19 @@ WHY IT'S NOT POSSIBLE:
 SUGGESTION FOR USER:
 {response_data.failure_suggestion or "No specific suggestion"}
 
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
-
 RULES:
 - Be empathetic but direct
 - Explain the issue clearly
 - Offer the suggestion if available
 - Don't over-apologize
 - Keep it to 2-3 sentences
-- DO NOT invent patient names"""
+- DO NOT invent patient names
+- {lang_instruction}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _build_completion_prompt(
         self,
@@ -4653,17 +4980,25 @@ RULES:
         else:
             address_instruction = "DO NOT use any name - patient name is not available"
         
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
+        
         return f"""Generate a {tone} response confirming what was accomplished.
 
-═══════════════════════════════════════════════════════════════
-PATIENT CONTEXT  
-═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT:
 {patient_context.get_prompt_context()}
 {address_instruction}
 
-═══════════════════════════════════════════════════════════════
-WHAT WAS DONE
-═══════════════════════════════════════════════════════════════
+WHAT WAS DONE:
 {response_data.completion_summary or "Task completed"}
 
 DETAILS:
@@ -4672,16 +5007,19 @@ DETAILS:
 EXECUTION LOG:
 {execution_summary}
 
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
-
 RULES:
 - Confirm the action was completed
 - Include key details (confirmation number, date, time, etc.)
 - Be warm but concise
 - No technical details or UUIDs
 - DO NOT invent patient names
-- 2-3 sentences"""
+- 2-3 sentences
+- {lang_instruction}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _build_confirmation_prompt(
         self,
@@ -4697,11 +5035,21 @@ RULES:
             f"  • {k}: {v}" for k, v in response_data.confirmation_details.items() if v
         ]) if response_data.confirmation_details else "No details"
         
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
+        
         return f"""Generate a {tone} response asking for confirmation before proceeding.
 
-═══════════════════════════════════════════════════════════════
-PATIENT CONTEXT
-═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT:
 {patient_context.get_prompt_context()}
 
 ACTION TO CONFIRM:
@@ -4713,15 +5061,18 @@ DETAILS:
 SUGGESTED QUESTION:
 {response_data.confirmation_question or "Should I proceed?"}
 
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
-
 RULES:
 - Summarize what you're about to do
 - Include all relevant details
 - Ask for explicit confirmation
 - Keep it clear and concise
-- DO NOT invent patient names"""
+- DO NOT invent patient names
+- {lang_instruction}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _build_generic_prompt(
         self,
@@ -4735,12 +5086,21 @@ RULES:
         """Fallback generic prompt builder."""
         execution_summary = self._build_execution_summary(exec_context)
         known_info = self._format_resolved_entities(response_data.resolved_entities)
+        lang_instruction = ""
+        if language == "ar":
+            # IMPORTANT: Always use Emirati Arabic for Arabic responses
+            dialect = dialect or "ae"  # Force Emirati if dialect is None
+            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
+            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
+            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in {language}."
         
         return f"""Generate a {tone} response.
 
-═══════════════════════════════════════════════════════════════
-PATIENT CONTEXT
-═══════════════════════════════════════════════════════════════
+PATIENT CONTEXT:
 {patient_context.get_prompt_context()}
 
 CONTEXT:
@@ -4749,13 +5109,13 @@ CONTEXT:
 EXECUTION LOG:
 {execution_summary}
 
-LANGUAGE: {language}
-DIALECT: {dialect or "standard"}
-
 RULES:
-- Be helpful and natural
-- DO NOT invent patient names
-- Keep it concise"""
+- {lang_instruction}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
 
     def _format_resolved_entities(self, entities: Dict[str, Any]) -> str:
         """Format resolved entities for prompts."""

@@ -2,12 +2,15 @@
 Configuration management for the dental clinic system.
 """
 
+import logging
 import os
 from typing import Optional, Literal, List
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
 from patient_ai_service.models.enums import LLMProvider, AnthropicModel, OpenAIModel
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -66,15 +69,36 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(None, alias="OPENAI_API_KEY")
 
     # LLM Configuration - Global Defaults
-    llm_provider: LLMProvider = Field(LLMProvider.ANTHROPIC, alias="LLM_PROVIDER")
+    # DEPRECATED: These fields are kept for backward compatibility only.
+    # LLM configuration now comes from config/llm_config.yaml
+    # These will be removed in a future version.
+    llm_provider: LLMProvider = Field(
+        LLMProvider.ANTHROPIC,
+        alias="LLM_PROVIDER",
+        description="DEPRECATED: Use config/llm_config.yaml instead"
+    )
     anthropic_model: AnthropicModel = Field(
         AnthropicModel.CLAUDE_SONNET_4_5,
-        alias="ANTHROPIC_MODEL"
+        alias="ANTHROPIC_MODEL",
+        description="DEPRECATED: Use config/llm_config.yaml instead"
     )
-    openai_model: OpenAIModel = Field(OpenAIModel.GPT_4O_MINI, alias="OPENAI_MODEL")
-    llm_max_tokens: int = 1000
-    llm_temperature: float = 0.7
-    llm_timeout: int = 30
+    openai_model: OpenAIModel = Field(
+        OpenAIModel.GPT_4O_MINI,
+        alias="OPENAI_MODEL",
+        description="DEPRECATED: Use config/llm_config.yaml instead"
+    )
+    llm_max_tokens: int = Field(
+        1000,
+        description="DEPRECATED: Use config/llm_config.yaml instead"
+    )
+    llm_temperature: float = Field(
+        0.7,
+        description="DEPRECATED: Use config/llm_config.yaml instead"
+    )
+    llm_timeout: int = Field(
+        30,
+        description="DEPRECATED: Use config/llm_config.yaml instead"
+    )
 
     # Component-Specific Model Overrides (optional, None = use global)
     reasoning_model_override: Optional[str] = Field(None, alias="REASONING_MODEL")
@@ -304,6 +328,52 @@ class Settings(BaseSettings):
         """
         temp_attr = f"{component}_temperature"
         return getattr(self, temp_attr, self.llm_temperature)
+    
+    def get_api_key_for_provider(self, provider: str) -> Optional[str]:
+        """
+        Get API key for a specific provider.
+        
+        Used by LLMConfigManager to retrieve API keys for different providers.
+        
+        Args:
+            provider: Provider name ('anthropic' or 'openai')
+        
+        Returns:
+            API key string or None if not set
+        """
+        if provider.lower() == "anthropic":
+            return self.anthropic_api_key
+        elif provider.lower() == "openai":
+            return self.openai_api_key
+        return None
+    
+    def validate_on_startup(self):
+        """
+        Validate configuration on startup and warn about deprecated settings.
+        
+        This method should be called during application startup to detect
+        deprecated environment variables and log warnings.
+        """
+        # Warn if old LLM_PROVIDER env var is set
+        if self.llm_provider:
+            logger.warning(
+                "⚠️  LLM_PROVIDER in .env is DEPRECATED. "
+                "Please use config/llm_config.yaml instead. "
+                "See patient-ai-v3/config/llm_config.yaml for configuration."
+            )
+        
+        # Warn about other deprecated LLM config vars (if they differ from defaults)
+        if hasattr(self, 'anthropic_model') and self.anthropic_model != AnthropicModel.CLAUDE_SONNET_4_5:
+            logger.warning(
+                "⚠️  ANTHROPIC_MODEL in .env is DEPRECATED. "
+                "Please use config/llm_config.yaml instead."
+            )
+        
+        if hasattr(self, 'openai_model') and self.openai_model != OpenAIModel.GPT_4O_MINI:
+            logger.warning(
+                "⚠️  OPENAI_MODEL in .env is DEPRECATED. "
+                "Please use config/llm_config.yaml instead."
+            )
 
 
 # Global settings instance

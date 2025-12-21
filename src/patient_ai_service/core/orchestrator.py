@@ -23,6 +23,7 @@ from patient_ai_service.core import (
     get_message_broker,
 )
 from patient_ai_service.core.config import settings
+from patient_ai_service.core.llm_config import get_llm_config_manager
 from patient_ai_service.core.reasoning import get_reasoning_engine, ReasoningEngine, ReasoningOutput
 from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
 from patient_ai_service.core.observability import get_observability_logger, clear_observability_logger
@@ -101,6 +102,7 @@ class Orchestrator:
         self.message_broker = get_message_broker()
         self.memory_manager = get_conversation_memory_manager()
         self.db_client = db_client or DbOpsClient()
+        self.llm_config_manager = get_llm_config_manager()
         
         # Unified Reasoning (replaces situation_assessor + reasoning_engine for routing)
         self.unified_reasoning = get_unified_reasoning()
@@ -237,7 +239,38 @@ Keep your response to 1-2 sentences maximum. Be warm and natural.{lang_instructi
 
 Your response:"""
 
+        # Log all inputs and built prompt
+        import json
+        logger.info("=" * 80)
+        logger.info(f"💬 [Fast Path] CONVERSATIONAL RESPONSE GENERATOR - INPUTS:")
+        logger.info("=" * 80)
+        inputs = {
+            "message": message,
+            "situation": situation.value,
+            "patient_name": patient_name,
+            "is_registered": is_registered,
+            "language": language,
+            "dialect": dialect,
+            "conversation_history": conversation_history,
+            "session_id": session_id
+        }
+        logger.info(f"💬 [Fast Path] Inputs JSON:\n{json.dumps(inputs, indent=2, default=str)}")
+        logger.info("=" * 80)
+        
+        system_prompt = "You are a warm, friendly dental clinic receptionist in the UAE. Be natural, concise, and culturally appropriate."
+        
+        logger.info(f"💬 [Fast Path] BUILT PROMPTS:")
+        logger.info("=" * 80)
+        logger.info(f"💬 [Fast Path] System Prompt:\n{system_prompt}")
+        logger.info("-" * 80)
+        logger.info(f"💬 [Fast Path] User Prompt:\n{prompt}")
+        logger.info("=" * 80)
+
         try:
+            # Get hierarchical LLM config for conversational_fast_path
+            llm_config = self.llm_config_manager.get_config(agent_name="conversational_fast_path")
+            llm_client = self.llm_config_manager.get_client(agent_name="conversational_fast_path")
+            
             # Get observability logger
             obs_logger = get_observability_logger(session_id) if session_id and settings.enable_observability else None
             
@@ -254,43 +287,66 @@ Your response:"""
             # Add current prompt as final user message
             messages.append({"role": "user", "content": prompt})
             
-            system_prompt = "You are a warm, friendly dental clinic receptionist in the UAE. Be natural, concise, and culturally appropriate."
-            
             # Make LLM call with token tracking
             llm_start_time = time.time()
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=system_prompt,
                     messages=messages,
-                    temperature=0.7,
-                    max_tokens=150
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=system_prompt,
                     messages=messages,
-                    temperature=0.7,
-                    max_tokens=150
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
             
             llm_duration_seconds = time.time() - llm_start_time
             
+            # Log raw LLM response
+            logger.info("=" * 80)
+            logger.info(f"💬 [Fast Path] RAW LLM RESPONSE:")
+            logger.info("=" * 80)
+            logger.info(f"💬 [Fast Path] Response Content:\n{response}")
+            logger.info("=" * 80)
+            
+            # Log LLM configuration used
+            logger.info(f"💬 [Fast Path] LLM Configuration:")
+            logger.info(f"💬 [Fast Path]   Provider: {llm_config.provider}")
+            logger.info(f"💬 [Fast Path]   Model: {llm_config.model}")
+            logger.info(f"💬 [Fast Path]   Temperature: {llm_config.temperature}")
+            logger.info(f"💬 [Fast Path]   Max Tokens: {llm_config.max_tokens}")
+            logger.info(f"💬 [Fast Path]   Tokens Used: {tokens.input_tokens}/{tokens.output_tokens} (total: {tokens.total_tokens})")
+            logger.info(f"💬 [Fast Path]   Duration: {llm_duration_seconds:.3f}s")
+            
             # Record LLM call for observability
             if obs_logger:
-                obs_logger.record_llm_call(
+                llm_call = obs_logger.record_llm_call(
                     component="conversational_fast_path",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=len(messages),
-                    temperature=0.7,
-                    max_tokens=150
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="conversational_response"
+                )
+                if llm_call and llm_call.cost and settings.cost_tracking_enabled:
+                    logger.info(f"💬 [Fast Path]   Cost: ${llm_call.cost.total_cost_usd:.6f} (Input: ${llm_call.cost.input_cost_usd:.6f}, Output: ${llm_call.cost.output_cost_usd:.6f})")
+                # Also record tokens in token tracker for component-level tracking
+                obs_logger.token_tracker.record_tokens(
+                    component="conversational_fast_path",
+                    input_tokens=tokens.input_tokens,
+                    output_tokens=tokens.output_tokens
                 )
             
-            logger.info(f"[Conversational] Generated response ({len(response)} chars) for {situation.value}, tokens: {tokens.total_tokens}")
+            logger.info(f"[Conversational] Generated response ({len(response)} chars) for {situation.value}, tokens: {tokens.input_tokens}/{tokens.output_tokens} (total: {tokens.total_tokens})")
             return response.strip(), tokens
             
         except Exception as e:
@@ -553,22 +609,47 @@ Your response:"""
                     step5_duration = (time.time() - step5_start) * 1000
                     logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
 
-                # Translate output if needed
-                if language_context.current_language != "en":
-                    english_response = await self._translate_output(
-                        session_id=session_id,
-                        text=english_response,
-                        target_language=language_context.current_language,
-                        target_dialect=language_context.current_dialect
+                # TRANSLATION OUTPUT DISABLED
+                # Fast path already generates response in target language via language instructions in prompt
+                # No translation needed - response is already in correct language
+                if obs_logger:
+                    obs_logger.record_pipeline_step(
+                        13, "translation_output", "translation",
+                        metadata={"status": "disabled", "reason": "fast_path_generates_in_target_language", "language": language_context.current_language}
                     )
 
                 # Add assistant message to memory
-                self.memory_manager.add_assistant_turn(
-                    session_id=session_id,
-                    content=english_response
-                )
+                with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                    self.memory_manager.add_assistant_turn(
+                        session_id=session_id,
+                        content=english_response
+                    )
 
                 total_duration = (time.time() - pipeline_start_time) * 1000
+                
+                # Log final response summary
+                pipeline_duration_seconds = time.time() - pipeline_start_time
+                logger.info("=" * 100)
+                logger.info("ORCHESTRATOR: process_message() COMPLETED (Fast Path)")
+                logger.info("=" * 100)
+                logger.info(f"Session ID: {session_id}")
+                logger.info(f"Final Response: {english_response[:200]}...")
+                logger.info(f"Route: fast_path")
+                logger.info(f"Situation: {unified_output.situation_type.value}")
+                logger.info(f"Total Pipeline Duration: {pipeline_duration_seconds:.3f}s")
+                logger.info(f"Tools Used: 0")
+                logger.info("=" * 100)
+                
+                # Log observability summary for fast path
+                if obs_logger:
+                    obs_logger.record_pipeline_step(
+                        15, "pipeline_complete", "orchestrator",
+                        metadata={"total_duration_seconds": pipeline_duration_seconds, "route": "fast_path"}
+                    )
+                    obs_logger.log_summary()
+                    
+                    # Reset observability logger for next request (preserves accumulative cost)
+                    clear_observability_logger(session_id)
 
                 return ChatResponse(
                     session_id=session_id,
@@ -598,7 +679,7 @@ Your response:"""
 
                 # Determine plan_action for agent context (map from unified plan_decision)
                 plan_action_map = {
-                    PlanDecision.NO_PLAN: PlanAction.CREATE_NEW,
+                    PlanDecision.NO_PLAN: PlanAction.NO_PLAN,
                     PlanDecision.CREATE_NEW: PlanAction.CREATE_NEW,
                     PlanDecision.RESUME: PlanAction.RESUME,
                     PlanDecision.ABANDON_CREATE: PlanAction.ABANDON_AND_CREATE,
@@ -970,6 +1051,7 @@ Your response:"""
             logger.info(f"Step 12 completed in {step12_duration:.2f}ms")
 
             # Step 13: Translation (output) - DISABLED
+            # TRANSLATION OUTPUT IS DISABLED - Agents generate responses directly in target language
             # The agent's _generate_focused_response already generates responses in the target language
             # based on context.get("current_language"). No additional translation needed.
             step13_start = time.time()
@@ -977,12 +1059,11 @@ Your response:"""
             logger.info("ORCHESTRATOR STEP 13: Translation (Output) - DISABLED")
             logger.info("-" * 100)
             with obs_logger.pipeline_step(13, "translation_output", "translation", {"status": "disabled", "language": language_context.current_language}) if obs_logger else nullcontext():
-                logger.info("Translation handled by agent's _generate_focused_response method")
-                logger.info("Agent generates response directly in target language based on context.current_language")
+                logger.info("TRANSLATION OUTPUT DISABLED - Using agent response as-is (already in target language)")
                 
                 # Use agent response as-is (already in target language)
                 translated_response = english_response
-                logger.info(f"Using agent response as-is (already in target language): {translated_response[:200]}...")
+                logger.info(f"Response already in target language ({language_context.current_language}): {translated_response[:200]}...")
             
             step13_duration = (time.time() - step13_start) * 1000
             logger.info(f"Step 13 completed in {step13_duration:.2f}ms (skipped translation)")

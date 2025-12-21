@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional
 
 from .base_agent import BaseAgent
 from patient_ai_service.models.enums import TriageLevel
+from patient_ai_service.models.agentic import ToolResultType
 from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
 
 logger = logging.getLogger(__name__)
@@ -45,20 +46,35 @@ class MedicalInquiryAgent(BaseAgent):
         self.register_tool(
             name="assess_triage",
             function=self.tool_assess_triage,
-            description="Assess the urgency level of a medical inquiry",
+            description="""Assess the urgency level of a patient's medical symptoms and determine appropriate triage level.
+
+This tool analyzes symptoms and pain levels to classify urgency as:
+- EMERGENCY: Severe bleeding, difficulty breathing, severe facial swelling, knocked out tooth, broken jaw
+- URGENT: Severe pain (8-10/10), swelling with fever, infection, pus, abscess
+- SOON: Moderate pain (5-7/10), persistent discomfort
+- ROUTINE: General questions, mild sensitivity
+
+The tool returns:
+- SUCCESS: Triage level assessed with recommendation for next steps
+- SYSTEM_ERROR: Assessment failed, should retry
+
+Use this tool when patient describes symptoms or mentions pain to properly prioritize their care needs.""",
             parameters={
                 "symptoms": {
                     "type": "array",
-                    "description": "List of symptoms mentioned",
-                    "items": {"type": "string"}
+                    "description": "REQUIRED: List of symptoms mentioned by the patient (e.g., ['bleeding', 'swelling', 'pain']). Extract from patient's exact words.",
+                    "items": {"type": "string"},
+                    "required": True
                 },
                 "pain_level": {
                     "type": "integer",
-                    "description": "Pain level 0-10 if mentioned"
+                    "description": "Optional: Pain level on scale of 0-10 if patient mentioned it. 0 = no pain, 10 = worst pain imaginable.",
+                    "required": False
                 },
                 "duration": {
                     "type": "string",
-                    "description": "How long symptoms have persisted"
+                    "description": "Optional: How long symptoms have persisted (e.g., '2 days', 'since yesterday', '1 week'). Use patient's exact wording.",
+                    "required": False
                 }
             }
         )
@@ -67,15 +83,29 @@ class MedicalInquiryAgent(BaseAgent):
         self.register_tool(
             name="recommend_appointment",
             function=self.tool_recommend_appointment,
-            description="Recommend booking an appointment based on urgency",
+            description="""Recommend booking an appointment based on assessed urgency level.
+
+Use this tool AFTER assess_triage to provide specific appointment scheduling recommendations:
+- emergency: Direct to 911 or ER immediately
+- urgent: Same-day appointment needed
+- soon: Schedule within 1-2 days
+- routine: Regular appointment scheduling
+
+The tool returns:
+- SUCCESS: Recommendation message with next steps
+- SYSTEM_ERROR: Failed to generate recommendation, should retry
+
+This tool helps transition patient from triage assessment to appointment booking.""",
             parameters={
                 "urgency": {
                     "type": "string",
-                    "description": "Urgency level: routine, soon, urgent, emergency"
+                    "description": "REQUIRED: Urgency level from assess_triage result. Valid values: 'emergency', 'urgent', 'soon', 'routine'",
+                    "required": True
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Reason for appointment"
+                    "description": "REQUIRED: Brief reason for appointment based on patient's symptoms/inquiry. Use patient's own words when possible.",
+                    "required": True
                 }
             }
         )
@@ -84,23 +114,42 @@ class MedicalInquiryAgent(BaseAgent):
         self.register_tool(
             name="log_inquiry",
             function=self.tool_log_inquiry,
-            description="Log the medical inquiry for staff review",
+            description="""Log a medical inquiry to the database for dental team review.
+
+CRITICAL: This tool MUST be called whenever a patient asks a medical question that you cannot answer.
+You are NOT qualified to provide medical advice, so ANY medical question must be logged.
+
+Examples of questions to log:
+- "What toothpaste should I use after my root canal?"
+- "Which medication is better for pain?"
+- "Is this symptom normal?"
+- "Can I eat after the procedure?"
+
+The tool returns:
+- SUCCESS: Inquiry logged successfully with inquiry_id
+- SYSTEM_ERROR: Failed to log, should retry
+
+After logging, inform the patient honestly that their question was documented for review.""",
             parameters={
                 "patient_id": {
                     "type": "string",
-                    "description": "Patient ID"
+                    "description": "REQUIRED: Patient's ID from PATIENT INFORMATION section",
+                    "required": True
                 },
                 "inquiry_type": {
                     "type": "string",
-                    "description": "Type: preventive_tip, side_effect, or general"
+                    "description": "REQUIRED: Type of inquiry. Valid values: 'preventive_tip' (health tips), 'side_effect' (medication/procedure side effects), 'general' (general medical questions), 'medication' (medication questions)",
+                    "required": True
                 },
                 "content": {
                     "type": "string",
-                    "description": "Inquiry details"
+                    "description": "REQUIRED: The patient's medical question/inquiry in their own words. Be specific and capture the full context.",
+                    "required": True
                 },
                 "priority": {
                     "type": "string",
-                    "description": "Priority level"
+                    "description": "REQUIRED: Priority level. Valid values: 'routine' (general questions), 'low', 'medium', 'high' (urgent medical concerns), 'urgent', 'critical'",
+                    "required": True
                 }
             }
         )
@@ -235,15 +284,23 @@ Remember: Your job is to LOG medical questions, NOT to ANSWER them."""
 
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "triage_level": triage,
                 "recommendation": recommendation,
                 "symptoms": symptoms,
-                "pain_level": pain_level
+                "pain_level": pain_level,
+                "suggested_response": f"Based on your symptoms, I've assessed this as {triage.lower()} priority. {recommendation}"
             }
 
         except Exception as e:
-            logger.error(f"Error in triage assessment: {e}")
-            return {"error": str(e)}
+            logger.error(f"Error in triage assessment: {e}", exc_info=True)
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True,
+                "suggested_response": "I'm having trouble assessing the urgency. Let me try again..."
+            }
 
     def tool_recommend_appointment(
         self,
@@ -264,14 +321,22 @@ Remember: Your job is to LOG medical questions, NOT to ANSWER them."""
 
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "urgency": urgency,
                 "message": message,
-                "next_step": "offer_booking"
+                "next_step": "offer_booking",
+                "suggested_response": message
             }
 
         except Exception as e:
-            logger.error(f"Error recommending appointment: {e}")
-            return {"error": str(e)}
+            logger.error(f"Error recommending appointment: {e}", exc_info=True)
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True,
+                "suggested_response": "I'm having trouble processing your request. Let me try again..."
+            }
 
     def tool_log_inquiry(
         self,
@@ -292,7 +357,7 @@ Remember: Your job is to LOG medical questions, NOT to ANSWER them."""
                 "appointment": "APPOINTMENT_QUERY",
                 "billing": "BILLING_QUERY"
             }
-            
+
             # Map priority to database enum values
             priority_mapping = {
                 "routine": "LOW",
@@ -302,11 +367,11 @@ Remember: Your job is to LOG medical questions, NOT to ANSWER them."""
                 "urgent": "HIGH",
                 "critical": "HIGH"
             }
-            
+
             # Get mapped values with defaults
             mapped_type = type_mapping.get(inquiry_type.lower(), "GENERAL_MEDICAL_QUESTION")
             mapped_priority = priority_mapping.get(priority.lower(), "LOW")
-            
+
             # Use the inquiries API with correct field names
             inquiry_data = {
                 "patientId": patient_id,
@@ -326,12 +391,26 @@ Remember: Your job is to LOG medical questions, NOT to ANSWER them."""
 
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "inquiry_id": result.get("id"),
-                    "message": "Inquiry logged for dentist review"
+                    "message": "Inquiry logged for dentist review",
+                    "suggested_response": "I've logged your question for our dental team to review. Would you like me to help schedule an appointment to discuss this with a dentist?"
                 }
             else:
-                return {"error": "Failed to log inquiry"}
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "Failed to log inquiry",
+                    "should_retry": True,
+                    "suggested_response": "I'm having trouble logging your question. Let me try again..."
+                }
 
         except Exception as e:
-            logger.error(f"Error logging inquiry: {e}")
-            return {"error": str(e)}
+            logger.error(f"Error logging inquiry: {e}", exc_info=True)
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "should_retry": True,
+                "suggested_response": "I'm having trouble logging your question. Let me try again..."
+            }

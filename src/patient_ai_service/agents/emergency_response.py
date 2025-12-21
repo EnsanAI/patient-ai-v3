@@ -9,6 +9,7 @@ import logging
 from typing import Dict, Any, Optional, List
 
 from .base_agent import BaseAgent
+from patient_ai_service.models.agentic import ToolResultType
 from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,10 @@ class EmergencyResponseAgent(BaseAgent):
         super().__init__(agent_name="EmergencyResponse", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
+    def _get_agent_instructions(self) -> str:
+        """Emergency response-specific behavioral instructions."""
+        return """CRITICAL: Patient safety is the absolute priority. Provide first aid instructions immediately, stay calm, and guide patient through emergency steps. Log emergency after providing immediate assistance."""
+
     def _register_tools(self) -> None:
         """Register emergency response tools."""
         self._register_report_emergency_tool()
@@ -109,23 +114,44 @@ class EmergencyResponseAgent(BaseAgent):
         self.register_tool(
             name="report_emergency",
             function=self.tool_report_emergency,
-            description="Report and log a dental emergency",
+            description="""Report and log a dental emergency to the clinic's emergency response system.
+
+This tool creates an official emergency record in the database that:
+- Notifies clinic staff immediately
+- Creates emergency ID for tracking
+- Logs patient information and emergency details
+- Updates emergency state for the session
+
+WHEN TO USE:
+- After providing first aid instructions
+- After assessing emergency severity
+- For ANY dental emergency situation (bleeding, knocked out tooth, severe pain, trauma)
+
+The tool returns:
+- SUCCESS: Emergency logged with emergency_id, staff notified
+- SYSTEM_ERROR: Failed to log, should retry (but continue with first aid guidance)
+
+IMPORTANT: Patient safety comes first. Even if logging fails, continue providing emergency guidance.""",
             parameters={
                 "patient_id": {
                     "type": "string",
-                    "description": "Patient ID"
+                    "description": "REQUIRED: Patient's ID from PATIENT INFORMATION section. If patient not registered, use session_id or temporary ID.",
+                    "required": True
                 },
                 "emergency_type": {
                     "type": "string",
-                    "description": "Type of emergency"
+                    "description": "REQUIRED: Type of emergency. Valid values: 'bleeding', 'knocked_out_tooth', 'broken_tooth', 'severe_pain', 'facial_trauma', 'broken_jaw', 'lost_filling', 'abscess', 'difficulty_breathing', 'severe_facial_swelling'. Use the most specific type available.",
+                    "required": True
                 },
                 "description": {
                     "type": "string",
-                    "description": "Emergency description"
+                    "description": "REQUIRED: Detailed description of the emergency in patient's own words. Include: what happened, when it happened, current symptoms, pain level if mentioned. Be comprehensive.",
+                    "required": True
                 },
                 "severity": {
                     "type": "string",
-                    "description": "Severity: critical, high, moderate"
+                    "description": "REQUIRED: Severity level. Valid values: 'critical' (life-threatening, needs 911), 'high' (urgent, needs immediate clinic care), 'moderate' (serious but stable). Match to triage assessment.",
+                    "required": True
                 }
             }
         )
@@ -135,11 +161,30 @@ class EmergencyResponseAgent(BaseAgent):
         self.register_tool(
             name="provide_first_aid_instructions",
             function=self.tool_first_aid,
-            description="Provide immediate first aid instructions",
+            description="""Provide immediate, step-by-step first aid instructions for a specific dental emergency.
+
+This tool provides emergency-specific guidance for:
+- bleeding: Pressure, gauze application, when to seek help
+- knocked_out_tooth: How to handle tooth, storage method (milk), time-critical care (1 hour)
+- broken_tooth: Rinsing, saving pieces, cold compress, avoid using tooth
+- severe_pain: Cold compress, OTC pain relief, what NOT to do
+
+CRITICAL WORKFLOW:
+1. Call this tool FIRST when emergency is identified
+2. Present instructions clearly to patient
+3. Then call report_emergency to log the incident
+4. Then call get_emergency_contacts if needed
+
+The tool returns:
+- SUCCESS: Step-by-step instructions formatted and ready to share
+- SYSTEM_ERROR: Failed to retrieve instructions (provide general emergency guidance)
+
+PRIORITY: Patient safety is paramount. Instructions must be clear, calm, and actionable.""",
             parameters={
                 "emergency_type": {
                     "type": "string",
-                    "description": "Type of emergency"
+                    "description": "REQUIRED: Type of emergency needing first aid. Valid values: 'bleeding', 'knocked_out_tooth', 'broken_tooth', 'severe_pain', 'abscess', 'lost_filling', 'facial_trauma'. Use exact match for specific instructions.",
+                    "required": True
                 }
             }
         )
@@ -149,7 +194,24 @@ class EmergencyResponseAgent(BaseAgent):
         self.register_tool(
             name="get_emergency_contacts",
             function=self.tool_emergency_contacts,
-            description="Get emergency contact information",
+            description="""Retrieve emergency contact information including 911, clinic emergency line, and poison control.
+
+This tool provides formatted emergency contact numbers:
+- 911: For life-threatening emergencies (severe bleeding, difficulty breathing, unconsciousness)
+- Clinic Emergency Line: 24/7 dental emergency hotline for knocked out teeth, severe pain, trauma
+- Poison Control: For medication or chemical exposure emergencies
+
+WHEN TO USE:
+- After providing first aid instructions
+- When patient needs immediate care contact
+- For critical/high severity emergencies
+- When directing patient to appropriate emergency service
+
+The tool returns:
+- SUCCESS: Formatted list of emergency contacts with context
+- SYSTEM_ERROR: Failed to retrieve (provide 911 as fallback)
+
+The tool requires no parameters and always returns current emergency contact information.""",
             parameters={}
         )
 
@@ -320,14 +382,29 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             if result:
                 return {
                     "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
                     "emergency_id": result.get("id"),
-                    "message": "Emergency reported and logged"
+                    "message": "Emergency reported and logged",
+                    "suggested_response": f"I've reported your {emergency_type} emergency to our clinic. Emergency ID: {result.get('id')}. Please follow the first aid instructions I provided."
                 }
-            return {"error": "Failed to log emergency"}
+
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": "Failed to log emergency",
+                "should_retry": True,
+                "suggested_response": "I'm having trouble logging the emergency. Let me try again while you follow the first aid instructions..."
+            }
 
         except Exception as e:
             logger.error(f"Error reporting emergency for patient {patient_id}: {e}", exc_info=True)
-            return {"error": f"Failed to report emergency: {str(e)}"}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": f"Failed to report emergency: {str(e)}",
+                "should_retry": True,
+                "suggested_response": "I'm having trouble logging the emergency, but please follow the first aid instructions I provided. Your safety is the priority."
+            }
 
     def _get_clinic_id(self) -> str:
         """
@@ -410,10 +487,15 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
 
             self._update_first_aid_state(session_id, instructions)
 
+            # Format instructions as numbered list for suggested response
+            formatted_instructions = "\n".join([f"{i+1}. {instr}" for i, instr in enumerate(instructions)])
+
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "emergency_type": emergency_type,
-                "instructions": instructions
+                "instructions": instructions,
+                "suggested_response": f"Here's what to do right now:\n\n{formatted_instructions}\n\nPlease follow these steps carefully. Are you able to do this?"
             }
 
         except Exception as e:
@@ -421,7 +503,13 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
                 f"Error providing first aid for {emergency_type}: {e}",
                 exc_info=True
             )
-            return {"error": f"Failed to provide first aid instructions: {str(e)}"}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": f"Failed to provide first aid instructions: {str(e)}",
+                "should_retry": True,
+                "suggested_response": "I'm having trouble retrieving first aid instructions. The most important thing is to stay calm. Can you describe your emergency again?"
+            }
 
     def _normalize_emergency_type(self, emergency_type: str) -> str:
         """
@@ -479,12 +567,26 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             Dictionary with success status, contacts dictionary, and message.
         """
         try:
+            # Format contacts for suggested response
+            contacts_formatted = "\n".join([
+                f"• {name}: {number}"
+                for name, number in self.EMERGENCY_CONTACTS.items()
+            ])
+
             return {
                 "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
                 "contacts": self.EMERGENCY_CONTACTS,
-                "message": "For life-threatening emergencies, call 911 immediately"
+                "message": "For life-threatening emergencies, call 911 immediately",
+                "suggested_response": f"Here are the emergency contacts:\n\n{contacts_formatted}\n\n⚠️ For life-threatening emergencies, call 911 immediately."
             }
 
         except Exception as e:
             logger.error(f"Error getting emergency contacts: {e}", exc_info=True)
-            return {"error": f"Failed to retrieve emergency contacts: {str(e)}"}
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": f"Failed to retrieve emergency contacts: {str(e)}",
+                "should_retry": True,
+                "suggested_response": "I'm having trouble retrieving emergency contacts. For life-threatening emergencies, please call 911 immediately."
+            }

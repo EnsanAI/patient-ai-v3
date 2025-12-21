@@ -261,8 +261,10 @@ class OpenAIClient(LLMClient):
     """OpenAI GPT client implementation."""
 
     def __init__(self, api_key: str, model: str):
-        openai.api_key = api_key
-        self.client = openai.OpenAI(api_key=api_key)
+        # Initialize OpenAI client with httpx client to avoid compatibility issues
+        import httpx
+        http_client = httpx.Client(timeout=30.0)
+        self.client = openai.OpenAI(api_key=api_key, http_client=http_client)
         self.model = model
         logger.info(f"Initialized OpenAI client with model: {model}")
 

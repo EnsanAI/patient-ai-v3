@@ -11,6 +11,7 @@ from .base_agent import BaseAgent
 from patient_ai_service.models.enums import Language
 from patient_ai_service.core.config import settings
 from patient_ai_service.core.script_detector import fast_detect_language
+from patient_ai_service.core.llm_config import get_llm_config_manager
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class TranslationAgent(BaseAgent):
 
     def __init__(self, **kwargs):
         super().__init__(agent_name="Translation", **kwargs)
+        self.llm_config_manager = get_llm_config_manager()
 
     def _register_tools(self):
         """Translation agent uses LLM directly, no additional tools needed."""
@@ -90,10 +92,21 @@ Text: "{text}"
 
 Language code:"""
 
-            response = self.llm_client.create_message(
+            # Get hierarchical config for detect_language function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="detect_language"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="detect_language"
+            )
+
+            response = llm_client.create_message(
                 system=self._get_system_prompt("detection"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=settings.translation_temperature
+                temperature=llm_config.temperature,
+                max_tokens=llm_config.max_tokens
             )
 
             # Extract language code
@@ -161,38 +174,52 @@ Text: "{text}"
 
 Tasks:
 1. Detect the language (ISO 639-1 code: en, ar, es, fr, hi, zh, pt, ru)
-2. Detect the regional dialect if identifiable (e.g., EG for Egyptian Arabic, SA for Gulf Arabic, MX for Mexican Spanish)
+2. Detect the regional dialect ONLY for non-English languages (e.g., EG for Egyptian Arabic, SA for Gulf Arabic, MX for Mexican Spanish)
 3. If NOT English, translate to English while preserving medical/dental terminology
+
+IMPORTANT: For English text, always set dialect to null.
 
 Respond with ONLY a JSON object:
 {{
     "language": "ISO 639-1 code",
-    "dialect": "region code or null",
+    "dialect": "region code or null (ALWAYS null for English)",
     "is_english": true/false,
     "english_text": "the English translation OR original text if already English",
     "confidence": "high/medium/low"
 }}
 
 Examples:
-- "I want to book an appointment" → {{"language": "en", "dialect": "US", "is_english": true, "english_text": "I want to book an appointment", "confidence": "high"}}
+- "I want to book an appointment" → {{"language": "en", "dialect": null, "is_english": true, "english_text": "I want to book an appointment", "confidence": "high"}}
 - "عايز احجز ميعاد" → {{"language": "ar", "dialect": "EG", "is_english": false, "english_text": "I want to book an appointment", "confidence": "high"}}
 - "Quiero reservar una cita" → {{"language": "es", "dialect": "MX", "is_english": false, "english_text": "I want to book an appointment", "confidence": "high"}}
 
 Response:"""
 
+            # Get hierarchical config for detect_and_translate function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="detect_and_translate"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="detect_and_translate"
+            )
+            
             # Track LLM call with token usage
             llm_start_time = time.time()
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=self._get_system_prompt("detection_and_translation"),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=settings.translation_temperature
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=self._get_system_prompt("detection_and_translation"),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=settings.translation_temperature
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
@@ -204,14 +231,15 @@ Response:"""
                 if obs_logger:
                     obs_logger.record_llm_call(
                         component="translation.detect_and_translate",
-                        provider=settings.llm_provider.value,
-                        model=settings.get_llm_model(),
+                        provider=llm_config.provider,
+                        model=llm_config.model,
                         tokens=tokens,
                         duration_seconds=llm_duration_seconds,
                         system_prompt_length=len(self._get_system_prompt("detection_and_translation")),
                         messages_count=1,
-                        temperature=settings.translation_temperature,
-                        max_tokens=settings.llm_max_tokens
+                        temperature=llm_config.temperature,
+                        max_tokens=llm_config.max_tokens,
+                        function_name="detect_and_translate"
                     )
 
             # Parse JSON response
@@ -233,6 +261,10 @@ Response:"""
                 language = "en"
                 dialect = None
                 english_text = text
+
+            # IMPORTANT: Ensure dialect is None for English
+            if language == "en":
+                dialect = None
 
             # Validate we got a translation if needed
             if not is_english and (not english_text or english_text.strip() == ""):
@@ -270,29 +302,38 @@ Response:"""
         from patient_ai_service.core.observability import get_observability_logger
         from patient_ai_service.models.observability import TokenUsage
         
-        prompt = f"""Translate this Arabic text to English.
-Preserve meaning and any dental/medical terminology.
-
-Arabic text: "{text}"
+        prompt = f"""Arabic Text: "{text}"
 
 English translation:"""
 
         try:
+            # Get hierarchical config for translate_text function (closest match)
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="translate_text"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="translate_text"
+            )
+            
             llm_start_time = time.time()
             
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
-                    system="You are a professional Arabic to English translator for a dental clinic. Translate accurately and naturally.",
+            system_prompt = "You are an Arabic to English translator for a clinic. Translate naturally. Handle slang/colloquialisms with English equivalents (NEVER translate them literally). Preserve medical terms. Output: 'English translation: [text]' only."
+            
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
+                    system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=500
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
-                    system="You are a professional Arabic to English translator for a dental clinic. Translate accurately and naturally.",
+                response = llm_client.create_message(
+                    system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=500
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
             
@@ -304,17 +345,66 @@ English translation:"""
                 if obs_logger:
                     obs_logger.record_llm_call(
                         component="translation.arabic_to_english_fast",
-                        provider=settings.llm_provider.value,
-                        model=settings.get_llm_model(),
+                        provider=llm_config.provider,
+                        model=llm_config.model,
                         tokens=tokens,
                         duration_seconds=llm_duration_seconds,
-                        system_prompt_length=100,
+                        system_prompt_length=len(system_prompt),
                         messages_count=1,
-                        temperature=0.3,
-                        max_tokens=500
+                        temperature=llm_config.temperature,
+                        max_tokens=llm_config.max_tokens,
+                        function_name="arabic_to_english_fast"
                     )
             
-            return response.strip()
+            # Clean up response - extract only the translation text
+            translation = response.strip()
+            
+            # Extract text after "English translation:" marker
+            if "English translation:" in translation:
+                parts = translation.split("English translation:", 1)
+                if len(parts) > 1:
+                    translation = parts[1].strip()
+            
+            # Remove markdown code blocks
+            if translation.startswith("```"):
+                lines = translation.split("\n")
+                in_code = False
+                cleaned = []
+                for line in lines:
+                    if line.strip().startswith("```"):
+                        in_code = not in_code
+                        continue
+                    if not in_code:
+                        cleaned.append(line)
+                translation = "\n".join(cleaned).strip()
+            
+            # Extract quoted text if present (common LLM format: "translation text")
+            import re
+            quoted_match = re.search(r'"([^"]+)"', translation)
+            if quoted_match:
+                translation = quoted_match.group(1)
+            else:
+                # Remove headers, notes, horizontal rules, and stop at notes
+                lines = translation.split("\n")
+                cleaned_lines = []
+                for line in lines:
+                    line_stripped = line.strip()
+                    # Stop at notes
+                    if line_stripped.startswith("**Note:**") or line_stripped.startswith("Note:") or line_stripped.startswith("*Note:"):
+                        break
+                    # Skip headers and separators
+                    if line_stripped.startswith("#") or line_stripped == "---" or line_stripped == "":
+                        continue
+                    # Skip lines that are just formatting
+                    if line_stripped.lower().startswith("english translation"):
+                        continue
+                    cleaned_lines.append(line)
+                translation = "\n".join(cleaned_lines).strip()
+            
+            # Final cleanup: remove any remaining quotes or extra whitespace
+            translation = translation.strip('"').strip("'").strip()
+            
+            return translation
             
         except Exception as e:
             logger.error(f"Error in Arabic translation: {e}")
@@ -354,10 +444,21 @@ Examples:
 
 Response:"""
 
-            response = self.llm_client.create_message(
+            # Get hierarchical config for detect_language_and_dialect function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="detect_language_and_dialect"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="detect_language_and_dialect"
+            )
+
+            response = llm_client.create_message(
                 system=self._get_system_prompt("detection"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=settings.translation_temperature
+                temperature=llm_config.temperature,
+                max_tokens=llm_config.max_tokens
             )
 
             # Parse JSON response - extract from markdown if needed
@@ -415,10 +516,21 @@ Text: "{text}"
 
 Translation:"""
 
-            response = self.llm_client.create_message(
+            # Get hierarchical config for translate_to_english function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="translate_to_english"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="translate_to_english"
+            )
+
+            response = llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=settings.translation_temperature
+                temperature=llm_config.temperature,
+                max_tokens=llm_config.max_tokens
             )
 
             translated = response.strip()
@@ -466,10 +578,21 @@ Text: "{text}"
 
 Translation:"""
 
-            response = self.llm_client.create_message(
+            # Get hierarchical config for translate_to_english_with_dialect function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="translate_to_english_with_dialect"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="translate_to_english_with_dialect"
+            )
+
+            response = llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=settings.translation_temperature
+                temperature=llm_config.temperature,
+                max_tokens=llm_config.max_tokens
             )
 
             translated = response.strip()
@@ -506,10 +629,21 @@ Text: "{text}"
 
 Translation:"""
 
-            response = self.llm_client.create_message(
+            # Get hierarchical config for translate_from_english function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="translate_from_english"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="translate_from_english"
+            )
+
+            response = llm_client.create_message(
                 system=self._get_system_prompt("translation"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=settings.translation_temperature
+                temperature=llm_config.temperature,
+                max_tokens=llm_config.max_tokens
             )
 
             translated = response.strip()
@@ -564,19 +698,31 @@ Text: "{text}"
 
 Translation:"""
 
+            # Get hierarchical config for translate_text function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="translation",
+                function_name="translate_text"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="translation",
+                function_name="translate_text"
+            )
+            
             # Track LLM call with token usage
             llm_start_time = time.time()
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
                     system=self._get_system_prompt("translation"),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=settings.translation_temperature
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                response = self.llm_client.create_message(
+                response = llm_client.create_message(
                     system=self._get_system_prompt("translation"),
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=settings.translation_temperature
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
@@ -588,14 +734,15 @@ Translation:"""
                 if obs_logger:
                     obs_logger.record_llm_call(
                         component="translation.translate_from_english",
-                        provider=settings.llm_provider.value,
-                        model=settings.get_llm_model(),
+                        provider=llm_config.provider,
+                        model=llm_config.model,
                         tokens=tokens,
                         duration_seconds=llm_duration_seconds,
                         system_prompt_length=len(self._get_system_prompt("translation")),
                         messages_count=1,
-                        temperature=settings.translation_temperature,
-                        max_tokens=settings.llm_max_tokens
+                        temperature=llm_config.temperature,
+                        max_tokens=llm_config.max_tokens,
+                        function_name="translate_from_english_with_dialect"
                     )
 
             translated = response.strip()
@@ -677,6 +824,11 @@ Translation:"""
         target_dialect = global_state.language_context.current_dialect
 
         if target_lang != "en":
+            # IMPORTANT: Force Emirati Arabic (ae) dialect for all Arabic responses
+            if target_lang == "ar":
+                target_dialect = "ae"
+                logger.info(f"[Translation] Forcing Emirati Arabic dialect (ae) for Arabic response")
+
             # Use dialect-aware translation
             translated = await self.translate_from_english_with_dialect(
                 message,

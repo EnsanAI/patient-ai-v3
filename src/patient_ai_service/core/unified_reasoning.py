@@ -11,6 +11,7 @@ import time
 from typing import Optional, Dict, Any, List
 
 from patient_ai_service.core.llm import LLMClient, get_llm_client
+from patient_ai_service.core.llm_config import get_llm_config_manager
 from patient_ai_service.core.config import settings
 from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.models.unified_reasoning import (
@@ -45,6 +46,7 @@ class UnifiedReasoning:
 
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client or get_llm_client()
+        self.llm_config_manager = get_llm_config_manager()
         logger.info("UnifiedReasoning initialized")
 
     async def reason(
@@ -103,33 +105,43 @@ class UnifiedReasoning:
         )
 
         # Log the built prompt
+        system_prompt = self._get_system_prompt()
         logger.info("=" * 80)
-        logger.info("[UnifiedReasoning] BUILT PROMPT:")
+        logger.info("☘️ [UnifiedReasoning] BUILT PROMPT:")
         logger.info("=" * 80)
-        logger.info(f"[UnifiedReasoning] System Prompt:\n{self._get_system_prompt()}")
+        logger.info(f"☘️ [UnifiedReasoning] System Prompt:\n{system_prompt}")
         logger.info("-" * 80)
-        logger.info(f"[UnifiedReasoning] User Prompt:\n{prompt}")
+        logger.info(f"☘️ [UnifiedReasoning] User Prompt:\n{prompt}")
         logger.info("=" * 80)
 
         try:
+            # Get hierarchical LLM config for reason function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="unified_reasoning",
+                function_name="reason"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="unified_reasoning",
+                function_name="reason"
+            )
+            
             # Make LLM call with token tracking
             llm_start_time = time.time()
-            system_prompt = self._get_system_prompt()
             
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                response_text, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response_text, tokens = llm_client.create_message_with_usage(
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=600
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
                 # Fallback if method doesn't exist - use create_message
-                response_text = self.llm_client.create_message(
+                response_text = llm_client.create_message(
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=600
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
@@ -137,23 +149,30 @@ class UnifiedReasoning:
 
             # Log the raw LLM response
             logger.info("=" * 80)
-            logger.info("[UnifiedReasoning] RAW LLM RESPONSE:")
+            logger.info("☘️ [UnifiedReasoning] RAW LLM RESPONSE:")
             logger.info("=" * 80)
-            logger.info(f"[UnifiedReasoning] Response Content:\n{response_text}")
+            logger.info(f"☘️ [UnifiedReasoning] Response Content:\n{response_text}")
             logger.info("=" * 80)
 
             # Record LLM call in observability
             if obs_logger:
                 obs_logger.record_llm_call(
                     component="unified_reasoning",
-                    provider=settings.llm_provider.value,
-                    model=settings.get_llm_model(),
+                    provider=llm_config.provider,
+                    model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
                     system_prompt_length=len(system_prompt),
                     messages_count=1,
-                    temperature=0.1,
-                    max_tokens=600
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="reason"
+                )
+                # Also record tokens in token tracker for component-level tracking
+                obs_logger.token_tracker.record_tokens(
+                    component="unified_reasoning",
+                    input_tokens=tokens.input_tokens,
+                    output_tokens=tokens.output_tokens
                 )
 
             # Parse response
@@ -161,6 +180,7 @@ class UnifiedReasoning:
 
             duration_ms = (time.time() - start_time) * 1000
             logger.info(f"[UnifiedReasoning] Completed in {duration_ms:.0f}ms")
+            logger.info(f"[UnifiedReasoning] Tokens: {tokens.input_tokens}/{tokens.output_tokens} (total: {tokens.total_tokens})")
             logger.info(f"[UnifiedReasoning] Route: {output.route_type.value}")
             logger.info(f"[UnifiedReasoning] Situation: {output.situation_type.value}")
             if output.agent:
@@ -192,19 +212,20 @@ class UnifiedReasoning:
 SITUATION TYPES
 ═══════════════════════════════════════════════════════════════════════════════
 
-FAST-PATH (route_type="fast_path", plan_decision="no_plan"):
+(route_type="fast_path", plan_decision="no_plan"):
 - greeting, farewell, thanks, pleasantry
 
-CONTINUATION (route_type="agent", usually resume plan):
+(route_type="agent", is_continuation=true, usually resume plan):
+- direct_continuation: User responds to our previous message
 - direct_answer: Answers what we're awaiting
 - selection: Picks from presented options
 - confirmation: Confirms proposed action
 - rejection: Declines/cancels
 - modification: Changes something already set
 
-NEW INTENT (route_type="agent", plan_decision="create_new" or "abandon_create"):
+(route_type="agent", is_continuation=false, plan_decision="create_new" or "abandon_create"):
 - new_intent: New request OR confirmation of something active agent CANNOT do
-- topic_shift: Changing subjects entirely
+- topic_shift: Changing subject or request entirely
 
 SPECIAL:
 - emergency: Route to emergency_response immediately
@@ -241,6 +262,7 @@ FOR FAST-PATH (greeting, farewell, thanks, pleasantry):
 FOR AGENT ROUTING:
 {
   "route_type": "agent",
+  "is_continuation": true|false,
   "situation_type": "...",
   "confidence": 0.0-1.0,
   "agent": "registration|appointment_manager|emergency_response|general_assistant|medical_inquiry",
@@ -248,8 +270,6 @@ FOR AGENT ROUTING:
   "plan_reasoning": "Why this plan decision",
   "what_user_means": "Plain English explanation of what user actually wants",
   "objective": "Goal for the agent (empty if resume)",
-  "is_continuation": true|false,
-  "continuation_type": "selection|confirmation|direct_answer|rejection|modification|null",
   "routing_action": "execute_confirmed_action|null"
 }
 

@@ -94,6 +94,10 @@ class ConversationMemoryManager:
         self.max_recent_turns = max_recent_turns
         self.summarization_token_threshold = summarization_token_threshold
 
+        # Import and initialize LLM config manager
+        from patient_ai_service.core.llm_config import get_llm_config_manager
+        self.llm_config_manager = get_llm_config_manager()
+
         logger.info(f"Initialized ConversationMemoryManager (max_recent_turns={max_recent_turns}, "
                    f"token_threshold={summarization_token_threshold})")
 
@@ -294,38 +298,51 @@ Write the summary in third person (e.g., "The user wants to book an appointment.
             from patient_ai_service.models.observability import TokenUsage
             from patient_ai_service.core.config import settings
 
+            # Get hierarchical LLM config for summarization
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="conversation_memory",
+                function_name="summarize"
+            )
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="conversation_memory",
+                function_name="summarize"
+            )
+
             # Track LLM call with token usage
             llm_start_time = time.time()
-            if hasattr(self.llm_client, 'create_message_with_usage'):
-                new_summary, tokens = self.llm_client.create_message_with_usage(
+            if hasattr(llm_client, 'create_message_with_usage'):
+                new_summary, tokens = llm_client.create_message_with_usage(
                     system="You are a conversation summarizer. Create concise, informative summaries.",
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
             else:
-                new_summary = self.llm_client.create_message(
+                new_summary = llm_client.create_message(
                     system="You are a conversation summarizer. Create concise, informative summaries.",
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
                 )
                 tokens = TokenUsage()
 
             llm_duration_seconds = time.time() - llm_start_time
 
-            # Record LLM call for observability
+            # Record LLM call for observability with hierarchical config
             if settings.enable_observability:
                 obs_logger = get_observability_logger(session_id)
                 if obs_logger:
                     obs_logger.record_llm_call(
                         component="memory.summarize",
-                        provider=settings.llm_provider.value,
-                        model=settings.get_llm_model(),
+                        provider=llm_config.provider,
+                        model=llm_config.model,
                         tokens=tokens,
                         duration_seconds=llm_duration_seconds,
                         system_prompt_length=len("You are a conversation summarizer. Create concise, informative summaries."),
                         messages_count=1,
-                        temperature=0.3,
-                        max_tokens=settings.llm_max_tokens
+                        temperature=llm_config.temperature,
+                        max_tokens=llm_config.max_tokens,
+                        function_name="summarize"
                     )
 
             memory.summary = new_summary.strip()

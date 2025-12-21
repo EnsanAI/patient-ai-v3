@@ -1,0 +1,162 @@
+# Hierarchical LLM Configuration
+# Single source of truth for all LLM configuration in patient-ai-v3
+# 
+# Hierarchy: function → agent → global (fallback order)
+# API keys remain in .env for security
+
+global:
+  provider: anthropic
+  model: claude-sonnet-4-5-20250929
+  temperature: 0.7
+  max_tokens: 1000
+  timeout: 30
+
+agents:
+  # Core reasoning engine (used by orchestrator)
+  unified_reasoning:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.1
+    max_tokens: 600
+    functions:
+      reason:
+        temperature: 0.1
+        max_tokens: 600
+      validate_response:
+        temperature: 0.1
+      finalize_response:
+        temperature: 0.1
+
+  # Legacy reasoning (deprecated, keeping for backward compat)
+  # Still used by orchestrator for validate_response and finalize_response
+  reasoning:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.3
+    functions:
+      validate_response:
+        temperature: 0.2
+        max_tokens: 500
+      finalize_response:
+        temperature: 0.3
+        max_tokens: 500
+
+  # Translation agent
+  translation:
+    provider: openai
+    model: gpt-4o-mini
+    temperature: 0.1
+    functions:
+      detect_language:
+        temperature: 0.0
+      translate_text:
+        temperature: 0.1
+      detect_and_translate:
+        temperature: 0.1
+
+  # Appointment manager agent
+  appointment_manager:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.7
+    functions:
+      _think:
+        temperature: 0.3
+      _verify_task_completion:
+        temperature: 0.1
+      _generate_focused_response:
+        temperature: 0.5
+        max_tokens: 300
+      _generate_response:
+        temperature: 0.5
+
+  # Medical inquiry agent
+  medical_inquiry:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.7
+    functions:
+      _think:
+        temperature: 0.3
+      _verify_task_completion:
+        temperature: 0.1
+      _generate_focused_response:
+        temperature: 0.5
+        max_tokens: 500
+      _generate_response:
+        temperature: 0.5
+
+  # Emergency response agent
+  emergency_response:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.7
+    functions:
+      _think:
+        temperature: 0.1
+      _verify_task_completion:
+        temperature: 0.1
+      _generate_focused_response:
+        temperature: 0.5
+      _generate_response:
+        temperature: 0.5
+
+  # Registration agent
+  registration:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.7
+    functions:
+      _think:
+        temperature: 0.3
+      _verify_task_completion:
+        temperature: 0.1
+      _generate_focused_response:
+        temperature: 0.5
+      _generate_response:
+        temperature: 0.5
+
+  # General assistant agent
+  general_assistant:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.7
+    functions:
+      _think:
+        temperature: 0.3
+      _verify_task_completion:
+        temperature: 0.1
+      _generate_focused_response:
+        temperature: 0.5
+      _generate_response:
+        temperature: 0.5
+
+  # Conversational fast path (orchestrator)
+  conversational_fast_path:
+    provider: openai
+    model: gpt-4o-mini
+    temperature: 0.7
+    max_tokens: 150
+
+  # Conversation memory (summarization)
+  conversation_memory:
+    provider: openai
+    model: gpt-4o-mini
+    temperature: 0.3
+    max_tokens: 300
+    functions:
+      summarize:
+        temperature: 0.2
+        max_tokens: 300
+
+provider_defaults:
+  anthropic:
+    model: claude-sonnet-4-5-20250929
+  openai:
+    model: gpt-4o-mini
+
+validation:
+  validate_api_keys_on_startup: false
+  warn_on_missing_provider: true
+  strict_mode: false
+

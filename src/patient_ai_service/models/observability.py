@@ -45,6 +45,7 @@ class LLMCall(BaseModel):
     """Information about a single LLM call."""
     call_id: str = Field(default_factory=lambda: f"llm_{datetime.utcnow().timestamp()}")
     component: str = ""  # "reasoning", "agent", "validation", "finalization"
+    function_name: Optional[str] = None  # Specific function within component (e.g., "reason", "_think", "validate_response")
     provider: str = ""
     model: str = ""
     system_prompt_length: int = 0
