@@ -54,6 +54,12 @@ from .llm_config import (
     get_hierarchical_llm_client,
     reset_llm_config_manager,
 )
+from .prompt_cache import (
+    get_universal_system_content,
+    get_cache_config,
+    set_cache_enabled,
+    CacheConfig,
+)
 
 __all__ = [
     # Config
@@ -103,4 +109,9 @@ __all__ = [
     "get_llm_config",
     "get_hierarchical_llm_client",
     "reset_llm_config_manager",
+    # Prompt Caching
+    "get_universal_system_content",
+    "get_cache_config",
+    "set_cache_enabled",
+    "CacheConfig",
 ]

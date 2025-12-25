@@ -29,6 +29,7 @@ class LLMConfig:
     temperature: float
     max_tokens: int
     timeout: int
+    prompt_cache_enabled: bool = False  # Prompt caching (Anthropic only)
 
     def __post_init__(self):
         """Validate config values."""
@@ -80,12 +81,16 @@ class LLMConfigManager:
         
         for path in possible_paths:
             if path.exists():
-                logger.info(f"Found LLM config at: {path}")
+                logger.info(f"✅ [LLMConfig] Found LLM config at: {path}")
+                logger.info(f"📁 [LLMConfig] Config file exists: {path.exists()}, absolute: {path.absolute()}")
                 return str(path)
         
         # Default to expected location
         default_path = Path(__file__).parent.parent.parent.parent / "config" / "llm_config.yaml"
-        logger.warning(f"Config file not found, using default: {default_path}")
+        logger.warning(
+            f"⚠️  [LLMConfig] Config file not found in any of the expected locations. "
+            f"Using default: {default_path} (exists: {default_path.exists()})"
+        )
         return str(default_path)
     
     def _load_config(self):
@@ -94,15 +99,26 @@ class LLMConfigManager:
             if os.path.exists(self._config_path):
                 with open(self._config_path, 'r') as f:
                     self._yaml_config = yaml.safe_load(f) or {}
-                logger.info(f"Loaded LLM config from {self._config_path}")
+                logger.info(f"✅ [LLMConfig] Loaded LLM config from {self._config_path}")
+                
+                # Log key config values for debugging
+                if "agents" in self._yaml_config:
+                    logger.info(f"📋 [LLMConfig] Found {len(self._yaml_config['agents'])} agents in config")
+                    if "unified_reasoning" in self._yaml_config["agents"]:
+                        ur_config = self._yaml_config["agents"]["unified_reasoning"]
+                        logger.info(
+                            f"🔍 [LLMConfig] unified_reasoning config: "
+                            f"provider={ur_config.get('provider', 'NOT SET')}, "
+                            f"model={ur_config.get('model', 'NOT SET')}"
+                        )
             else:
                 logger.warning(
-                    f"LLM config file not found at {self._config_path}. "
+                    f"⚠️  [LLMConfig] LLM config file not found at {self._config_path}. "
                     f"Using defaults from Settings class."
                 )
                 self._yaml_config = {}
         except Exception as e:
-            logger.error(f"Failed to load LLM config from {self._config_path}: {e}")
+            logger.error(f"❌ [LLMConfig] Failed to load LLM config from {self._config_path}: {e}")
             logger.warning("Falling back to Settings class defaults")
             self._yaml_config = {}
     
@@ -204,6 +220,10 @@ class LLMConfigManager:
         # Get global values (with fallback to Settings)
         provider = global_config.get("provider") or settings.llm_provider.value
         model = global_config.get("model")
+
+        # Get prompt cache configuration from global.prompt_cache.enabled
+        prompt_cache_config = global_config.get("prompt_cache", {})
+        prompt_cache_enabled = prompt_cache_config.get("enabled", False)
         if not model:
             # Use provider default or Settings
             if provider in provider_defaults:
@@ -219,16 +239,38 @@ class LLMConfigManager:
         if agent_name and "agents" in self._yaml_config:
             agent_config = self._yaml_config["agents"].get(agent_name)
             if agent_config and isinstance(agent_config, dict):
+                logger.debug(
+                    f"🔧 [LLMConfig] Processing agent-level config for '{agent_name}': "
+                    f"provider={agent_config.get('provider', 'NOT SET')}, "
+                    f"model={agent_config.get('model', 'NOT SET')}"
+                )
+                
                 if "provider" in agent_config:
+                    old_provider = provider
                     provider = agent_config["provider"]
+                    logger.debug(
+                        f"🔧 [LLMConfig] Agent '{agent_name}' provider override: "
+                        f"{old_provider} → {provider}"
+                    )
                     # Reset model if provider changed
                     if provider in provider_defaults:
                         model = provider_defaults[provider].get("model")
+                        logger.debug(
+                            f"🔧 [LLMConfig] Reset model to provider default: {model}"
+                        )
                     if not model:
                         model = settings.get_llm_model()
+                        logger.debug(
+                            f"🔧 [LLMConfig] Using Settings default model: {model}"
+                        )
                 
                 if "model" in agent_config:
+                    old_model = model
                     model = agent_config["model"]
+                    logger.debug(
+                        f"🔧 [LLMConfig] Agent '{agent_name}' model override: "
+                        f"{old_model} → {model}"
+                    )
                 
                 if "temperature" in agent_config:
                     temperature = agent_config["temperature"]
@@ -243,16 +285,39 @@ class LLMConfigManager:
                 if function_name and "functions" in agent_config:
                     func_config = agent_config["functions"].get(function_name)
                     if func_config and isinstance(func_config, dict):
+                        logger.debug(
+                            f"🔧 [LLMConfig] Processing function-level config for "
+                            f"'{agent_name}.{function_name}': "
+                            f"provider={func_config.get('provider', 'NOT SET')}, "
+                            f"model={func_config.get('model', 'NOT SET')}"
+                        )
+                        
                         if "provider" in func_config:
+                            old_provider = provider
                             provider = func_config["provider"]
+                            logger.debug(
+                                f"🔧 [LLMConfig] Function '{function_name}' provider override: "
+                                f"{old_provider} → {provider}"
+                            )
                             # Reset model if provider changed
                             if provider in provider_defaults:
                                 model = provider_defaults[provider].get("model")
+                                logger.debug(
+                                    f"🔧 [LLMConfig] Reset model to provider default: {model}"
+                                )
                             if not model:
                                 model = settings.get_llm_model()
+                                logger.debug(
+                                    f"🔧 [LLMConfig] Using Settings default model: {model}"
+                                )
                         
                         if "model" in func_config:
+                            old_model = model
                             model = func_config["model"]
+                            logger.debug(
+                                f"🔧 [LLMConfig] Function '{function_name}' model override: "
+                                f"{old_model} → {model}"
+                            )
                         
                         if "temperature" in func_config:
                             temperature = func_config["temperature"]
@@ -263,13 +328,31 @@ class LLMConfigManager:
                         if "timeout" in func_config:
                             timeout = func_config["timeout"]
         
-        return LLMConfig(
+        resolved_config = LLMConfig(
             provider=provider,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=timeout
+            timeout=timeout,
+            prompt_cache_enabled=prompt_cache_enabled
         )
+        
+        # Debug logging for config resolution
+        logger.debug(
+            f"🔧 [LLMConfig] Resolved config for agent='{agent_name}', function='{function_name}': "
+            f"provider={resolved_config.provider}, model={resolved_config.model}, "
+            f"temperature={resolved_config.temperature}, max_tokens={resolved_config.max_tokens}"
+        )
+        
+        # Special logging for unified_reasoning to help diagnose issues (INFO level for visibility)
+        if agent_name == "unified_reasoning":
+            logger.info(
+                f"🔍 [LLMConfig] UnifiedReasoning config resolved for function='{function_name}': "
+                f"provider={resolved_config.provider}, model={resolved_config.model}, "
+                f"temperature={resolved_config.temperature}, max_tokens={resolved_config.max_tokens}"
+            )
+        
+        return resolved_config
     
     def get_client(
         self,
@@ -311,7 +394,15 @@ class LLMConfigManager:
             )
             
             self._client_cache[cache_key] = client
-            logger.debug(f"Created new LLM client: {cache_key}")
+            logger.info(
+                f"✅ [LLMConfig] Created NEW LLM client: {cache_key} "
+                f"(agent='{agent_name}', function='{function_name}')"
+            )
+        else:
+            logger.debug(
+                f"♻️  [LLMConfig] Using CACHED LLM client: {cache_key} "
+                f"(agent='{agent_name}', function='{function_name}')"
+            )
         
         return self._client_cache[cache_key]
     
@@ -377,4 +468,5 @@ def reset_llm_config_manager():
     """Reset the global config manager (useful for testing)."""
     global _config_manager
     _config_manager = None
+
 

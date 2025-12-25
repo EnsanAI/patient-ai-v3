@@ -23,7 +23,7 @@ from patient_ai_service.core import (
     get_message_broker,
 )
 from patient_ai_service.core.config import settings
-from patient_ai_service.core.llm_config import get_llm_config_manager
+from patient_ai_service.core.llm_config import get_llm_config_manager, LLMConfig
 from patient_ai_service.core.reasoning import get_reasoning_engine, ReasoningEngine, ReasoningOutput
 from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
 from patient_ai_service.core.observability import get_observability_logger, clear_observability_logger
@@ -71,6 +71,7 @@ from patient_ai_service.models.enums import UrgencyLevel
 from patient_ai_service.models.validation import ExecutionLog, ValidationResult
 # NEW: Phase 3 imports - Agent Plan Management
 from patient_ai_service.models.agent_plan import AgentPlan, PlanAction
+from patient_ai_service.core.state_manager import ContinuationContext
 from patient_ai_service.agents import (
     AppointmentManagerAgent,
     MedicalInquiryAgent,
@@ -370,6 +371,292 @@ Your response:"""
             fallback_response = lang_fallbacks.get(situation, lang_fallbacks[SituationType.GREETING])
             return fallback_response, TokenUsage()
 
+    async def _information_collection_response(
+        self,
+        session_id: str,
+        message: str,
+        information_collection: Dict[str, Any],
+        recent_messages: List[Dict[str, str]],
+        language: str,
+        dialect: Optional[str],
+        patient_name: Optional[str]
+    ) -> Tuple[str, TokenUsage, bool]:
+        """
+        Lightweight response for information collection non-brainer flow.
+
+        Uses GPT-4o mini with 8 recent messages for context. Decides:
+        1. If user provided sufficient information → return response and flag to route to agent
+        2. If user provided partial information → ask follow-up question
+        3. If user didn't provide information → re-ask the question
+
+        Args:
+            session_id: Session identifier
+            message: User's latest message
+            information_collection: Dict with 'information_needed', 'information_question', etc.
+            recent_messages: Last 8 conversation turns for context
+            language: Target response language code
+            dialect: Target dialect code or None
+            patient_name: Patient's first name if known
+
+        Returns:
+            Tuple of (response_text, token_usage, should_route_to_agent)
+        """
+        # Log all inputs
+        logger.info("=" * 80)
+        logger.info(f"⚡ [Info Collection] INFORMATION COLLECTION RESPONSE GENERATOR - INPUTS:")
+        logger.info("=" * 80)
+        inputs = {
+            "session_id": session_id,
+            "message": message,
+            "information_needed": information_collection.get('information_needed', 'N/A'),
+            "information_question": information_collection.get('information_question', 'N/A'),
+            "context": information_collection.get('context', 'N/A'),
+            "patient_name": patient_name,
+            "language": language,
+            "dialect": dialect,
+            "recent_messages_count": len(recent_messages)
+        }
+        logger.info(f"⚡ [Info Collection] Inputs JSON:\n{json.dumps(inputs, indent=2, default=str)}")
+        logger.info("=" * 80)
+
+        name = patient_name or "there"
+
+        # Build language instruction (reuse pattern from _conversational_response)
+        lang_instruction = ""
+        if language == "ar":
+            dialect_map = {
+                "ae": "Emirati Arabic (UAE dialect)",
+                "sa": "Saudi Arabic (Gulf dialect)",
+                "eg": "Egyptian Arabic",
+                "lv": "Levantine Arabic",
+                None: "Modern Standard Arabic"
+            }
+            dialect_name = dialect_map.get(dialect, dialect_map[None])
+            lang_instruction = f"\n\nIMPORTANT: Respond in {dialect_name}. Use natural, conversational Arabic appropriate for the UAE."
+        elif language != "en":
+            lang_instruction = f"\n\nIMPORTANT: Respond in {language}."
+
+        # Build conversation context from last 8 messages
+        conversation_context = ""
+        if recent_messages:
+            conversation_context = "\n\nRecent conversation (last 8 turns):\n"
+            for turn in recent_messages[-8:]:
+                role_label = "User" if turn.get("role") == "user" else "Assistant"
+                conversation_context += f"{role_label}: {turn.get('content', '')}\n"
+
+        # Extract information collection details
+        information_needed = information_collection.get('information_needed', 'user information')
+        information_question = information_collection.get('information_question', '')
+        context = information_collection.get('context', 'general inquiry')
+
+        # Build JSON example separately to avoid f-string brace escaping issues
+        json_example = '''{
+  "route_to_agent": true|false,
+  "response": "Your natural response to the user"
+}'''
+
+        prompt = f"""You are a friendly clinic receptionist in the UAE helping collect information.
+
+Patient: {name}
+Context: {context}
+
+INFORMATION NEEDED:
+{information_needed}
+
+QUESTION WE ASKED:
+"{information_question}"
+
+USER'S LATEST RESPONSE:
+"{message}"
+{conversation_context}
+
+YOUR TASK:
+Assess if the user's response provides the requested information. Be FLEXIBLE:
+- "I recommend..." is valid
+- "Anything is fine" is valid
+- "I don't care" is valid
+- "I don't know" is valid
+- Partial information is valid
+- Vague answers are valid (extract what you can)
+
+DECISION OPTIONS:
+
+1. SUFFICIENT INFORMATION PROVIDED:
+   - User answered (even vaguely/partially)
+   - Set route_to_agent: true
+   - Acknowledge their response warmly
+   - Say you'll proceed with their request
+   - Example: "Great! I'll check available appointments for you."
+
+2. PARTIAL/UNCLEAR INFORMATION:
+   - User provided something but more clarity would help
+   - Set route_to_agent: false
+   - Ask a specific follow-up question
+   - Example: "You mentioned afternoon - did you have a specific time in mind, like 2pm or 4pm?"
+
+3. NO INFORMATION PROVIDED:
+   - User said something unrelated or didn't answer
+   - Set route_to_agent: false
+   - Gently re-ask the question
+   - Example: "I understand, but to help you book an appointment, I need to know what type of visit you need."
+
+{lang_instruction}
+
+Respond in JSON format:
+{json_example}
+"""
+
+        # Log built prompt
+        logger.info("=" * 80)
+        logger.info(f"⚡ [Info Collection] BUILT PROMPT:")
+        logger.info("=" * 80)
+        logger.info(f"⚡ [Info Collection] Prompt length: {len(prompt)} chars (~{len(prompt)//4} tokens)")
+        logger.info(f"⚡ [Info Collection] Prompt:\n{prompt}")
+        logger.info("=" * 80)
+
+        try:
+            # Get hierarchical LLM config for information_collection function
+            llm_config = self.llm_config_manager.get_config(
+                agent_name="orchestrator",
+                function_name="information_collection"
+            )
+            
+            # Get LLM client using config manager (handles API keys automatically)
+            llm_client = self.llm_config_manager.get_client(
+                agent_name="orchestrator",
+                function_name="information_collection"
+            )
+
+            # Log LLM configuration
+            logger.info("=" * 80)
+            logger.info(f"⚡ [Info Collection] LLM CONFIGURATION:")
+            logger.info("=" * 80)
+            logger.info(f"⚡ [Info Collection]   Provider: {llm_config.provider}")
+            logger.info(f"⚡ [Info Collection]   Model: {llm_config.model}")
+            logger.info(f"⚡ [Info Collection]   Temperature: {llm_config.temperature}")
+            logger.info(f"⚡ [Info Collection]   Max Tokens: {llm_config.max_tokens}")
+            logger.info(f"⚡ [Info Collection]   Timeout: {llm_config.timeout}")
+            logger.info("=" * 80)
+
+            # Make LLM call
+            llm_start_time = time.time()
+            if hasattr(llm_client, 'chat_completion_json'):
+                response_text, tokens = await llm_client.chat_completion_json(
+                    messages=[{"role": "user", "content": prompt}],
+                    config=llm_config,
+                    session_id=session_id
+                )
+            else:
+                # Fallback to regular message creation
+                response_text, tokens = llm_client.create_message_with_usage(
+                    system="You are a helpful assistant. Return JSON only.",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens
+                )
+
+            llm_duration_seconds = time.time() - llm_start_time
+            llm_duration_ms = llm_duration_seconds * 1000
+
+            # Log raw LLM response
+            logger.info("=" * 80)
+            logger.info(f"⚡ [Info Collection] RAW LLM RESPONSE:")
+            logger.info("=" * 80)
+            logger.info(f"⚡ [Info Collection] Response Content:\n{response_text}")
+            logger.info("=" * 80)
+            logger.info(f"⚡ [Info Collection] LLM call completed in {llm_duration_ms:.0f}ms")
+            logger.info(f"⚡ [Info Collection] Tokens: {tokens.input_tokens} in / {tokens.output_tokens} out (total: {tokens.total_tokens})")
+            logger.info("=" * 80)
+
+            # Get observability logger
+            obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
+
+            # Record LLM call in observability
+            if obs_logger:
+                llm_call = obs_logger.record_llm_call(
+                    component="orchestrator.information_collection",
+                    provider=llm_config.provider,
+                    model=llm_config.model,
+                    tokens=tokens,
+                    duration_seconds=llm_duration_seconds,
+                    system_prompt_length=0,  # No system prompt for JSON mode
+                    messages_count=1,
+                    temperature=llm_config.temperature,
+                    max_tokens=llm_config.max_tokens,
+                    function_name="information_collection_response"
+                )
+                if llm_call and llm_call.cost and settings.cost_tracking_enabled:
+                    logger.info(f"⚡ [Info Collection]   Cost: ${llm_call.cost.total_cost_usd:.6f} (Input: ${llm_call.cost.input_cost_usd:.6f}, Output: ${llm_call.cost.output_cost_usd:.6f})")
+                # Also record tokens in token tracker for component-level tracking
+                obs_logger.token_tracker.record_tokens(
+                    component="orchestrator.information_collection",
+                    input_tokens=tokens.input_tokens,
+                    output_tokens=tokens.output_tokens
+                )
+
+            # Parse response
+            try:
+                # Strip markdown code blocks if present
+                cleaned_response = response_text.strip()
+                if cleaned_response.startswith("```json"):
+                    # Remove opening ```json
+                    cleaned_response = cleaned_response[7:]
+                elif cleaned_response.startswith("```"):
+                    # Remove opening ```
+                    cleaned_response = cleaned_response[3:]
+
+                # Remove closing ```
+                if cleaned_response.endswith("```"):
+                    cleaned_response = cleaned_response[:-3]
+
+                cleaned_response = cleaned_response.strip()
+
+                logger.info(f"⚡ [Info Collection] Cleaned response for parsing (removed markdown if present)")
+
+                result = json.loads(cleaned_response)
+                route_to_agent = result.get("route_to_agent", False)
+                response = result.get("response", "I'm not sure I understood. Could you please provide the information I requested?")
+
+                logger.info("=" * 80)
+                logger.info(f"⚡ [Info Collection] PARSED RESPONSE:")
+                logger.info("=" * 80)
+                logger.info(f"⚡ [Info Collection] Route to agent: {route_to_agent}")
+                logger.info(f"⚡ [Info Collection] Response length: {len(response)} chars")
+                logger.info(f"⚡ [Info Collection] Response:\n{response}")
+                logger.info("=" * 80)
+
+            except json.JSONDecodeError as e:
+                logger.error("=" * 80)
+                logger.error(f"⚡ [Info Collection] JSON PARSING ERROR:")
+                logger.error("=" * 80)
+                logger.error(f"⚡ [Info Collection] Error: {e}")
+                logger.error(f"⚡ [Info Collection] Raw response: {response_text}")
+                logger.error("=" * 80)
+                route_to_agent = False
+                response = "I'm not sure I understood. Could you please provide the information I requested?"
+
+            logger.info(f"⚡ [Info Collection] ✅ Information collection response completed successfully")
+            logger.info(f"⚡ [Info Collection] Final decision: {'ROUTE TO AGENT' if route_to_agent else 'ASK FOLLOW-UP'}")
+
+            return response, tokens, route_to_agent
+
+        except Exception as e:
+            logger.error("=" * 80)
+            logger.error(f"⚡ [Info Collection] EXCEPTION:")
+            logger.error("=" * 80)
+            logger.error(f"⚡ [Info Collection] Error type: {type(e).__name__}")
+            logger.error(f"⚡ [Info Collection] Error message: {e}")
+            logger.error(f"⚡ [Info Collection] Traceback:", exc_info=True)
+            logger.error("=" * 80)
+
+            # Fallback response
+            fallback_response = "I'm not sure I understood. Could you please provide that information again?"
+            if language == "ar":
+                fallback_response = "لم أفهم جيداً. هل يمكنك تقديم هذه المعلومات مرة أخرى؟"
+
+            logger.info(f"⚡ [Info Collection] Returning fallback response: {fallback_response}")
+            return fallback_response, TokenUsage(), False
+
     async def process_message(
         self,
         session_id: str,
@@ -529,9 +816,29 @@ Your response:"""
             awaiting = continuation_context.get("awaiting") if continuation_context else None
             awaiting_context = continuation_context.get("awaiting_context") if continuation_context else None  # NEW
             pending_action = continuation_context.get("pending_action") if continuation_context else None      # NEW
+            information_collection = continuation_context.get("information_collection") if continuation_context else None  # NEW
 
             # Get existing plan
             existing_plan = self.state_manager.get_any_active_plan(session_id)
+
+            # 🔍 ADD LOGGING HERE
+            logger.info(f"🔍🔍🔍 [ORCHESTRATOR] PLAN RETRIEVAL ══════════════════")
+            logger.info(f"🔍 Session ID: {session_id}")
+            if existing_plan:
+                logger.info(f"🔍 ✅ PLAN FOUND!")
+                logger.info(f"🔍   Agent name: {existing_plan.agent_name}")
+                logger.info(f"🔍   Status: {existing_plan.status.value}")
+                logger.info(f"🔍   Objective: {existing_plan.objective}")
+                logger.info(f"🔍   Tasks: {len(existing_plan.tasks)}")
+                logger.info(f"🔍   Awaiting: {existing_plan.awaiting_info}")
+                logger.info(f"🔍   Entities: {list(existing_plan.entities.keys())}")
+            else:
+                logger.info(f"🔍 ❌ NO PLAN FOUND")
+                logger.info(f"🔍   Continuation context exists: {bool(continuation_context)}")
+                if continuation_context:
+                    logger.info(f"🔍   Continuation awaiting: {continuation_context.get('awaiting')}")
+                    logger.info(f"🔍   Continuation entities: {list(continuation_context.get('entities', {}).keys())}")
+            logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
 
             # Get recent conversation turns
             recent_turns = self._get_recent_turns(session_id, limit=6)
@@ -546,6 +853,7 @@ Your response:"""
                     awaiting=awaiting,
                     awaiting_context=awaiting_context,    # NEW
                     pending_action=pending_action,         # NEW
+                    information_collection=information_collection,  # NEW
                     recent_turns=recent_turns,
                     existing_plan=existing_plan
                 )
@@ -663,6 +971,143 @@ Your response:"""
                     }
                 )
 
+            # === INFORMATION COLLECTION NON-BRAINER ===
+            if unified_output.routing_action == "collect_information":
+                logger.info(f"⚡ [Information Collection] Non-brainer response for info collection")
+
+                # Get information collection context
+                continuation_context = self.state_manager.get_continuation_context(session_id)
+                information_collection = continuation_context.get("information_collection", {}) if continuation_context else {}
+
+                if not information_collection:
+                    logger.warning("⚡ [Info Collection] routing_action is collect_information but no information_collection in context!")
+                    # Fall through to normal agent routing
+                else:
+                    with obs_logger.pipeline_step(5, "information_collection_response", "orchestrator",
+                                                  {"information_needed": information_collection.get('information_needed', 'N/A')}) if obs_logger else nullcontext():
+
+                        # Get recent messages (last 8 for context)
+                        recent_messages = self._get_recent_turns(session_id, limit=8)
+
+                        # Get language context
+                        global_state = self.state_manager.get_global_state(session_id)
+                        language_context = global_state.language_context
+
+                        # Generate lightweight response
+                        info_start = time.time()
+                        english_response, info_tokens, route_to_agent = await self._information_collection_response(
+                            session_id=session_id,
+                            message=english_message,
+                            information_collection=information_collection,
+                            recent_messages=recent_messages,
+                            language=language_context.current_language,
+                            dialect=language_context.current_dialect,
+                            patient_name=patient_info.get('first_name')
+                        )
+                        info_duration = (time.time() - info_start) * 1000
+                        logger.info(f"⚡ [Information Collection] Response generated in {info_duration:.0f}ms")
+                        logger.info(f"⚡ [Information Collection] Route to agent: {route_to_agent}")
+
+                        # Build execution log
+                        execution_log = ExecutionLog(
+                            session_id=session_id,
+                            agent_name="information_collection",
+                            tools_used=[]
+                        )
+
+                        if route_to_agent:
+                            # User provided sufficient information - clear continuation and route to agent
+                            logger.info(f"⚡ [Information Collection] Sufficient info provided - routing to agent on next turn")
+
+                            # Clear continuation context
+                            self.state_manager.clear_continuation_context(session_id)
+
+                            # Update agentic state to active (no longer blocked)
+                            self.state_manager.update_agentic_state(
+                                session_id,
+                                status="active",
+                                active_agent=unified_output.agent or global_state.active_agent
+                            )
+
+                            # Add lightweight response to memory
+                            self.memory_manager.add_assistant_turn(session_id, english_response)
+
+                            # For this turn, return the acknowledgment response
+                            # The agent will process on the NEXT turn
+                            step5_duration = (time.time() - step5_start) * 1000
+                            logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
+
+                            total_duration = (time.time() - pipeline_start_time) * 1000
+                            logger.info("=" * 100)
+                            logger.info("ORCHESTRATOR: process_message() COMPLETED (Information Collection - Routing)")
+                            logger.info("=" * 100)
+                            logger.info(f"Session ID: {session_id}")
+                            logger.info(f"Final Response: {english_response[:200]}...")
+                            logger.info(f"Route: information_collection → {unified_output.agent or global_state.active_agent}")
+                            logger.info(f"Total Duration: {total_duration:.0f}ms")
+                            logger.info("=" * 100)
+
+                            # Clear observability for next request
+                            if obs_logger:
+                                obs_logger.log_summary()
+                                clear_observability_logger(session_id)
+
+                            return ChatResponse(
+                                session_id=session_id,
+                                response=english_response,
+                                intent="information_collected",
+                                metadata={
+                                    "route": "information_collection",
+                                    "will_route_to_agent": unified_output.agent or global_state.active_agent,
+                                    "duration_ms": total_duration
+                                }
+                            )
+                        else:
+                            # User didn't provide sufficient information - ask follow-up
+                            logger.info(f"⚡ [Information Collection] Insufficient info - asking follow-up")
+
+                            # Keep continuation context intact (stay in info collection mode)
+                            # Increment waiting turns
+                            if continuation_context:
+                                continuation_context['waiting_turns'] = continuation_context.get('waiting_turns', 0) + 1
+                                # Update the continuation context with incremented waiting_turns
+                                updated_context = ContinuationContext(**continuation_context)
+                                state = self.state_manager.get_agentic_state(session_id)
+                                state.continuation_context = updated_context
+                                self.state_manager._save_state(session_id, "agentic_state", state)
+
+                            # Add response to memory
+                            self.memory_manager.add_assistant_turn(session_id, english_response)
+
+                            step5_duration = (time.time() - step5_start) * 1000
+                            logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
+
+                            total_duration = (time.time() - pipeline_start_time) * 1000
+                            logger.info("=" * 100)
+                            logger.info("ORCHESTRATOR: process_message() COMPLETED (Information Collection - Follow-up)")
+                            logger.info("=" * 100)
+                            logger.info(f"Session ID: {session_id}")
+                            logger.info(f"Final Response: {english_response[:200]}...")
+                            logger.info(f"Route: information_collection (follow-up)")
+                            logger.info(f"Total Duration: {total_duration:.0f}ms")
+                            logger.info("=" * 100)
+
+                            # Clear observability for next request
+                            if obs_logger:
+                                obs_logger.log_summary()
+                                clear_observability_logger(session_id)
+
+                            return ChatResponse(
+                                session_id=session_id,
+                                response=english_response,
+                                intent="information_collection_followup",
+                                metadata={
+                                    "route": "information_collection",
+                                    "awaiting": "information",
+                                    "duration_ms": total_duration
+                                }
+                            )
+
             # === AGENT ROUTING ===
             with obs_logger.pipeline_step(6, "agent_routing", "orchestrator", {"agent": unified_output.agent, "plan_decision": unified_output.plan_decision.value if unified_output.plan_decision else None}) if obs_logger else nullcontext():
                 logger.info(f"🎯 [Agent Routing] Agent: {unified_output.agent}")
@@ -673,6 +1118,11 @@ Your response:"""
                     if existing_plan:
                         self.state_manager.abandon_all_plans(session_id, "unified_reasoning_abandon")
                         logger.info(f"📋 [Plan] Abandoned existing plan for {existing_plan.agent_name}")
+                
+                if unified_output.plan_decision == PlanDecision.COMPLETE:
+                    if existing_plan:
+                        self.state_manager.abandon_all_plans(session_id, "unified_reasoning_complete")
+                        logger.info(f"📋 [Plan] Cleared completed plan for {existing_plan.agent_name}")
 
                 # Build reasoning-compatible output for agent activation
                 reasoning = self._build_reasoning_from_unified(unified_output, existing_plan, continuation_context)
@@ -683,6 +1133,7 @@ Your response:"""
                     PlanDecision.CREATE_NEW: PlanAction.CREATE_NEW,
                     PlanDecision.RESUME: PlanAction.RESUME,
                     PlanDecision.ABANDON_CREATE: PlanAction.ABANDON_AND_CREATE,
+                    PlanDecision.COMPLETE: PlanAction.NO_PLAN,  # Complete clears plan, no new plan needed
                 }
                 plan_action = plan_action_map.get(unified_output.plan_decision, PlanAction.CREATE_NEW)
 
@@ -1389,7 +1840,7 @@ Your response:"""
 
         # Merge with continuation context if resuming
         if continuation_context and task_context.get("is_continuation"):
-            resolved = continuation_context.get("resolved_entities", {})
+            resolved = continuation_context.get("entities", {})
             if resolved:
                 logger.info(f"🔄 Merging resolved entities from continuation: {json.dumps(resolved, default=str)}")
                 merged_count = 0
@@ -1420,7 +1871,11 @@ Your response:"""
         if not memory.recent_turns:
             return []
         return [
-            {"role": turn.role, "content": turn.content}
+            {
+                "role": turn.role,
+                "content": turn.content,
+                "timestamp": turn.timestamp.isoformat() if hasattr(turn, 'timestamp') and turn.timestamp else None
+            }
             for turn in memory.recent_turns[-limit:]
         ]
 
@@ -1464,22 +1919,30 @@ Your response:"""
         # For resume, use existing plan's objective
         if unified_output.plan_decision == PlanDecision.RESUME and existing_plan:
             objective = existing_plan.objective
-            entities = existing_plan.resolved_entities.copy() if existing_plan.resolved_entities else {}
+            entities = existing_plan.entities.copy() if existing_plan.entities else {}
         else:
             objective = unified_output.objective or unified_output.what_user_means or ""
             entities = {}
 
         # Merge entities from continuation context if available
         if continuation_context:
-            resolved = continuation_context.get("resolved_entities", {})
+            resolved = continuation_context.get("entities", {})
             for k, v in resolved.items():
                 if k not in entities:
                     entities[k] = v
 
+        # NEW: Restore LLM entities SEPARATELY (ISOLATED from above)
+        # ONLY from continuation context, NO merging with other sources
+        llm_entities = {}
+        if continuation_context:
+            llm_entities = continuation_context.get("llm_entities", {}).copy()
+            logger.info(f"🔒 Restored ISOLATED LLM entities: {list(llm_entities.keys())}")
+
         task_context = TaskContext(
             user_intent=unified_output.what_user_means or "",
             objective=objective,
-            entities=entities,
+            entities=entities,  # Internal only
+            llm_entities=llm_entities,  # NEW: ISOLATED LLM track
             is_continuation=unified_output.is_continuation,
             continuation_type=unified_output.continuation_type
         )
@@ -1513,9 +1976,55 @@ Your response:"""
         
         NEW (Phase 3): Includes plan_action and existing_plan for plan-based execution.
         """
-        # Get entities from task context
+        # Get entities from task context (conversation entities - global)
         entities = task_context.get("entities", {}).copy()
-        logger.info(f"📊 Entities before enhancement: {json.dumps(entities, default=str)}")
+        logger.info(f"📊 Conversation entities: {json.dumps(entities, default=str)}")
+
+        # Get agent_name from reasoning routing
+        agent_name = reasoning.routing.agent if hasattr(reasoning.routing, 'agent') else None
+
+        # ✅ NEW: Add AGENT-SCOPED derived entities
+        entity_state = self.state_manager.get_entity_state(session_id)
+        if entity_state and agent_name:
+            derived_added = 0
+            derived_skipped_other_agent = 0
+            derived_skipped_invalid = 0
+
+            for key, derived_entity in entity_state.derived.entities.items():
+                # ✅ CRITICAL: Only include derived entities from THIS agent
+                if derived_entity.agent_name != agent_name:
+                    derived_skipped_other_agent += 1
+                    logger.debug(
+                        f"⏭️ Skipped derived entity '{key}' from other agent '{derived_entity.agent_name}'"
+                    )
+                    continue
+
+                # Check if valid
+                if not derived_entity.is_valid():
+                    derived_skipped_invalid += 1
+                    logger.debug(
+                        f"⚠️ Skipped invalid derived entity '{key}': "
+                        f"{derived_entity.invalidation_reason or 'expired'}"
+                    )
+                    continue
+
+                # Add to entities (don't overwrite conversation entities)
+                if key not in entities:
+                    entities[key] = derived_entity.value
+                    derived_added += 1
+                    logger.info(
+                        f"✅ Added derived entity '{key}' from {derived_entity.source_tool} "
+                        f"(age: {derived_entity.age_display()})"
+                    )
+
+            # Summary log
+            logger.info(
+                f"📊 Agent {agent_name} context: "
+                f"{len(entities)} total entities "
+                f"(derived: +{derived_added}, "
+                f"skipped_other_agents: {derived_skipped_other_agent}, "
+                f"skipped_invalid: {derived_skipped_invalid})"
+            )
 
         # CRITICAL: Inject patient_id from global state to prevent hallucinations
         # The LLM should not have to extract this from the system prompt
@@ -1541,11 +2050,60 @@ Your response:"""
             logger.info(f"📊 Enhanced entities with {len(entities_added)} injection(s): {', '.join(entities_added)}")
         logger.info(f"📊 Final agent context entities: {json.dumps(entities, default=str)}")
 
+        # NEW: Build ISOLATED LLM entities (ONLY from LLM updates + patient_id)
+        llm_entities = task_context.get("llm_entities", {}).copy()
+
+        # CRITICAL: ONLY inject patient_id into LLM entities, nothing else
+        try:
+            global_state = self.state_manager.get_global_state(session_id)
+            if global_state and global_state.patient_profile:
+                patient_id = global_state.patient_profile.patient_id
+                if patient_id and patient_id.strip():
+                    if "patient_id" not in llm_entities:
+                        llm_entities["patient_id"] = patient_id
+                        logger.info(f"🔒 Injected patient_id into ISOLATED LLM entities: {patient_id}")
+        except Exception as e:
+            logger.error(f"Error injecting patient_id into LLM entities: {e}")
+
+        logger.info(
+            f"🔒 LLM entities (ISOLATED): {len(llm_entities)} items: {list(llm_entities.keys())}"
+        )
+        logger.info(
+            f"📊 Internal entities (multi-source): {len(entities)} items"
+        )
+
+        # Calculate entity statistics
+        total_entities = len(entities)
+        # Estimate conversation entities (non-derived keys)
+        conversation_entities = sum(
+            1 for k in entities
+            if not k.endswith('_uuid') and not k.endswith('_id') and k != 'available_slots'
+        )
+        derived_entities_count = total_entities - conversation_entities
+
+        # Log entity statistics
+        logger.info(
+            f"📊 Entity stats: total={total_entities}, "
+            f"conversation={conversation_entities}, derived={derived_entities_count}"
+        )
+        
+        # Track with metrics
+        try:
+            from patient_ai_service.core.observability import (
+                entity_count,
+                derived_entity_count
+            )
+            entity_count.observe(total_entities)
+            derived_entity_count.observe(derived_entities_count)
+        except Exception:
+            pass  # Don't fail on metrics errors
+
         context = {
             # Task context
             "user_intent": task_context.get("user_intent", ""),
             "objective": task_context.get("objective", ""),  # NEW: Include objective
-            "entities": entities,  # Use enhanced entities with patient_id
+            "entities": entities,  # Multi-source (internal only, NEVER shown to LLM)
+            "llm_entities": llm_entities,  # NEW: ISOLATED (shown in prompts)
             "success_criteria": task_context.get("success_criteria", []),
             "constraints": task_context.get("constraints", []),
             "prior_context": task_context.get("prior_context"),

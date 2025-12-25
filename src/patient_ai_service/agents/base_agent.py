@@ -21,6 +21,7 @@ Key improvements:
 import json
 import logging
 import time
+import inspect
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable, Tuple, TYPE_CHECKING
 from datetime import datetime
@@ -41,6 +42,10 @@ from patient_ai_service.core.llm_config import (
     LLMConfig,
     LLMConfigManager,
     get_llm_config_manager,
+)
+from patient_ai_service.core.prompt_cache import (
+    get_universal_system_content,
+    get_cache_config,
 )
 from patient_ai_service.models.validation import ExecutionLog, ToolExecution
 from patient_ai_service.models.observability import (
@@ -777,7 +782,7 @@ class BaseAgent(ABC):
             self._llm_config_manager = get_llm_config_manager()
         return self._llm_config_manager
     
-    def _get_llm_config_for_function(self, function_name: str) -> LLMConfig:
+    def _get_llm_config_for_function(self, function_name: Optional[str] = None) -> LLMConfig:
         """
         Get hierarchically-resolved LLM config for a specific function.
         
@@ -795,7 +800,7 @@ class BaseAgent(ABC):
             function_name=function_name
         )
     
-    def _get_llm_client_for_function(self, function_name: str) -> LLMClient:
+    def _get_llm_client_for_function(self, function_name: Optional[str] = None) -> LLMClient:
         """
         Get hierarchically-configured LLM client for a specific function.
         
@@ -826,10 +831,11 @@ class BaseAgent(ABC):
     ):
         """Register a tool/action for this agent."""
         self._tools[name] = function
-        # Identify required parameters (those without defaults)
+        # Identify required parameters (those explicitly marked as required or without defaults)
+        # Default to optional (False) unless explicitly marked as required
         required = [
             param_name for param_name, param_schema in parameters.items()
-            if param_schema.get("required", True) and "default" not in param_schema
+            if param_schema.get("required", False) is True and "default" not in param_schema
         ]
         schema = {
             "name": name,
@@ -837,7 +843,7 @@ class BaseAgent(ABC):
             "input_schema": {
                 "type": "object",
                 "properties": parameters,
-                "required": required if required else list(parameters.keys())
+                "required": required  # Only include explicitly required parameters
             }
         }
         self._tool_schemas.append(schema)
@@ -955,10 +961,11 @@ Output ONLY valid JSON."""
         
         # Get hierarchical LLM config for plan generation
         # Note: plan generation doesn't have a specific function name, so use agent-level config
-        llm_config = self._get_llm_config_for_function("_think")  # Use _think config as closest match
+        # Pass None as function_name to get agent-level config (not function-level override)
+        llm_config = self._get_llm_config_for_function(None)  # Use agent-level config, not _think override
         plan_temperature = llm_config.temperature
         plan_max_tokens = llm_config.max_tokens
-        llm_client = self._get_llm_client_for_function("_think")
+        llm_client = self._get_llm_client_for_function(None)  # Use agent-level config, not _think override
         
         # Make LLM call with token tracking
         llm_start_time = time.time()
@@ -1041,6 +1048,24 @@ Output ONLY valid JSON."""
                     params=task_data.get("params", {}),
                     depends_on=task_data.get("depends_on", [])
                 )
+            
+            # Extract required tools from plan tasks
+            plan.required_tools = plan.extract_required_tools()
+
+            if plan.required_tools:
+                logger.info(
+                    f"📋 [{self.agent_name}] ✅ Extracted {len(plan.required_tools)} "
+                    f"required tools: {plan.required_tools}"
+                )
+            else:
+                logger.info(
+                    f"📋 [{self.agent_name}] ℹ️  No tools required "
+                    f"(all tasks conversational) - will use full catalog"
+                )
+
+            # Initialize tool scoping state
+            plan.all_tools_enabled = False
+            plan.tool_expansion_requested_at = None
         except Exception as e:
             logger.error(f"📋 [{self.agent_name}] Failed to parse plan: {e}")
             # Fallback: single generic task
@@ -1049,6 +1074,10 @@ Output ONLY valid JSON."""
                 tool=None,
                 params={}
             )
+            # Initialize tool scoping state even for fallback
+            plan.required_tools = []
+            plan.all_tools_enabled = False
+            plan.tool_expansion_requested_at = None
     
     def _extract_json(self, text: str) -> str:
         """Extract JSON from LLM response (handles markdown code blocks)."""
@@ -1122,11 +1151,11 @@ Output ONLY valid JSON."""
             pending_action = continuation_context.get('pending_action', {})
             pending_tool = (
                 pending_action.get('tool') or 
-                continuation_context.get('resolved_entities', {}).get('pending_tool')
+                continuation_context.get('entities', {}).get('pending_tool')
             )
             pending_tool_input = (
                 pending_action.get('tool_input') or 
-                continuation_context.get('resolved_entities', {}).get('pending_tool_input', {})
+                continuation_context.get('entities', {}).get('pending_tool_input', {})
             )
             
             if pending_tool:
@@ -1179,6 +1208,10 @@ Output ONLY valid JSON."""
                 entities=context.get("entities", {}),
                 constraints=context.get("constraints", [])
             )
+            # NEW: Initialize plan with llm_entities from context
+            if context.get("llm_entities"):
+                plan.llm_entities = context["llm_entities"].copy()
+                logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
             self.state_manager.store_agent_plan(session_id, plan)
 
         elif plan_action_str in ["resume", "update_resume"]:
@@ -1193,6 +1226,12 @@ Output ONLY valid JSON."""
                     plan.unblock_with_info(new_entities)
                     logger.info(f"📋 [{self.agent_name}] Updated plan with: {list(new_entities.keys())}")
                     logger.info(f"🧠 [{self.agent_name}] Plan status: {plan.status.value}")
+
+                    # NEW: Restore llm_entities from context if resuming
+                    if context.get("llm_entities"):
+                        plan.update_llm_entities_with_fifo(context["llm_entities"])
+                        logger.info(f"📋 [{self.agent_name}] Restored {len(context['llm_entities'])} LLM entities to plan")
+
                     self.state_manager.store_agent_plan(session_id, plan)
             else:
                 # Fallback: create new if no existing plan data
@@ -1202,6 +1241,10 @@ Output ONLY valid JSON."""
                     objective=context.get("objective", context.get("user_intent", "")),
                     entities=context.get("entities", {})
                 )
+                # NEW: Initialize plan with llm_entities from context
+                if context.get("llm_entities"):
+                    plan.llm_entities = context["llm_entities"].copy()
+                    logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
                 self.state_manager.store_agent_plan(session_id, plan)
         else:
             # Fallback: create new
@@ -1211,6 +1254,10 @@ Output ONLY valid JSON."""
                 objective=context.get("objective", context.get("user_intent", "")),
                 entities=context.get("entities", {})
             )
+            # NEW: Initialize plan with llm_entities from context
+            if context.get("llm_entities"):
+                plan.llm_entities = context["llm_entities"].copy()
+                logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
             self.state_manager.store_agent_plan(session_id, plan)
         
         # Initialize execution context
@@ -1288,21 +1335,68 @@ Output ONLY valid JSON."""
             logger.info(f"[{self.agent_name}] Decision: {thinking.decision}")
             logger.info(f"[{self.agent_name}] Reasoning: {thinking.reasoning[:100]}...")
 
-            # Persist updated resolved entities to global state, if provided
-            if getattr(thinking, "updated_resolved_entities", None):
-                try:
-                    self.state_manager.update_global_state(
-                        session_id,
-                        resolved_entities=thinking.updated_resolved_entities
-                    )
+            # NOTE: entities are persisted through ContinuationContext
+            # (set via set_continuation_context when CLARIFY/COLLECT_INFO decisions
+            # pause execution), NOT through GlobalState. See state.py for details.
+            if getattr(thinking, "updated_entities", None):
+                logger.info(
+                    f"✍️ [{self.agent_name}]   → Resolved entities available: "
+                    f"{list(thinking.updated_entities.keys())} "
+                    f"(will persist via ContinuationContext if needed)"
+                )
+
+                # ✅ NEW: Persist updated entities back to plan for next iteration
+                # This ensures delta updates accumulate across iterations
+                if exec_context.plan:
+                    exec_context.plan.update_entities_with_fifo(thinking.updated_entities)
                     logger.info(
-                        f"✍️ [{self.agent_name}]   → Updated global resolved_entities: "
-                        f"{list(thinking.updated_resolved_entities.keys())}"
+                        f"✍️ [{self.agent_name}]   → Updated plan.entities (FIFO): "
+                        f"{list(exec_context.plan.entities.keys())}"
                     )
-                except Exception as e:
-                    logger.warning(
-                        f"[{self.agent_name}] ⚠️ Failed to persist resolved_entities: {e}"
-                    )
+
+                    # NEW: Update LLM-only entities for prompt display
+                    if thinking.llm_delta:
+                        exec_context.plan.update_llm_entities_with_fifo(thinking.llm_delta)
+                        logger.info(
+                            f"📝 [{self.agent_name}]   → Updated plan.llm_entities: +{len(thinking.llm_delta)} LLM updates "
+                            f"(Total LLM entities: {len(exec_context.plan.llm_entities)})"
+                        )
+
+            # -----------------------------------------------------------------
+            # HANDLE TOOL EXPANSION REQUEST
+            # -----------------------------------------------------------------
+            
+            if thinking.request_all_tools and exec_context.plan and not exec_context.plan.all_tools_enabled:
+                logger.info(f"🔧 [{self.agent_name}] Tool expansion requested!")
+                logger.info(f"🔧 [{self.agent_name}]   Reason: {thinking.tool_expansion_reason or 'Not specified'}")
+                
+                # Enable all tools for this plan
+                exec_context.plan.all_tools_enabled = True
+                exec_context.plan.tool_expansion_requested_at = exec_context.iteration
+                
+                # Store updated plan
+                self.state_manager.store_agent_plan(session_id, exec_context.plan)
+                
+                logger.info(f"🔧 [{self.agent_name}]   ✅ Full tool catalog enabled")
+                logger.info(f"🔧 [{self.agent_name}]   → Re-calling _think() with ALL tools...")
+                
+                # Record expansion event
+                if settings.enable_observability:
+                    obs_logger = get_observability_logger(session_id)
+                    if obs_logger:
+                        obs_logger.record_custom_event(
+                            event_type="tool_expansion",
+                            data={
+                                "iteration": exec_context.iteration,
+                                "reason": thinking.tool_expansion_reason,
+                                "original_tool_count": len(exec_context.plan.required_tools),
+                                "total_tool_count": len(self._tool_schemas)
+                            }
+                        )
+                
+                # Re-run _think() with expanded tools (don't increment iteration)
+                exec_context.iteration -= 1  # Compensate for loop increment
+                continue  # Jump to next iteration
             
             # -----------------------------------------------------------------
             # ACT: Execute based on decision
@@ -1559,21 +1653,25 @@ Output ONLY valid JSON."""
             
             elif thinking.decision == AgentDecision.CLARIFY:
                 logger.info(f"[{self.agent_name}] Asking for clarification - saving state")
-                
+
                 # Save continuation context using response data
                 awaiting = thinking.response.clarification_needed or thinking.awaiting_info or "clarification"
-                # Use updated_resolved_entities as the canonical view if available
-                resolved = thinking.updated_resolved_entities or \
-                    thinking.response.resolved_entities or \
-                    thinking.resolved_entities or \
-                    self._extract_resolved_entities(exec_context)
-                
+                # Use updated_entities as the canonical view if available
+                resolved = thinking.updated_entities or \
+                    thinking.response.entities or \
+                    thinking.entities or \
+                    self._extract_entities(exec_context)
+
+                # Get LLM entities from plan
+                llm_entities = exec_context.plan.llm_entities.copy() if exec_context.plan and exec_context.plan.llm_entities else {}
+
                 self.state_manager.set_continuation_context(
                     session_id,
                     awaiting=awaiting,
                     options=[],
                     original_request=exec_context.user_request,
-                    resolved_entities=resolved,
+                    entities=resolved,
+                    llm_entities=llm_entities,  # NEW
                     blocked_criteria=[]
                 )
                 
@@ -1599,21 +1697,35 @@ Output ONLY valid JSON."""
 
             elif thinking.decision == AgentDecision.COLLECT_INFORMATION:
                 logger.info(f"[{self.agent_name}] Collecting information - saving state and generating response")
-                
+
                 # Save continuation context using response data
-                awaiting = thinking.response.information_needed or thinking.awaiting_info or "user_information"
-                # Use updated_resolved_entities as the canonical view if available
-                resolved = thinking.updated_resolved_entities or \
-                    thinking.response.resolved_entities or \
-                    thinking.resolved_entities or \
-                    self._extract_resolved_entities(exec_context)
-                
+                information_needed = thinking.response.information_needed or thinking.awaiting_info or "user_information"
+                # Use updated_entities as the canonical view if available
+                resolved = thinking.updated_entities or \
+                    thinking.response.entities or \
+                    thinking.entities or \
+                    self._extract_entities(exec_context)
+
+                # NEW: Build information collection context
+                awaiting_context = f"Collecting: {information_needed}"
+                information_collection = {
+                    "information_needed": information_needed,
+                    "information_question": thinking.response.information_question or "",
+                    "context": self.agent_name
+                }
+
+                # Get LLM entities from plan
+                llm_entities = exec_context.plan.llm_entities.copy() if exec_context.plan and exec_context.plan.llm_entities else {}
+
                 self.state_manager.set_continuation_context(
                     session_id,
-                    awaiting=awaiting,
+                    awaiting="information",  # Standardized trigger
+                    awaiting_context=awaiting_context,  # NEW
+                    information_collection=information_collection,  # NEW
                     options=[],  # No options for free-form input
                     original_request=exec_context.user_request,
-                    resolved_entities=resolved,
+                    entities=resolved,
+                    llm_entities=llm_entities,  # NEW
                     blocked_criteria=[c.description for c in exec_context.get_blocked_criteria()]
                 )
                 
@@ -1625,9 +1737,9 @@ Output ONLY valid JSON."""
                 )
 
                 # Mark plan as BLOCKED and persist for next turn (Fix 9)
-                self._mark_plan_blocked_and_store(session_id, exec_context, awaiting)
+                self._mark_plan_blocked_and_store(session_id, exec_context, "information")
 
-                logger.info(f"[{self.agent_name}] Saved continuation: awaiting={awaiting}, resolved={list(resolved.keys())}")
+                logger.info(f"[{self.agent_name}] Saved continuation: awaiting=information, information_needed={information_needed}, resolved={list(resolved.keys())}")
 
                 # Generate response using unified method
                 response = await self._generate_response(
@@ -1690,7 +1802,10 @@ Output ONLY valid JSON."""
                     "action_type": self._get_action_type(confirmation_action),
                     "summary": awaiting_context
                 }
-                
+
+                # Get LLM entities from plan
+                llm_entities = exec_context.plan.llm_entities.copy() if exec_context.plan and exec_context.plan.llm_entities else {}
+
                 # Save the pending action so we can execute it after confirmation
                 self.state_manager.set_continuation_context(
                     session_id,
@@ -1699,13 +1814,14 @@ Output ONLY valid JSON."""
                     pending_action=pending_action,       # NEW
                     options=["yes", "no", "confirm", "cancel"],
                     original_request=exec_context.user_request,
-                    resolved_entities={
+                    entities={
                         # Keep for backward compatibility
                         "pending_action": confirmation_action,
                         "pending_tool": pending_tool,
                         "pending_tool_input": pending_tool_input,
                         **confirmation_details
                     },
+                    llm_entities=llm_entities,  # NEW
                     blocked_criteria=[]
                 )
                 
@@ -2050,7 +2166,26 @@ Output ONLY valid JSON."""
         session_id: str,
         execution_context: 'ExecutionContext'
     ) -> str:
-        """Build thinking prompt using cached static content."""
+        """
+        DEPRECATED: This method is no longer used.
+        
+        The thinking prompt is now built using a 3-layer approach:
+        - Layer 1 (cached): get_universal_system_content()
+        - Layer 2 (not cached): _get_thinking_system_prompt(exec_context)
+        - Layer 3 (dynamic): _build_thinking_prompt(message, context, exec_context)
+        
+        This method is kept for backward compatibility but should not be called.
+        Use _get_thinking_system_prompt() and _build_thinking_prompt() instead.
+        """
+        import warnings
+        warnings.warn(
+            "_get_thinking_prompt() is deprecated. Use _get_thinking_system_prompt() "
+            "and _build_thinking_prompt() instead. This method will be removed in a future version.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        
+        # Build thinking prompt using cached static content (legacy implementation).
         
         # STATIC: Agent personality (cacheable per-agent, only patient context changes)
         base_prompt = self._get_system_prompt(session_id)
@@ -2253,6 +2388,11 @@ CRITICAL RULES:
                 }
         
         elif tool_name == "list_doctors":
+            # Don't use cache if it's an empty list - allow tool to be called to check for new doctors
+            if isinstance(cached_value, list) and len(cached_value) == 0:
+                logger.info(f"[{self.agent_name}] Cached doctors list is empty, calling tool to refresh")
+                return None  # Force tool call instead of using empty cache
+            
             return {
                 "success": True,
                 "result_type": "partial",
@@ -2275,20 +2415,29 @@ CRITICAL RULES:
         
         This is called after every successful tool execution.
         """
+        # Validation
+        if not self.agent_name:
+            logger.error(f"Agent name not set when storing derived entities for tool {tool_name}")
+            return
+
         try:
             stored = self.state_manager.store_tool_result(
                 session_id=session_id,
                 tool_name=tool_name,
                 tool_params=tool_input,
-                tool_result=tool_result
+                tool_result=tool_result,
+                agent_name=self.agent_name
             )
             
             if stored:
-                logger.debug(f"[{self.agent_name}] Stored derived entities: {stored}")
+                logger.info(
+                    f"Agent {self.agent_name} stored {len(stored)} derived entities "
+                    f"from {tool_name}: {stored}"
+                )
         
         except Exception as e:
             # Don't fail the tool call if entity storage fails
-            logger.warning(f"Failed to store derived entities: {e}")
+            logger.error(f"Error storing derived entities: {e}", exc_info=True)
 
     def _resolve_tool_input_templates(
         self,
@@ -2300,7 +2449,7 @@ CRITICAL RULES:
         Resolve template placeholders in tool_input using:
         1. Previous task results from observations
         2. Derived entities from state_manager
-        3. Plan's resolved_entities
+        3. Plan's entities
         
         Templates like {{task_1.doctor_id}} or {{doctor_uuid}} are resolved to actual values.
         """
@@ -2311,9 +2460,9 @@ CRITICAL RULES:
         # Build a resolution context from all available sources
         resolution_context = {}
         
-        # 1. From plan's resolved_entities
-        if exec_context.plan and exec_context.plan.resolved_entities:
-            resolution_context.update(exec_context.plan.resolved_entities)
+        # 1. From plan's entities
+        if exec_context.plan and exec_context.plan.entities:
+            resolution_context.update(exec_context.plan.entities)
         
         # 2. From observations (tool results)
         for obs in exec_context.observations:
@@ -2928,20 +3077,109 @@ FORBIDDEN:
         """
         return ""  # Default: no special instructions
 
-    def _get_thinking_system_prompt(self) -> str:
-        """Get system prompt for thinking phase."""
-        return f"""You are the thinking module for {self.agent_name}.
+    def _get_thinking_system_prompt(self, exec_context: Optional['ExecutionContext'] = None) -> str:
+        """
+        Get the AGENT-SPECIFIC system prompt (Layer 2 - NOT cached).
+
+        This returns the agent identity, instructions, and tools.
+        The universal guides are in Layer 1 (cached).
+        """
+        # Get tools description (scoped to plan if available)
+        logger.info(f"📝 [{self.agent_name}] Step 1: Getting tools description...")
+        
+        # Determine which tools to include
+        filter_tools = None  # Default: all tools
+        scoping_enabled = False
+        
+        if exec_context and exec_context.plan and exec_context.plan.should_use_scoped_tools():
+            filter_tools = exec_context.plan.required_tools
+            scoping_enabled = True
+            logger.info(
+                f"📝 [{self.agent_name}]   → Using scoped tools: {filter_tools} "
+                f"(FULL descriptions per tool)"
+            )
+        else:
+            logger.info(f"📝 [{self.agent_name}]   → Using full tool catalog")
+            if exec_context and exec_context.plan:
+                if exec_context.plan.all_tools_enabled:
+                    logger.info(
+                        f"📝 [{self.agent_name}]      Reason: Expansion requested "
+                        f"at iteration {exec_context.plan.tool_expansion_requested_at}"
+                    )
+                elif not exec_context.plan.required_tools:
+                    logger.info(
+                        f"📝 [{self.agent_name}]      Reason: Plan has no required tools"
+                    )
+            else:
+                logger.info(f"📝 [{self.agent_name}]      Reason: No plan exists")
+        
+        # Get tool descriptions (filtered or full, but ALWAYS with complete details per tool)
+        tools_desc = self._get_tools_description(filter_tools=filter_tools)
+        
+        logger.info(
+            f"📝 [{self.agent_name}]   ✅ Tools description length: {len(tools_desc)} chars"
+        )
+        
+        # Calculate and log token savings
+        if scoping_enabled:
+            all_tools_desc = self._get_tools_description()
+            saved_chars = len(all_tools_desc) - len(tools_desc)
+            estimated_tokens_saved = saved_chars // 4
+            logger.info(
+                f"📝 [{self.agent_name}]   💰 Estimated tokens saved: ~{estimated_tokens_saved}"
+            )
+        
+        logger.debug(f"📝 [{self.agent_name}]   → Tools description:\n{tools_desc}")
+        
+        # Build scoping warning text if scoping is enabled
+        scoping_warning = ""
+        if scoping_enabled:
+            scoping_warning = """
+[!] TOOL SCOPING ACTIVE
+================================================================================
+
+Only tools required by your plan are shown above. Each tool has its FULL
+description with all parameters and details.
+
+If you discover you need a tool NOT listed (e.g., user changed their mind,
+tool failed and you need alternative):
+
+  1. Set "request_all_tools": true in your JSON response
+  2. Set "tool_expansion_reason": "Brief explanation why"
+  3. You will be called again with the complete tool catalog
+
+"""
+        
+        tools_header_suffix = " (SCOPED TO PLAN)" if scoping_enabled else ""
+        
+        return f"""
+═══════════════════════════════════════════════════════════════════════════════
+YOU ARE THE THINKING MODULE
+═══════════════════════════════════════════════════════════════════════════════
+
+You are the thinking module for the {self.agent_name} agent.
 
 Your job is to:
-1. Analyze the current situation
-2. Decide the best next action
-3. Know when to stop
+1. Analyze the current situation based on observations
+2. Decide the best next action to take
+3. Know when the task is complete
 
-{self._get_result_type_guide()}
+═══════════════════════════════════════════════════════════════════════════════
+AGENT-SPECIFIC INSTRUCTIONS
+═══════════════════════════════════════════════════════════════════════════════
 
-{self._get_decision_guide()}
+{self._get_agent_instructions() or 'No special instructions for this agent.'}
 
-Always respond with valid JSON in the specified format."""
+═══════════════════════════════════════════════════════════════════════════════
+🛠️  AVAILABLE TOOLS{tools_header_suffix}
+═══════════════════════════════════════════════════════════════════════════════
+
+{tools_desc}
+
+{scoping_warning}═══════════════════════════════════════════════════════════════════════════════
+CRITICAL: Always respond with valid JSON in the exact format specified.
+═══════════════════════════════════════════════════════════════════════════════
+"""
 
     def _get_result_type_guide(self) -> str:
         """Guide for understanding tool result types."""
@@ -3024,14 +3262,14 @@ CLARIFY:
 - Ask a specific question
 - MUST specify clarification_question
 - MUST specify awaiting_info (what you need)
-- MUST specify resolved_entities (what you already have)
+- MUST specify entities (what you already have)
 
 COLLECT_INFORMATION:
 - You need to exit the agentic loop to collect information from the user
 - Use this when you need to gather data before continuing execution
 - Response will pass through focused response generation for natural output
 - MUST specify awaiting_info (what you need)
-- MUST specify resolved_entities (what you already have)
+- MUST specify entities (what you already have)
 
 REQUEST_CONFIRMATION:
 - Use BEFORE executing critical actions: book_appointment, cancel_appointment, reschedule_appointment
@@ -3052,10 +3290,235 @@ RETRY:
         context: Dict[str, Any],
         exec_context: ExecutionContext
     ) -> str:
-        """Build the prompt for the thinking phase with FULL context from reasoning engine."""
-        logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
-        logger.info(f"📝 [{self.agent_name}] BUILDING THINKING PROMPT")
-        logger.info(f"📝 [{self.agent_name}] ─────────────────────────────────────────")
+        """
+        Build the DYNAMIC thinking prompt (Layer 3 - NOT cached).
+
+        This contains only information that changes per request:
+        - User message
+        - Intent from reasoning engine
+        - Resolved entities (filtered for relevance)
+        - Observations from execution
+        - Plan status
+        """
+        logger.info(f"📝 [{self.agent_name}] Building dynamic thinking prompt...")
+
+        # Extract context fields
+        user_intent = context.get('user_intent') or context.get('what_user_means', 'Not specified')
+        entities = context.get('entities', {})  # Internal use only (NOT shown in prompt)
+        llm_entities = context.get('llm_entities', {})  # NEW: ISOLATED LLM-only entities
+        constraints = context.get('constraints', [])
+        routing_action = context.get('routing_action', context.get('action', 'Not specified'))
+
+        # NOTE: llm_entities ONLY contains:
+        #   1. Entities YOU explicitly updated via entities_to_update
+        #   2. patient_id (auto-injected by system)
+        # To get other data (slots, doctor info, etc.), use tools!
+
+
+        # Build continuation section if applicable (unified reasoning v3)
+        continuation_section = ""
+        if context.get('is_continuation', False):
+            continuation_type = context.get('continuation_type') or context.get('situation_type')
+            selected_option = context.get('selected_option')
+            continuation_section = f"""
+CONTINUATION:
+Type: {continuation_type or 'unknown'}
+Selected: {selected_option or 'None'}
+"""
+
+        # Get plan status (compact)
+        plan_status = "No plan"
+        if exec_context.plan:
+            plan = exec_context.plan
+            completed = len(plan.get_completed_task_ids())
+            total = len(plan.tasks)
+            plan_status = f"{plan.objective} [{completed}/{total} complete]"
+
+        # Build compact observations summary
+        observations = exec_context.get_observations_summary() or "(none yet)"
+
+        # Assemble complete dynamic prompt with JSON schema
+        prompt = f"""
+═══════════════════════════════════════════════════════════════════════════════
+CURRENT SITUATION
+═══════════════════════════════════════════════════════════════════════════════
+
+User's Message: {message}
+
+Reasoning Engine Analysis:
+  Intent: {user_intent}
+  Recommended Action: {routing_action}
+
+LLM-Managed Entities (ISOLATED):
+{json.dumps(llm_entities, indent=2, default=str) if llm_entities else '  (empty - start fresh or patient_id will be injected)'}
+
+IMPORTANT: These are ONLY entities YOU explicitly manage via entities_to_update.
+- patient_id is auto-injected for you
+- NO other entities from tools, reasoning, or system are shown here
+- Update these by including entities_to_update in your response
+- Use tools to get other data (available slots, doctor info, etc.)
+
+{continuation_section}
+
+═══════════════════════════════════════════════════════════════════════════════
+EXECUTION STATUS
+═══════════════════════════════════════════════════════════════════════════════
+
+Plan: {plan_status}
+
+Observations (Iteration {exec_context.iteration}):
+{observations}
+
+═══════════════════════════════════════════════════════════════════════════════
+YOUR TASK
+═══════════════════════════════════════════════════════════════════════════════
+
+Analyze the situation and decide your next action.
+
+Follow the OUTPUT FORMAT and DECISION GUIDE from the system prompt.
+"""
+
+        logger.info(f"📝 [{self.agent_name}] Dynamic prompt: {len(prompt)} chars")
+        return prompt
+
+    def _filter_relevant_entities(
+        self,
+        entities: Dict[str, Any],
+        context: Dict[str, Any],
+        max_entities: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Filter resolved entities to only include relevant ones.
+        
+        Keeps:
+        - Core identifiers (patient_id, session_id)
+        - Entities mentioned in current intent
+        - Recently used entities
+        """
+        if not entities or len(entities) <= max_entities:
+            return entities
+        
+        # Always keep core identifiers
+        core_keys = {'patient_id', 'session_id', 'user_id'}
+        
+        # Get intent to check relevance
+        intent = context.get('user_intent', '') + ' ' + context.get('what_user_means', '')
+        intent_lower = intent.lower()
+        
+        # Score entities
+        scored = {}
+        for key, value in entities.items():
+            if key in core_keys:
+                scored[key] = 100  # Always include
+            elif key.lower() in intent_lower or str(value).lower() in intent_lower:
+                scored[key] = 50  # Mentioned in intent
+            else:
+                scored[key] = 1  # Low priority
+        
+        # Keep top N
+        sorted_keys = sorted(scored.keys(), key=lambda k: scored[k], reverse=True)
+        return {k: entities[k] for k in sorted_keys[:max_entities]}
+
+    def _get_result_type_guide(self) -> str:
+        """Guide for understanding tool result types."""
+        return """
+═══════════════════════════════════════════════════════════════════════════════
+UNDERSTANDING TOOL RESULTS
+═══════════════════════════════════════════════════════════════════════════════
+
+After each tool call, the result has a result_type that tells you what to do:
+
+┌─────────────────┬────────────────────────────────────────────────────────────┐
+│ result_type     │ What it means & What to do                                 │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ SUCCESS         │ ✅ Goal achieved! Mark criterion complete.                  │
+│                 │    Look for: success=true, appointment_id, confirmation    │
+│                 │    Action: Mark relevant criterion COMPLETE, continue      │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ PARTIAL         │ ⏳ Progress made, more steps needed.                        │
+│                 │    Look for: data returned but more actions needed         │
+│                 │    Action: Continue to next logical step                   │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ USER_INPUT      │ 🔄 STOP! Cannot proceed without user decision.             │
+│                 │    Look for: alternatives array, available=false           │
+│                 │    Action: RESPOND_WITH_OPTIONS - present choices to user  │
+│                 │    DO NOT keep trying tools - user must choose!            │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ RECOVERABLE     │ 🔧 Try a different approach.                               │
+│                 │    Look for: recovery_action field                         │
+│                 │    Action: Try suggested recovery action or alternative    │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ FATAL           │ ❌ Cannot complete this request.                           │
+│                 │    Look for: error with no recovery path                   │
+│                 │    Action: RESPOND_IMPOSSIBLE - explain why, suggest alt   │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ SYSTEM_ERROR    │ 🚫 Infrastructure failure.                                 │
+│                 │    Look for: database error, timeout, connection issue     │
+│                 │    Action: RETRY with different tool, then RESPOND_IMPOSSIBLE│
+└─────────────────┴────────────────────────────────────────────────────────────┘
+
+CRITICAL: When result_type is USER_INPUT:
+- This is NOT a failure!
+- The tool worked correctly
+- But user must make a choice before proceeding
+- You MUST stop and present options
+- DO NOT try other tools hoping for different result
+"""
+
+    def _get_decision_guide(self) -> str:
+        """Guide for making decisions."""
+        return """
+═══════════════════════════════════════════════════════════════════════════════
+DECISION GUIDE
+═══════════════════════════════════════════════════════════════════════════════
+
+Choose your decision based on the situation:
+
+CALL_TOOL:
+- You need information or want to perform an action
+- You have all required parameters
+- No criteria are blocked waiting for user input
+
+RESPOND_COMPLETE (with is_task_complete=true):
+- ALL success criteria are COMPLETE
+- You have confirmation/evidence for each criterion
+- Time to give user the good news!
+
+RESPOND_WITH_OPTIONS:
+- A tool returned result_type=USER_INPUT
+- You have alternatives to present
+- User must choose before you can continue
+
+RESPOND_IMPOSSIBLE:
+- A tool returned result_type=FATAL
+- The request cannot be fulfilled
+- Explain why and suggest alternatives if any
+
+CLARIFY:
+- You don't have enough information
+- Required parameters are missing
+- Ask a specific question
+- MUST specify clarification_question
+- MUST specify awaiting_info (what you need)
+- MUST specify entities (what you already have)
+
+COLLECT_INFORMATION:
+- You need to exit the agentic loop to collect information from the user
+- Use this when you need to gather data before continuing execution
+- Response will pass through focused response generation for natural output
+- MUST specify awaiting_info (what you need)
+- MUST specify entities (what you already have)
+
+REQUEST_CONFIRMATION:
+- Use BEFORE executing critical actions: book_appointment, cancel_appointment, reschedule_appointment
+- MUST specify confirmation_summary with full details (action, details, tool_name, tool_input)
+- Wait for user to confirm before calling the tool
+
+RETRY:
+- A tool returned result_type=SYSTEM_ERROR
+- Haven't exceeded retry limit
+- Tool returned recovery_action
+"""
         
         # Get tools description
         logger.info(f"📝 [{self.agent_name}] Step 1: Getting tools description...")
@@ -3070,16 +3533,19 @@ RETRY:
         constraints = context.get('constraints', [])
         prior_context = context.get('prior_context', 'None')
         routing_action = context.get('routing_action', context.get('action', 'Not specified'))
-        
-        # Get resolved_entities from GlobalState (conversation-scoped memory)
-        global_state = self.state_manager.get_global_state(exec_context.session_id)
-        resolved_entities = getattr(global_state, "resolved_entities", {}) or {}
-        
+
+        # Get entities from the plan (accumulated during execution)
+        # NOTE: These come from AgentPlan.entities, NOT GlobalState.
+        # GlobalState.entities was removed to eliminate confusion.
+        plan_entities = {}
+        if exec_context.plan and exec_context.plan.entities:
+            plan_entities = exec_context.plan.entities
+
         logger.info(f"📝 [{self.agent_name}]   → User intent: {user_intent}")
         logger.info(f"📝 [{self.agent_name}]   → Routing action: {routing_action}")
         logger.info(f"📝 [{self.agent_name}]   → Prior context: {prior_context}")
         logger.info(f"📝 [{self.agent_name}]   → Entities: {list(entities.keys()) if entities else 'None'}")
-        logger.info(f"✍️ [{self.agent_name}]   → Resolved entities: {list(resolved_entities.keys()) if resolved_entities else 'None'}")
+        logger.info(f"✍️ [{self.agent_name}]   → Plan entities: {list(plan_entities.keys()) if plan_entities else 'None'}")
         logger.info(f"📝 [{self.agent_name}]   → Constraints: {len(constraints)} constraint(s)")
         
         # Check for continuation
@@ -3172,7 +3638,7 @@ Entities Identified (from reasoning):
 {json.dumps(entities, indent=2, default=str) if entities else '(none)'}
 
 Resolved Entities (from previous conversation turns):
-{json.dumps(resolved_entities, indent=2, default=str) if resolved_entities else '(none)'}
+{json.dumps(plan_entities, indent=2, default=str) if plan_entities else '(none)'}
 
 Constraints:
 {chr(10).join(f'  - {c}' for c in constraints) if constraints else '  (none)'}
@@ -3244,13 +3710,13 @@ Respond with JSON:
     // RESPONSE DATA - Fill based on decision type
     // ═══════════════════════════════════════════════════════════════
     "response": {{
-        // Always fill resolved_entities with EVERYTHING you know so far:
+        // Always fill entities with EVERYTHING you know so far:
         //
         // - Include all relevant facts collected in this conversation
         // - Merge in new information from the current turn
         // - Overwrite values that changed (e.g., new doctor preference)
         // - Remove entries that are no longer valid for the current plan
-        "resolved_entities": {{
+        "entities": {{
             "patient_id": "...",
             "doctor_name": "...",
             "date": "...",
@@ -3295,27 +3761,27 @@ DECISION → RESPONSE MAPPING
 ═══════════════════════════════════════════════════════════════════════════════
 
 COLLECT_INFORMATION:
-  → Fill: information_needed, information_question, resolved_entities
+  → Fill: information_needed, information_question, entities
   → Example: Need visit_reason before booking
   → Response will ASK for missing info, NOT promise action
 
 CLARIFY:
-  → Fill: clarification_needed, clarification_question, resolved_entities
+  → Fill: clarification_needed, clarification_question, entities
   → Example: "3pm" could mean today or tomorrow
   → Response will ask clarifying question
 
 RESPOND_WITH_OPTIONS:
-  → Fill: options, options_context, options_reason, resolved_entities
+  → Fill: options, options_context, options_reason, entities
   → Example: Requested time unavailable, here are alternatives
   → Response will present options
 
 RESPOND_IMPOSSIBLE:
-  → Fill: failure_reason, failure_suggestion, resolved_entities
+  → Fill: failure_reason, failure_suggestion, entities
   → Example: Doctor doesn't exist in system
   → Response will explain failure and suggest alternatives
 
 RESPOND_COMPLETE:
-  → Fill: completion_summary, completion_details, resolved_entities
+  → Fill: completion_summary, completion_details, entities
   → Example: Appointment successfully booked
   → Response will confirm what was done with details
 
@@ -3328,7 +3794,7 @@ CRITICAL RULES:
 - NEVER say "I'll check..." or "I'll do..." unless you're about to CALL_TOOL
 - COLLECT_INFORMATION = ASK for info, don't promise action
 - Only RESPOND_COMPLETE after tools have actually succeeded
-- Fill resolved_entities with EVERYTHING you know so far
+- Fill entities with EVERYTHING you know so far
 
 DECISION RULES:
 1. If reasoning engine provided clear guidance → EXECUTE IT (call appropriate tools)
@@ -3458,7 +3924,7 @@ DECISION RULES:
             tool_input = None
             clarification_question = None
             awaiting_info = None
-            resolved_entities = None
+            entities = None
             
             if decision == AgentDecision.CALL_TOOL:
                 tool_name = data.get("tool_name")
@@ -3479,12 +3945,12 @@ DECISION RULES:
             elif decision == AgentDecision.COLLECT_INFORMATION:
                 logger.info(f"🔍 [{self.agent_name}]   → Collecting information - will generate focused response")
             
-            # Extract awaiting_info and resolved_entities for COLLECT_INFORMATION and CLARIFY
+            # Extract awaiting_info and entities for COLLECT_INFORMATION and CLARIFY
             if decision in [AgentDecision.COLLECT_INFORMATION, AgentDecision.CLARIFY]:
                 awaiting_info = data.get("awaiting_info")
-                resolved_entities = data.get("resolved_entities", {})
+                entities = data.get("entities", {})
                 logger.info(f"🔍 [{self.agent_name}]   → Awaiting info: {awaiting_info}")
-                logger.info(f"✍️ [{self.agent_name}]   → Resolved entities (from thinking JSON): {list(resolved_entities.keys()) if resolved_entities else 'None'}")
+                logger.info(f"✍️ [{self.agent_name}]   → Resolved entities (from thinking JSON): {list(entities.keys()) if entities else 'None'}")
             
             # Extract confirmation_summary for REQUEST_CONFIRMATION (legacy)
             confirmation_summary = None
@@ -3499,6 +3965,13 @@ DECISION RULES:
                         logger.warning(f"🔍 [{self.agent_name}]   ⚠️  Failed to parse confirmation_summary: {e}")
                 else:
                     logger.warning(f"🔍 [{self.agent_name}]   ⚠️  REQUEST_CONFIRMATION but no confirmation_summary provided!")
+            
+            # Extract tool expansion request (optional fields)
+            request_all_tools = data.get("request_all_tools", False)
+            tool_expansion_reason = data.get("tool_expansion_reason")
+            
+            if request_all_tools:
+                logger.info(f"🔍 [{self.agent_name}]   → Expansion requested: {tool_expansion_reason}")
             
             # Extract response object (NEW structured approach)
             logger.info(f"🔍 [{self.agent_name}] Step 8: Extracting response data...")
@@ -3524,7 +3997,7 @@ DECISION RULES:
                     information_question=None,  # Will be generated from information_needed
                     clarification_needed=None,
                     clarification_question=clarification_question,
-                    resolved_entities=resolved_entities or {},
+                    entities=entities or {},
                     confirmation_action=confirmation_summary.action if confirmation_summary else None,
                     confirmation_details=confirmation_summary.details if confirmation_summary else {},
                     confirmation_question=None  # Will be generated
@@ -3533,19 +4006,66 @@ DECISION RULES:
             # Build result
             logger.info(f"🔍 [{self.agent_name}] Step 9: Building ThinkingResult object...")
 
-            # Determine updated_resolved_entities for persistent conversation memory.
+            # Determine updated_entities for persistent conversation memory.
             # Priority order:
-            # 1) response.resolved_entities if present
-            # 2) legacy resolved_entities field if present
-            # 3) fall back to existing global_state.resolved_entities (no change)
-            global_state = self.state_manager.get_global_state(exec_context.session_id)
-            previous_resolved = getattr(global_state, "resolved_entities", {}) or {}
+            # 1) entities_to_update (delta format) - merge into current entities
+            # 2) response.entities if present (from LLM structured response - complete state)
+            # 3) legacy entities field if present (from LLM JSON)
+            # 4) fall back to plan's entities (accumulated during execution)
+            # NOTE: GlobalState.entities was removed - use plan or context instead.
+            previous_resolved = {}
+            if exec_context.plan and exec_context.plan.entities:
+                previous_resolved = exec_context.plan.entities.copy()
             updated_resolved = previous_resolved.copy()
 
-            if response_data.resolved_entities:
-                updated_resolved.update(response_data.resolved_entities)
-            elif resolved_entities:
-                updated_resolved.update(resolved_entities)
+            # NEW: Initialize LLM delta tracking (ISOLATED from multi-source entities)
+            llm_delta = {}
+
+            # ✅ NEW: Check for delta format first
+            if response_obj and "entities_to_update" in response_obj:
+                # Delta update format
+                delta = response_obj.get("entities_to_update", {})
+                llm_delta = delta.copy()  # NEW: Preserve for LLM-only tracking
+                
+                # Track metrics
+                try:
+                    from patient_ai_service.core.observability import (
+                        delta_update_count,
+                        delta_size
+                    )
+                    delta_update_count.labels(format='delta').inc()
+                    delta_size.observe(len(delta))
+                except Exception:
+                    pass  # Don't fail on metrics errors
+                
+                # Apply delta (update existing, add new)
+                for key, value in delta.items():
+                    updated_resolved[key] = value
+
+                logger.info(
+                    f"✅ Applied delta update: {len(delta)} entities changed/added "
+                    f"(LLM track: {len(llm_delta)}, Total internal: {len(updated_resolved)})"
+                )
+                
+                # Also update response_data.entities for backward compatibility
+                if response_data:
+                    response_data.entities = updated_resolved.copy()
+            
+            # Fallback to complete state format
+            elif response_data and response_data.entities:
+                # Track metrics
+                try:
+                    from patient_ai_service.core.observability import delta_update_count
+                    delta_update_count.labels(format='complete').inc()
+                except Exception:
+                    pass
+                
+                updated_resolved.update(response_data.entities)
+                logger.info(
+                    f"Using complete state format: {len(response_data.entities)} entities"
+                )
+            elif entities:
+                updated_resolved.update(entities)
 
             result = ThinkingResult(
                 analysis=analysis,
@@ -3558,10 +4078,13 @@ DECISION RULES:
                 clarification_question=clarification_question,  # Legacy
                 is_task_complete=is_task_complete,
                 awaiting_info=awaiting_info,  # Legacy
-                resolved_entities=resolved_entities,  # Legacy
+                entities=entities,  # Legacy
                 confirmation_summary=confirmation_summary,  # Legacy
                 response=response_data,  # NEW structured response
-                updated_resolved_entities=updated_resolved
+                updated_entities=updated_resolved,
+                llm_delta=llm_delta,  # NEW: LLM-only entity updates (ISOLATED)
+                request_all_tools=request_all_tools,
+                tool_expansion_reason=tool_expansion_reason
             )
             
             logger.info(f"🔍 [{self.agent_name}]   ✅ ThinkingResult created successfully")
@@ -3601,7 +4124,7 @@ DECISION RULES:
                 clarification_question="I'm having trouble understanding. Could you please rephrase your request?"
             )
 
-    def _extract_resolved_entities(self, exec_context: ExecutionContext) -> Dict[str, Any]:
+    def _extract_entities(self, exec_context: ExecutionContext) -> Dict[str, Any]:
         """Extract what we've already resolved from execution context and observations."""
         resolved = {}
         
@@ -3654,6 +4177,18 @@ DECISION RULES:
                 awaiting=awaiting,
                 options=options or []
             )
+
+            # 🔍 ADD DETAILED LOGGING HERE
+            logger.info(f"🔍🔍🔍 [PLAN SAVE DEBUG] ═══════════════════════════════")
+            logger.info(f"🔍 Session ID: {session_id}")
+            logger.info(f"🔍 Agent name (self): {self.agent_name}")
+            logger.info(f"🔍 Agent name (plan): {exec_context.plan.agent_name}")
+            logger.info(f"🔍 Plan status: {exec_context.plan.status}")
+            logger.info(f"🔍 Plan objective: {exec_context.plan.objective}")
+            logger.info(f"🔍 Plan entities: {list(exec_context.plan.entities.keys())}")
+            logger.info(f"🔍 Plan awaiting: {exec_context.plan.awaiting_info}")
+            logger.info(f"🔍🔍🔍 ════════════════════════════════════════════════")
+
             self.state_manager.store_agent_plan(session_id, exec_context.plan)
             logger.info(f"🛑 [{self.agent_name}] Plan marked BLOCKED and stored: {reason}")
         else:
@@ -3702,14 +4237,40 @@ DECISION RULES:
         else:
             return "action"
 
-    def _get_tools_description(self) -> str:
-        """Get description of available tools with full parameter details for the prompt."""
+    def _get_tools_description(self, filter_tools: Optional[List[str]] = None) -> str:
+        """
+        Get description of available tools with FULL parameter details for the prompt.
+
+        Args:
+            filter_tools: Optional list of tool names to include. If None, includes all tools.
+                         Each included tool receives its COMPLETE description with all parameters.
+
+        Returns:
+            Formatted string description of tools
+        """
         if not hasattr(self, '_tool_schemas') or not self._tool_schemas:
             return "No tools available."
 
+        # Apply tool filter if provided
+        if filter_tools is not None:
+            if not filter_tools:
+                return "No tools available."
+
+            # Filter to only requested tools (but keep FULL descriptions)
+            filtered_schemas = [s for s in self._tool_schemas if s.get("name") in filter_tools]
+
+            if not filtered_schemas:
+                logger.warning(f"[{self.agent_name}] Tool filter requested {filter_tools} but none found in schemas")
+                return "No tools available."
+
+            schemas_to_describe = filtered_schemas
+        else:
+            # No filter - use all tools
+            schemas_to_describe = self._tool_schemas
+
         lines = []
 
-        for schema in self._tool_schemas:
+        for schema in schemas_to_describe:
             name = schema.get("name")
             description = schema.get("description", "No description")
             params = schema['input_schema'].get('properties', {})
@@ -3789,10 +4350,10 @@ DECISION RULES:
         """
         Think about the current situation and decide next action.
         
-        This is where the LLM analyzes:
-        - What has been done (observations)
-        - What remains to do (plan)
-        - What to do next (decision)
+        Uses layered prompt caching:
+        - Layer 1 (Cached): Universal guides, decision rules
+        - Layer 2 (Not Cached): Agent identity, tools
+        - Layer 3 (Not Cached): Dynamic context
         """
         logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
         logger.info(f"🧠 [{self.agent_name}] ENTERING _think() - Iteration {exec_context.iteration}")
@@ -3865,63 +4426,107 @@ DECISION RULES:
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
         
-        # Get hierarchical LLM config for _think function
+        # Get LLM config
         llm_config = self._get_llm_config_for_function("_think")
-        thinking_temperature = llm_config.temperature
         llm_client = self._get_llm_client_for_function("_think")
         
-        system_prompt = self._get_thinking_system_prompt()
-        logger.info(f"🧠 [{self.agent_name}]   → Model: {llm_config.model}")
-        logger.info(f"🧠 [{self.agent_name}]   → Provider: {llm_config.provider}")
-        logger.info(f"🧠 [{self.agent_name}]   → Temperature: {thinking_temperature}")
-        logger.info(f"🧠 [{self.agent_name}]   → System prompt length: {len(system_prompt)} chars")
-        logger.debug(f"🧠 [{self.agent_name}]   → System prompt:\n{system_prompt}")
+        # Build prompt layers
+        # Layer 1: Universal (cached)
+        universal_content = get_universal_system_content()
+        
+        # Layer 2: Agent-specific (not cached)
+        agent_content = self._get_thinking_system_prompt(exec_context)
+        
+        # Layer 3: Dynamic (user prompt)
+        dynamic_prompt = self._build_thinking_prompt(message, context, exec_context)
+        
+        # Check if caching is enabled and client supports it
+        use_caching = (
+            llm_config.prompt_cache_enabled and
+            hasattr(llm_client, 'create_message_with_cache_and_usage') and
+            llm_config.provider == 'anthropic'
+        )
+
+        logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+        logger.info(f"🧠 [{self.agent_name}] PROMPT STRUCTURE:")
+        logger.info(f"🧠 [{self.agent_name}] Cache enabled: {use_caching} (config: {llm_config.prompt_cache_enabled}, provider: {llm_config.provider})")
+        logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+
+        if use_caching:
+            logger.info(f"🧠 [{self.agent_name}] 📌 SYSTEM PROMPT (CACHED) - Layer 1: Universal Content (~{len(universal_content)//4} tokens)")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+            logger.info(f"🧠 [{self.agent_name}] {universal_content}")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+            logger.info(f"🧠 [{self.agent_name}] 📄 SYSTEM PROMPT (NOT CACHED) - Layer 2: Agent-Specific (~{len(agent_content)//4} tokens)")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+            logger.info(f"🧠 [{self.agent_name}] {agent_content}")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+        else:
+            combined_system = universal_content + "\n\n" + agent_content
+            logger.info(f"🧠 [{self.agent_name}] 📄 SYSTEM PROMPT (NO CACHING) - Combined (~{len(combined_system)//4} tokens)")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+            logger.info(f"🧠 [{self.agent_name}] {combined_system}")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+
+        logger.info(f"🧠 [{self.agent_name}] 💬 USER PROMPT - Layer 3: Dynamic Context (~{len(dynamic_prompt)//4} tokens)")
+        logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+        logger.info(f"🧠 [{self.agent_name}] {dynamic_prompt}")
+        logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
         
         llm_start_time = time.time()
-        logger.info(f"🧠 [{self.agent_name}]   → Calling LLM at {datetime.utcnow().isoformat()}...")
         
         try:
-            # ═════════════════════════════════════════════════════════════════
-            # STEP 4: EXECUTE LLM CALL
-            # ═════════════════════════════════════════════════════════════════
-            logger.info(f"🧠 [{self.agent_name}] [STEP 4/5] Executing LLM call...")
-            
-            # Try to get token usage if available
-            if hasattr(llm_client, 'create_message_with_usage'):
-                logger.info(f"🧠 [{self.agent_name}]   → Using create_message_with_usage (token tracking enabled)")
-                response, tokens = llm_client.create_message_with_usage(
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=thinking_temperature,
+            if use_caching:
+                # Use cached method
+                response, tokens = llm_client.create_message_with_cache_and_usage(
+                    system_cached=universal_content,
+                    system_dynamic=agent_content,
+                    messages=[{"role": "user", "content": dynamic_prompt}],
+                    temperature=llm_config.temperature,
                     max_tokens=llm_config.max_tokens
                 )
+                
+                # Log cache status
+                if tokens.cache_read_input_tokens > 0:
+                    logger.info(f"🎯 [{self.agent_name}] CACHE HIT: {tokens.cache_read_input_tokens} tokens from cache")
+                elif tokens.cache_creation_input_tokens > 0:
+                    logger.info(f"📝 [{self.agent_name}] CACHE WRITE: {tokens.cache_creation_input_tokens} tokens to cache")
             else:
-                logger.info(f"🧠 [{self.agent_name}]   → Using create_message (no token tracking)")
-                response = llm_client.create_message(
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=thinking_temperature,
-                    max_tokens=llm_config.max_tokens
-                )
-                tokens = TokenUsage()
+                # Fall back to non-cached method
+                system_prompt = universal_content + "\n\n" + agent_content
+                
+                if hasattr(llm_client, 'create_message_with_usage'):
+                    response, tokens = llm_client.create_message_with_usage(
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": dynamic_prompt}],
+                        temperature=llm_config.temperature,
+                        max_tokens=llm_config.max_tokens
+                    )
+                else:
+                    response = llm_client.create_message(
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": dynamic_prompt}],
+                        temperature=llm_config.temperature,
+                        max_tokens=llm_config.max_tokens
+                    )
+                    tokens = TokenUsage()
             
             llm_duration_seconds = time.time() - llm_start_time
-            
-            logger.info(f"🧠 [{self.agent_name}]   ✅ LLM call completed in {llm_duration_seconds:.3f}s")
-            logger.info(f"🧠 [{self.agent_name}]   → Token usage:")
-            logger.info(f"🧠 [{self.agent_name}]       • Input tokens: {tokens.input_tokens if hasattr(tokens, 'input_tokens') else 'N/A'}")
-            logger.info(f"🧠 [{self.agent_name}]       • Output tokens: {tokens.output_tokens if hasattr(tokens, 'output_tokens') else 'N/A'}")
-            logger.info(f"🧠 [{self.agent_name}]       • Total tokens: {tokens.total_tokens if hasattr(tokens, 'total_tokens') else 'N/A'}")
-            logger.info(f"🧠 [{self.agent_name}]   → Response length: {len(response)} chars")
-            
+
+            logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
+            logger.info(f"🧠 [{self.agent_name}] ✅ LLM call completed in {llm_duration_seconds:.3f}s")
+            logger.info(f"🧠 [{self.agent_name}] Tokens: {tokens.input_tokens} in / {tokens.output_tokens} out")
+            if tokens.cache_read_input_tokens > 0:
+                logger.info(f"🧠 [{self.agent_name}] Cache hit rate: {tokens.cache_hit_rate:.1%}")
+
             # Log raw LLM response
-            logger.info("💬" * 80)
-            logger.info(f"🧠 [{self.agent_name}] RAW LLM RESPONSE:")
-            logger.info("💬" * 80)
-            logger.info(response)
-            logger.info("💬" * 80)
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+            logger.info(f"🧠 [{self.agent_name}] 📤 RAW LLM RESPONSE:")
+            logger.info(f"🧠 [{self.agent_name}] ─────────────────────────────────────────────────────────")
+            logger.info(f"🧠 [{self.agent_name}] {response}")
+            logger.info(f"🧠 [{self.agent_name}] ════════════════════════════════════════════════════════")
             
-            # Record LLM call with iteration context
+            # Record LLM call in observability
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.think",
@@ -3929,13 +4534,52 @@ DECISION RULES:
                     model=llm_config.model,
                     tokens=tokens,
                     duration_seconds=llm_duration_seconds,
-                    system_prompt_length=len(system_prompt),
+                    system_prompt_length=len(universal_content) + len(agent_content),
                     messages_count=1,
-                    temperature=thinking_temperature,
+                    temperature=llm_config.temperature,
                     max_tokens=llm_config.max_tokens,
-                    function_name="_think",
-                    error=None
+                    function_name="_think"
                 )
+            
+            # Record tool scoping statistics
+            if obs_logger and hasattr(obs_logger, 'agent_execution'):
+                scoping_stats = {}
+                
+                if exec_context.plan:
+                    scoping_stats['plan_tool_count'] = len(exec_context.plan.required_tools)
+                    scoping_stats['scoping_enabled'] = exec_context.plan.should_use_scoped_tools()
+                    scoping_stats['expansion_requested'] = exec_context.plan.all_tools_enabled
+                    scoping_stats['expansion_iteration'] = exec_context.plan.tool_expansion_requested_at
+                    
+                    if scoping_stats['scoping_enabled']:
+                        # Calculate actual token savings
+                        full_desc = self._get_tools_description()
+                        scoped_desc = self._get_tools_description(
+                            filter_tools=exec_context.plan.required_tools
+                        )
+                        saved_chars = len(full_desc) - len(scoped_desc)
+                        scoping_stats['estimated_tokens_saved'] = saved_chars // 4
+                    else:
+                        scoping_stats['estimated_tokens_saved'] = 0
+                    
+                    scoping_stats['available_tool_count'] = (
+                        len(exec_context.plan.required_tools)
+                        if scoping_stats['scoping_enabled']
+                        else len(self._tool_schemas)
+                    )
+                else:
+                    # No plan - always full catalog
+                    scoping_stats = {
+                        'plan_tool_count': 0,
+                        'scoping_enabled': False,
+                        'expansion_requested': False,
+                        'expansion_iteration': None,
+                        'estimated_tokens_saved': 0,
+                        'available_tool_count': len(self._tool_schemas)
+                    }
+                
+                obs_logger.agent_execution.tool_scoping_stats = scoping_stats
+                logger.info(f"📊 [{self.agent_name}] Tool scoping stats: {scoping_stats}")
             
             # ═════════════════════════════════════════════════════════════════
             # STEP 5: PARSE RESPONSE
@@ -3976,13 +4620,8 @@ DECISION RULES:
         
         except Exception as e:
             llm_duration_seconds = time.time() - llm_start_time
+            logger.error(f"🧠 [{self.agent_name}] ❌ LLM call FAILED after {llm_duration_seconds:.3f}s: {e}")
             
-            logger.error(f"🧠 [{self.agent_name}]   ❌ LLM call FAILED after {llm_duration_seconds:.3f}s")
-            logger.error(f"🧠 [{self.agent_name}]   → Error type: {type(e).__name__}")
-            logger.error(f"🧠 [{self.agent_name}]   → Error message: {str(e)}")
-            logger.error(f"🧠 [{self.agent_name}]   → Stack trace:", exc_info=True)
-            
-            # Record failed LLM call
             if obs_logger:
                 obs_logger.record_llm_call(
                     component=f"agent.{self.agent_name}.think",
@@ -3990,9 +4629,9 @@ DECISION RULES:
                     model=llm_config.model,
                     tokens=TokenUsage(),
                     duration_seconds=llm_duration_seconds,
-                    system_prompt_length=len(system_prompt),
+                    system_prompt_length=0,
                     messages_count=1,
-                    temperature=thinking_temperature,
+                    temperature=llm_config.temperature,
                     max_tokens=llm_config.max_tokens,
                     function_name="_think",
                     error=str(e)
@@ -4063,16 +4702,30 @@ DECISION RULES:
             logger.info(f"🛠️  [{self.agent_name}]       • {key}: {value_str}")
         logger.debug(f"🛠️  [{self.agent_name}]   → Full inputs (debug):\n{json.dumps(tool_input, indent=4, default=str)}")
 
-        # Filter out metadata fields that should not be passed to tool method
-        # These fields are for agent reasoning/logging but not actual tool parameters
-        metadata_fields = {'tool_name', 'action_description'}
-        clean_tool_input = {k: v for k, v in tool_input.items() if k not in metadata_fields}
-
-        if len(clean_tool_input) != len(tool_input):
-            filtered_keys = [k for k in tool_input.keys() if k in metadata_fields]
-            logger.info(f"🛠️  [{self.agent_name}]   → Filtered out metadata fields: {filtered_keys}")
-
+        # Get tool method to inspect its signature
         tool_method = self._tools[tool_name]
+        
+        # Get actual function parameters from the tool's signature
+        sig = inspect.signature(tool_method)
+        valid_params = set(sig.parameters.keys())
+        
+        # Handle nested tool_input dict if present (merge with top-level, top-level takes precedence)
+        merged_input = dict(tool_input)
+        if 'tool_input' in merged_input and isinstance(merged_input['tool_input'], dict):
+            nested = merged_input.pop('tool_input')
+            # Merge nested dict into top-level (top-level values take precedence)
+            merged_input = {**nested, **merged_input}
+            logger.info(f"🛠️  [{self.agent_name}]   → Merged nested tool_input dict with top-level keys")
+        
+        # Filter input to only include keys that match the tool's actual parameters
+        clean_tool_input = {k: v for k, v in merged_input.items() if k in valid_params}
+        
+        # Log what was filtered out
+        filtered_keys = [k for k in merged_input.keys() if k not in valid_params]
+        if filtered_keys:
+            logger.info(f"🛠️  [{self.agent_name}]   → Filtered out unrelated inputs: {filtered_keys}")
+            logger.info(f"🛠️  [{self.agent_name}]   → Valid tool parameters: {sorted(valid_params)}")
+            logger.info(f"🛠️  [{self.agent_name}]   → Cleaned input keys: {sorted(clean_tool_input.keys())}")
         start_time = time.time()
         logger.info(f"🛠️  [{self.agent_name}] Step 3: Calling tool method at {datetime.utcnow().isoformat()}...")
 
@@ -4587,36 +5240,55 @@ DECISION RULES:
         patient_context = PatientContext.from_session(
             session_id, 
             self.state_manager,
-            resolved_entities=response_data.resolved_entities
+            entities=response_data.entities
         )
         
         logger.info(f"🎯 [{self.agent_name}] Patient context: {patient_context.get_prompt_context()}")
         
         # Format resolved entities
-        known_info = self._format_resolved_entities(response_data.resolved_entities)
+        known_info = self._format_entities(response_data.entities)
+        
+        # Get recent conversation history (last 3 messages = 1.5 exchanges)
+        # Exclude the current user message (not yet responded to)
+        history = self.conversation_history.get(session_id, [])
+        history_for_context = history[:-1] if history and history[-1].get("role") == "user" else history
+        
+        # Get last 3 messages
+        recent_messages = history_for_context[-3:] if len(history_for_context) > 3 else history_for_context
+        
+        # Format recent messages for inclusion in system prompt
+        recent_context = ""
+        if recent_messages:
+            recent_context = "\n\nRECENT CONVERSATION:\n"
+            for msg in recent_messages:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                role_label = "User" if role == "user" else "Assistant"
+                recent_context += f"{role_label}: {content}\n"
+            recent_context += "\nNOTE: Use this context for natural conversation flow, but avoid redundancy - don't repeat what was already said."
         
         # Build decision-specific prompt
         if decision == AgentDecision.COLLECT_INFORMATION:
-            prompt = self._build_collect_info_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            prompt = self._build_collect_info_prompt(response_data, known_info, patient_context, tone, language, dialect, recent_context)
             
         elif decision == AgentDecision.CLARIFY:
-            prompt = self._build_clarify_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            prompt = self._build_clarify_prompt(response_data, known_info, patient_context, tone, language, dialect, recent_context)
             
         elif decision == AgentDecision.RESPOND_WITH_OPTIONS:
-            prompt = self._build_options_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            prompt = self._build_options_prompt(response_data, known_info, patient_context, tone, language, dialect, recent_context)
             
         elif decision == AgentDecision.RESPOND_IMPOSSIBLE:
-            prompt = self._build_impossible_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            prompt = self._build_impossible_prompt(response_data, known_info, patient_context, tone, language, dialect, recent_context)
             
         elif decision in [AgentDecision.RESPOND, AgentDecision.RESPOND_COMPLETE]:
-            prompt = self._build_completion_prompt(response_data, exec_context, patient_context, tone, language, dialect)
+            prompt = self._build_completion_prompt(response_data, exec_context, patient_context, tone, language, dialect, recent_context)
             
         elif decision == AgentDecision.REQUEST_CONFIRMATION:
-            prompt = self._build_confirmation_prompt(response_data, known_info, patient_context, tone, language, dialect)
+            prompt = self._build_confirmation_prompt(response_data, known_info, patient_context, tone, language, dialect, recent_context)
             
         else:
             # Fallback
-            prompt = self._build_generic_prompt(response_data, exec_context, patient_context, tone, language, dialect)
+            prompt = self._build_generic_prompt(response_data, exec_context, patient_context, tone, language, dialect, recent_context)
         
         # Log all inputs and built prompt
         logger.info("=" * 80)
@@ -4657,18 +5329,22 @@ DECISION RULES:
             response_temperature = llm_config.temperature
             llm_client = self._get_llm_client_for_function("_generate_focused_response")
             
-            user_message = "Generate the response."
+            # Messages array is now just the instruction - conversation history is in system prompt
+            messages = [{"role": "user", "content": "Generate the response."}]
+            
+            logger.info(f"💬 [{self.agent_name}] Recent conversation context included in system prompt: {len(recent_messages)} messages")
+
             if hasattr(llm_client, 'create_message_with_usage'):
                 response, tokens = llm_client.create_message_with_usage(
                     system=prompt,
-                    messages=[{"role": "user", "content": user_message}],
+                    messages=messages,
                     temperature=response_temperature,
                     max_tokens=llm_config.max_tokens
                 )
             else:
                 response = llm_client.create_message(
                     system=prompt,
-                    messages=[{"role": "user", "content": user_message}],
+                    messages=messages,
                     temperature=response_temperature,
                     max_tokens=llm_config.max_tokens
                 )
@@ -4758,7 +5434,8 @@ DECISION RULES:
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Build prompt for COLLECT_INFORMATION decision."""
         lang_instruction = ""
@@ -4785,17 +5462,17 @@ WHAT WE ALREADY KNOW:
 
 WHAT WE NEED:
 {response_data.information_needed}
-
-SUGGESTED QUESTION:
-{response_data.information_question or f"Ask for {response_data.information_needed}"}
-
+{recent_context}
 RULES:
-- Ask ONLY for the missing information
+- Ask ONLY for the missing information listed in "WHAT WE NEED"
 - Be conversational and natural
-- DO NOT say "I'll check" or "I'll do X" - nothing has been done yet!
-- DO NOT promise any action
+- DO NOT mention appointments, booking, scheduling, or any actions
+- DO NOT say "I'll check", "I'll do X", "I'll help you", "I'd be happy to help you schedule/book/do X" - nothing has been done yet!
+- DO NOT promise any action or future action
+- DO NOT reference what the user might want to do later (appointments, booking, etc.)
 - DO NOT invent patient names - use only what's in PATIENT CONTEXT
 - Keep it to 1-2 sentences
+- Simply ask for the information needed, nothing more
 - {lang_instruction}
 
 OUTPUT FORMAT:
@@ -4810,7 +5487,8 @@ Response:"""
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Build prompt for CLARIFY decision."""
         lang_instruction = ""
@@ -4840,10 +5518,10 @@ WHAT'S UNCLEAR:
 
 SUGGESTED QUESTION:
 {response_data.clarification_question or "Could you please clarify?"}
-
+{recent_context}
 RULES:
 - Ask a clarifying question
-- Be conversational and natural
+- Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - DO NOT invent patient names
 - Keep it to 1-2 sentences
 - {lang_instruction}
@@ -4860,7 +5538,8 @@ Response:"""
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Build prompt for RESPOND_WITH_OPTIONS decision."""
         options_formatted = "\n".join([f"  • {opt}" for opt in response_data.options])
@@ -4892,13 +5571,14 @@ WHY OPTIONS ARE NEEDED:
 
 OPTIONS TO PRESENT ({response_data.options_context}):
 {options_formatted}
-
+{recent_context}
 RULES:
 - Briefly explain why we're offering alternatives
 - Present the options clearly
 - Ask which they prefer
 - Keep it concise (2-4 sentences)
 - Don't apologize excessively
+- Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - DO NOT invent patient names
 - {lang_instruction}
 
@@ -4914,7 +5594,8 @@ Response:"""
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Build prompt for RESPOND_IMPOSSIBLE decision."""
         lang_instruction = ""
@@ -4942,13 +5623,14 @@ WHY IT'S NOT POSSIBLE:
 
 SUGGESTION FOR USER:
 {response_data.failure_suggestion or "No specific suggestion"}
-
+{recent_context}
 RULES:
 - Be empathetic but direct
 - Explain the issue clearly
 - Offer the suggestion if available
 - Don't over-apologize
 - Keep it to 2-3 sentences
+- Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - DO NOT invent patient names
 - {lang_instruction}
 
@@ -4964,7 +5646,8 @@ Response:"""
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Build prompt for RESPOND_COMPLETE decision."""
         # Get execution summary from actual tool results
@@ -5006,12 +5689,13 @@ DETAILS:
 
 EXECUTION LOG:
 {execution_summary}
-
+{recent_context}
 RULES:
 - Confirm the action was completed
 - Include key details (confirmation number, date, time, etc.)
 - Be warm but concise
 - No technical details or UUIDs
+- Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - DO NOT invent patient names
 - 2-3 sentences
 - {lang_instruction}
@@ -5028,7 +5712,8 @@ Response:"""
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Build prompt for REQUEST_CONFIRMATION decision."""
         details_formatted = "\n".join([
@@ -5060,12 +5745,13 @@ DETAILS:
 
 SUGGESTED QUESTION:
 {response_data.confirmation_question or "Should I proceed?"}
-
+{recent_context}
 RULES:
 - Summarize what you're about to do
 - Include all relevant details
 - Ask for explicit confirmation
 - Keep it clear and concise
+- Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - DO NOT invent patient names
 - {lang_instruction}
 
@@ -5081,11 +5767,12 @@ Response:"""
         patient_context: PatientContext,
         tone: str,
         language: str,
-        dialect: Optional[str]
+        dialect: Optional[str],
+        recent_context: str = ""
     ) -> str:
         """Fallback generic prompt builder."""
         execution_summary = self._build_execution_summary(exec_context)
-        known_info = self._format_resolved_entities(response_data.resolved_entities)
+        known_info = self._format_entities(response_data.entities)
         lang_instruction = ""
         if language == "ar":
             # IMPORTANT: Always use Emirati Arabic for Arabic responses
@@ -5108,8 +5795,9 @@ CONTEXT:
 
 EXECUTION LOG:
 {execution_summary}
-
+{recent_context}
 RULES:
+- Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - {lang_instruction}
 
 OUTPUT FORMAT:
@@ -5117,7 +5805,7 @@ Provide ONLY the response text.
 
 Response:"""
 
-    def _format_resolved_entities(self, entities: Dict[str, Any]) -> str:
+    def _format_entities(self, entities: Dict[str, Any]) -> str:
         """Format resolved entities for prompts."""
         if not entities:
             return "Nothing collected yet."

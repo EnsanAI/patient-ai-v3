@@ -5,6 +5,24 @@ This module provides the unified entity layer that:
 - Holds both patient entities and derived entities
 - Handles the linkage between them
 - Provides easy access methods for agents
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  DERIVED ENTITIES NOT CURRENTLY INTEGRATED (2024-12 Status)
+═══════════════════════════════════════════════════════════════════════════════
+
+The `derived` field (DerivedEntitiesManager) is stored but NOT queried during
+the continuation flow. See derived_entities.py for full explanation.
+
+The actual entity flow uses:
+  - ContinuationContext.entities (Dict[str, Any]) - no validity checks
+  - AgentPlan.entities - accumulated during plan execution
+
+This EntityState class IS used for:
+  - Storing tool results via store_tool_result()
+  - Patient preference tracking via PatientEntities
+
+But the derived entity validity system is not connected to the main flow yet.
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 from datetime import datetime
@@ -95,7 +113,8 @@ class EntityState(BaseModel):
         self,
         tool_name: str,
         tool_params: Dict[str, Any],
-        tool_result: Dict[str, Any]
+        tool_result: Dict[str, Any],
+        agent_name: Optional[str] = None
     ) -> List[DerivedEntity]:
         """
         Process a tool result and extract derived entities.
@@ -106,6 +125,7 @@ class EntityState(BaseModel):
             tool_name: Name of the tool that was called
             tool_params: Parameters used in the tool call
             tool_result: The result from the tool
+            agent_name: Name of the agent that called this tool
             
         Returns:
             List of derived entities that were stored
@@ -118,16 +138,16 @@ class EntityState(BaseModel):
         
         # Extract entities based on tool type
         if tool_name in ["find_doctor_by_name", "list_doctors"]:
-            stored.extend(self._extract_doctor_entities(tool_name, tool_params, tool_result))
+            stored.extend(self._extract_doctor_entities(tool_name, tool_params, tool_result, agent_name))
         
         elif tool_name == "check_availability":
-            stored.extend(self._extract_availability_entities(tool_name, tool_params, tool_result))
+            stored.extend(self._extract_availability_entities(tool_name, tool_params, tool_result, agent_name))
         
         elif tool_name == "book_appointment":
-            stored.extend(self._extract_booking_entities(tool_name, tool_params, tool_result))
+            stored.extend(self._extract_booking_entities(tool_name, tool_params, tool_result, agent_name))
         
         elif tool_name == "register_patient":
-            stored.extend(self._extract_registration_entities(tool_name, tool_params, tool_result))
+            stored.extend(self._extract_registration_entities(tool_name, tool_params, tool_result, agent_name))
         
         if stored:
             self.last_updated_at = datetime.utcnow()
@@ -138,7 +158,8 @@ class EntityState(BaseModel):
         self,
         tool_name: str,
         params: Dict[str, Any],
-        result: Dict[str, Any]
+        result: Dict[str, Any],
+        agent_name: Optional[str] = None
     ) -> List[DerivedEntity]:
         """Extract doctor-related derived entities."""
         stored = []
@@ -152,7 +173,8 @@ class EntityState(BaseModel):
                     source_tool=tool_name,
                     source_params=params,
                     resolves_patient_entity="appointment.doctor_preference",
-                    resolves_patient_value=self.patient.appointment.doctor_preference
+                    resolves_patient_value=self.patient.appointment.doctor_preference,
+                    agent_name=agent_name
                 )
                 stored.append(entity)
                 
@@ -163,7 +185,8 @@ class EntityState(BaseModel):
                     source_tool=tool_name,
                     source_params=params,
                     resolves_patient_entity="appointment.doctor_preference",
-                    resolves_patient_value=self.patient.appointment.doctor_preference
+                    resolves_patient_value=self.patient.appointment.doctor_preference,
+                    agent_name=agent_name
                 )
                 stored.append(info_entity)
         
@@ -175,7 +198,8 @@ class EntityState(BaseModel):
                 value=doctors,
                 source_tool=tool_name,
                 source_params=params,
-                valid_for=None  # Never expires
+                valid_for=None,  # Never expires
+                agent_name=agent_name
             )
             stored.append(entity)
             
@@ -191,7 +215,8 @@ class EntityState(BaseModel):
                             source_tool=tool_name,
                             source_params=params,
                             resolves_patient_entity="appointment.doctor_preference",
-                            resolves_patient_value=self.patient.appointment.doctor_preference
+                            resolves_patient_value=self.patient.appointment.doctor_preference,
+                            agent_name=agent_name
                         )
                         stored.append(uuid_entity)
                         break
@@ -202,7 +227,8 @@ class EntityState(BaseModel):
         self,
         tool_name: str,
         params: Dict[str, Any],
-        result: Dict[str, Any]
+        result: Dict[str, Any],
+        agent_name: Optional[str] = None
     ) -> List[DerivedEntity]:
         """Extract availability-related derived entities."""
         stored = []
@@ -222,7 +248,8 @@ class EntityState(BaseModel):
             source_params=params,
             resolves_patient_entity="appointment.time_preference",
             resolves_patient_value=self.patient.appointment.time_preference,
-            valid_for=300  # 5 minutes
+            valid_for=300,  # 5 minutes
+            agent_name=agent_name
         )
         stored.append(entity)
         
@@ -233,7 +260,8 @@ class EntityState(BaseModel):
                 value=result["all_available_slots"],
                 source_tool=tool_name,
                 source_params=params,
-                valid_for=300
+                valid_for=300,
+                agent_name=agent_name
             )
             stored.append(slots_entity)
         
@@ -243,7 +271,8 @@ class EntityState(BaseModel):
         self,
         tool_name: str,
         params: Dict[str, Any],
-        result: Dict[str, Any]
+        result: Dict[str, Any],
+        agent_name: Optional[str] = None
     ) -> List[DerivedEntity]:
         """Extract booking-related derived entities."""
         stored = []
@@ -260,7 +289,8 @@ class EntityState(BaseModel):
                 },
                 source_tool=tool_name,
                 source_params=params,
-                valid_for=None  # Never expires within session
+                valid_for=None,  # Never expires within session
+                agent_name=agent_name
             )
             stored.append(entity)
         
@@ -270,7 +300,8 @@ class EntityState(BaseModel):
         self,
         tool_name: str,
         params: Dict[str, Any],
-        result: Dict[str, Any]
+        result: Dict[str, Any],
+        agent_name: Optional[str] = None
     ) -> List[DerivedEntity]:
         """Extract registration-related derived entities."""
         stored = []
@@ -281,7 +312,8 @@ class EntityState(BaseModel):
                 value=result["patient_id"],
                 source_tool=tool_name,
                 source_params=params,
-                valid_for=None  # Never expires
+                valid_for=None,  # Never expires
+                agent_name=agent_name
             )
             stored.append(entity)
         

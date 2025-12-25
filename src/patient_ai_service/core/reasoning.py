@@ -66,6 +66,7 @@ class TaskContext(BaseModel):
     user_intent: str = ""
     objective: str = ""  # NEW: High-level goal for agent
     entities: Dict[str, Any] = Field(default_factory=dict)
+    llm_entities: Dict[str, Any] = Field(default_factory=dict)  # NEW: LLM-only entity updates (ISOLATED)
     success_criteria: List[str] = Field(default_factory=list)  # Keep but will be outcome-based
     constraints: List[str] = Field(default_factory=list)
     prior_context: Optional[str] = None
@@ -750,7 +751,7 @@ CONTINUATION CONTEXT (Previous flow was interrupted)
 The system is waiting for: {continuation_context.get('awaiting', 'user response')}
 Options presented to user: {json.dumps(continuation_context.get('presented_options', []), indent=2)}
 Original request: {continuation_context.get('original_request', 'Unknown')}
-Resolved so far: {json.dumps(continuation_context.get('resolved_entities', {}), indent=2)}
+Resolved so far: {json.dumps(continuation_context.get('entities', {}), indent=2)}
 
 IMPORTANT: Check if user's message is a response to the above!
 """
@@ -938,13 +939,13 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
 
             # Handle task_context - merge resolved entities from continuation context
             if continuation_context and is_continuation:
-                resolved_entities = continuation_context.get("resolved_entities", {})
-                if resolved_entities:
+                entities = continuation_context.get("entities", {})
+                if entities:
                     # Merge resolved entities into task_context entities
                     if "entities" not in task_context_data:
                         task_context_data["entities"] = {}
-                    task_context_data["entities"].update(resolved_entities)
-                    logger.info(f"🔄 [ReasoningEngine] Merged {len(resolved_entities)} resolved entities from continuation: {json.dumps(resolved_entities, default=str)}")
+                    task_context_data["entities"].update(entities)
+                    logger.info(f"🔄 [ReasoningEngine] Merged {len(entities)} resolved entities from continuation: {json.dumps(entities, default=str)}")
 
                 # Add selected option to entities if applicable
                 if selected_option and continuation_type == "selection":

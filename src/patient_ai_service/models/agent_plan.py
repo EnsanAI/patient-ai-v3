@@ -10,6 +10,8 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from enum import Enum
 
+from patient_ai_service.models.fifo_dict import FIFODict
+
 
 class PlanStatus(str, Enum):
     """Lifecycle status of a plan."""
@@ -92,6 +94,13 @@ class AgentPlan(BaseModel):
     tasks: List[PlanTask] = Field(default_factory=list)
     
     # ═══════════════════════════════════════════════════════════════
+    # TOOL SCOPING OPTIMIZATION
+    # ═══════════════════════════════════════════════════════════════
+    required_tools: List[str] = Field(default_factory=list)
+    all_tools_enabled: bool = False
+    tool_expansion_requested_at: Optional[int] = None
+    
+    # ═══════════════════════════════════════════════════════════════
     # EXECUTION STATE
     # ═══════════════════════════════════════════════════════════════
     status: PlanStatus = PlanStatus.CREATED
@@ -105,8 +114,12 @@ class AgentPlan(BaseModel):
     # ═══════════════════════════════════════════════════════════════
     # ACCUMULATED KNOWLEDGE
     # ═══════════════════════════════════════════════════════════════
-    resolved_entities: Dict[str, Any] = Field(default_factory=dict)
-    
+    entities: Dict[str, Any] = Field(default_factory=dict)  # Multi-source (internal)
+
+    # NEW: LLM-only entity updates (shown in prompts)
+    # ISOLATED from multi-source entities - only contains what LLM explicitly updates
+    llm_entities: Dict[str, Any] = Field(default_factory=dict)
+
     # ═══════════════════════════════════════════════════════════════
     # LIFECYCLE
     # ═══════════════════════════════════════════════════════════════
@@ -196,7 +209,7 @@ class AgentPlan(BaseModel):
             
             # Update resolved entities from result
             if result.get("derived_entities"):
-                self.resolved_entities.update(result["derived_entities"])
+                self.entities.update(result["derived_entities"])
         
         self.updated_at = datetime.utcnow()
     
@@ -242,12 +255,12 @@ class AgentPlan(BaseModel):
     
     def unblock_with_info(self, new_entities: Dict[str, Any]):
         """Unblock the plan with new information from user."""
-        self.resolved_entities.update(new_entities)
+        self.entities.update(new_entities)
         self.status = PlanStatus.EXECUTING
         self.blocked_reason = None
         self.awaiting_info = None
         self.presented_options = []
-        
+
         # Unblock the blocked task
         for task in self.tasks:
             if task.status == TaskStatus.BLOCKED:
@@ -255,9 +268,89 @@ class AgentPlan(BaseModel):
                 task.blocked_reason = None
                 task.blocked_awaiting = None
                 task.blocked_options = None
-        
+
         self.updated_at = datetime.utcnow()
-    
+
+    def update_entities_with_fifo(self, new_entities: Dict[str, Any]):
+        """
+        Update entities with FIFO eviction (max 8).
+
+        This ensures conversation entities don't grow unbounded.
+        When adding new entities would exceed 8, the oldest entity is automatically evicted.
+
+        Args:
+            new_entities: Dict of entities to add/update (smart merging: overwrite existing, append new)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Convert current entities to FIFODict
+        fifo = FIFODict.from_dict(self.entities, max_size=8)
+
+        # Apply updates (FIFO eviction happens automatically)
+        for key, value in new_entities.items():
+            fifo[key] = value  # FIFODict handles eviction if needed
+
+        # Check if any entities were evicted
+        eviction_log = fifo.get_eviction_log()
+        if eviction_log:
+            evicted_keys = [e['key'] for e in eviction_log]
+            logger.warning(
+                f"⚠️ FIFO evicted {len(evicted_keys)} entities from plan: {evicted_keys}"
+            )
+
+        # Convert back to regular dict for storage
+        self.entities = fifo.to_dict()
+        self.updated_at = datetime.utcnow()
+
+    def update_llm_entities_with_fifo(self, new_entities: Dict[str, Any]):
+        """
+        Update LLM entities with FIFO eviction (max 8).
+
+        Uses smart merge from ENTITY_INTEGRATION_PLAN.md:
+        - Updates existing keys → moves to end (newest)
+        - New keys when at max → evicts oldest
+        - Tracks evictions for monitoring
+
+        Args:
+            new_entities: Dict of LLM entity updates (from entities_to_update)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not new_entities:
+            return
+
+        # Convert to FIFODict for smart merge
+        fifo = FIFODict.from_dict(self.llm_entities, max_size=8)
+
+        # Apply updates (FIFODict handles smart merge automatically)
+        for key, value in new_entities.items():
+            fifo[key] = value  # Update or insert with FIFO eviction
+
+        # Log evictions
+        eviction_log = fifo.get_eviction_log()
+        if eviction_log:
+            evicted_keys = [e['key'] for e in eviction_log]
+            logger.warning(
+                f"⚠️ FIFO evicted {len(evicted_keys)} LLM entities: {evicted_keys}"
+            )
+
+            # Track metrics (same pattern as ENTITY_INTEGRATION_PLAN.md)
+            try:
+                from patient_ai_service.core.observability import fifo_eviction_count
+                for evicted_key in evicted_keys:
+                    fifo_eviction_count.labels(
+                        evicted_key=evicted_key,
+                        track="llm_only"
+                    ).inc()
+            except Exception:
+                pass  # Don't fail on metrics errors
+
+        # Convert back to dict for storage
+        self.llm_entities = fifo.to_dict()
+        self.updated_at = datetime.utcnow()
+
     def mark_complete(self):
         """Mark the plan as complete."""
         self.status = PlanStatus.COMPLETE
@@ -276,6 +369,22 @@ class AgentPlan(BaseModel):
         complete = len([t for t in self.tasks if t.status == TaskStatus.COMPLETE])
         total = len(self.tasks)
         return f"Plan '{self.objective[:50]}' - {complete}/{total} tasks complete, status: {self.status.value}"
+    
+    def extract_required_tools(self) -> List[str]:
+        """Extract unique non-null tool names from tasks."""
+        tools = set()
+        for task in self.tasks:
+            if task.tool:  # Ignore null tools
+                tools.add(task.tool)
+        return sorted(list(tools))
+    
+    def should_use_scoped_tools(self) -> bool:
+        """Check if we should use scoped tools or full catalog."""
+        if self.all_tools_enabled:
+            return False  # Expansion requested
+        if not self.required_tools:
+            return False  # No tools needed - graceful degradation
+        return True
 
 
 class PlanAction(str, Enum):

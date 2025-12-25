@@ -10,12 +10,17 @@ global:
   temperature: 0.7
   max_tokens: 1000
   timeout: 30
+  
+  # Prompt caching (Anthropic only)
+  prompt_cache:
+    enabled: true
+    min_tokens: 1024
 
 agents:
   # Core reasoning engine (used by orchestrator)
   unified_reasoning:
-    provider: anthropic
-    model: claude-sonnet-4-5-20250929
+    provider: openai
+    model: gpt-5-mini-2025-08-07
     temperature: 0.1
     max_tokens: 600
     functions:
@@ -61,6 +66,8 @@ agents:
     temperature: 0.7
     functions:
       _think:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.3
       _verify_task_completion:
         temperature: 0.1
@@ -68,6 +75,8 @@ agents:
         temperature: 0.5
         max_tokens: 300
       _generate_response:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.5
 
   # Medical inquiry agent
@@ -84,6 +93,8 @@ agents:
         temperature: 0.5
         max_tokens: 500
       _generate_response:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.5
 
   # Emergency response agent
@@ -99,6 +110,8 @@ agents:
       _generate_focused_response:
         temperature: 0.5
       _generate_response:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.5
 
   # Registration agent
@@ -108,13 +121,19 @@ agents:
     temperature: 0.7
     functions:
       _think:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.3
       _verify_task_completion:
         temperature: 0.1
       _generate_focused_response:
         temperature: 0.5
+        max_tokens: 300
       _generate_response:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.5
+
 
   # General assistant agent
   general_assistant:
@@ -129,6 +148,8 @@ agents:
       _generate_focused_response:
         temperature: 0.5
       _generate_response:
+        provider: openai
+        model: gpt-5-mini-2025-08-07
         temperature: 0.5
 
   # Conversational fast path (orchestrator)
@@ -137,6 +158,15 @@ agents:
     model: gpt-4o-mini
     temperature: 0.7
     max_tokens: 150
+
+  # Orchestrator (for information collection non-brainer flow)
+  orchestrator:
+    functions:
+      information_collection:
+        provider: openai
+        model: gpt-4o-mini
+        temperature: 0.3
+        max_tokens: 200
 
   # Conversation memory (summarization)
   conversation_memory:

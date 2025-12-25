@@ -6,6 +6,30 @@ This module defines what the SYSTEM has resolved. These entities:
 - Linked to: Patient entities they resolve
 - Validity: Auto-invalidate when linked patient entity changes
 - Expiry: Some have time-based expiry (e.g., availability checks)
+
+═══════════════════════════════════════════════════════════════════════════════
+⚠️  NOT CURRENTLY INTEGRATED INTO MAIN FLOW (2024-12 Status)
+═══════════════════════════════════════════════════════════════════════════════
+
+This module provides a validity-tracking system for derived entities, but it is
+NOT currently used in the continuation flow. The actual entity passing works via:
+
+  1. ContinuationContext.entities - persists between turns (Dict[str, Any])
+  2. AgentPlan.entities - accumulates during plan execution
+  3. task_context["entities"] - runtime entities passed to agents
+
+DerivedEntitiesManager IS stored via:
+  - state_manager.store_tool_result() → EntityState.derived
+  - base_agent._store_derived_entities()
+
+But the continuation flow NEVER reads from EntityState.derived for validation.
+It loads raw values from ContinuationContext without checking validity/TTL.
+
+To integrate this system, orchestrator/_build_reasoning_from_unified() would
+need to call get_valid_derived_entity() when loading continuation entities.
+
+Until then, this module is effectively dead code - stored but never queried.
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 from datetime import datetime, timedelta
@@ -44,6 +68,9 @@ class DerivedEntity(BaseModel):
     # Linkage to patient entity
     resolves_patient_entity: Optional[str] = None   # "appointment.doctor_preference"
     resolves_patient_value: Optional[Any] = None    # "Dr. Sarah" - the value we resolved
+    
+    # Agent tracking
+    agent_name: Optional[str] = None  # Track which agent created this
     
     # Validity
     valid_for: Optional[int] = None    # Seconds until expiry (None = no time expiry)
@@ -179,7 +206,8 @@ class DerivedEntitiesManager(BaseModel):
         source_params: Dict[str, Any] = None,
         resolves_patient_entity: str = None,
         resolves_patient_value: Any = None,
-        valid_for: int = None
+        valid_for: int = None,
+        agent_name: Optional[str] = None
     ) -> DerivedEntity:
         """
         Store a derived entity from a tool result.
@@ -192,6 +220,7 @@ class DerivedEntitiesManager(BaseModel):
             resolves_patient_entity: Patient entity path this resolves
             resolves_patient_value: The patient value we resolved
             valid_for: Seconds until expiry (None = use default from rules)
+            agent_name: Name of the agent that created this entity
             
         Returns:
             The stored DerivedEntity
@@ -208,7 +237,8 @@ class DerivedEntitiesManager(BaseModel):
             source_params=source_params or {},
             resolves_patient_entity=resolves_patient_entity,
             resolves_patient_value=resolves_patient_value,
-            valid_for=valid_for
+            valid_for=valid_for,
+            agent_name=agent_name
         )
         
         self.entities[key] = entity
@@ -233,10 +263,29 @@ class DerivedEntitiesManager(BaseModel):
         """
         entity = self.entities.get(key)
         if entity is None:
+            # Track miss
+            try:
+                from patient_ai_service.core.observability import derived_entity_miss_rate
+                derived_entity_miss_rate.labels(entity_key=key, reason="not_found").inc()
+            except Exception:
+                pass  # Don't fail on metrics errors
             return None
+        
+        # Track age
+        try:
+            from patient_ai_service.core.observability import derived_entity_age
+            derived_entity_age.observe(entity.age_seconds())
+        except Exception:
+            pass  # Don't fail on metrics errors
         
         # Check basic validity (not invalidated, not expired)
         if not entity.is_valid():
+            reason = "expired" if entity.is_stale() else "invalidated"
+            try:
+                from patient_ai_service.core.observability import derived_entity_miss_rate
+                derived_entity_miss_rate.labels(entity_key=key, reason=reason).inc()
+            except Exception:
+                pass
             return None
         
         # Check against current patient value if we have patient entities
@@ -245,7 +294,22 @@ class DerivedEntitiesManager(BaseModel):
             if not entity.matches_patient_value(current_value):
                 # Patient preference changed - invalidate
                 entity.invalidate(f"Patient changed {entity.resolves_patient_entity} from '{entity.resolves_patient_value}' to '{current_value}'")
+                try:
+                    from patient_ai_service.core.observability import derived_entity_miss_rate
+                    derived_entity_miss_rate.labels(entity_key=key, reason="patient_changed").inc()
+                except Exception:
+                    pass
                 return None
+        
+        # Hit!
+        try:
+            from patient_ai_service.core.observability import derived_entity_hit_rate
+            derived_entity_hit_rate.labels(
+                entity_key=key,
+                agent_name=entity.agent_name or "unknown"
+            ).inc()
+        except Exception:
+            pass  # Don't fail on metrics errors
         
         return entity
     

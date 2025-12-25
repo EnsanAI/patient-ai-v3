@@ -181,7 +181,7 @@ class AgentResponseData(BaseModel):
     # ═══════════════════════════════════════════════════════════════
     # COMMON - Shared across all decision types
     # ═══════════════════════════════════════════════════════════════
-    resolved_entities: Dict[str, Any] = Field(default_factory=dict)
+    entities: Dict[str, Any] = Field(default_factory=dict)
     # What we already know: {patient_id, doctor_name, date, time}
     
     # For internal tracking
@@ -196,7 +196,7 @@ class PatientContext(BaseModel):
     patient_id: Optional[str] = None
     
     @classmethod
-    def from_session(cls, session_id: str, state_manager, resolved_entities: Dict = None) -> 'PatientContext':
+    def from_session(cls, session_id: str, state_manager, entities: Dict = None) -> 'PatientContext':
         """Build patient context from session state."""
         # Try to get from patient state (registered patient)
         try:
@@ -210,12 +210,12 @@ class PatientContext(BaseModel):
         except:
             pass
         
-        # Not registered - check resolved_entities for collected name
-        if resolved_entities:
+        # Not registered - check entities for collected name
+        if entities:
             collected_name = (
-                resolved_entities.get("patient_name") or
-                resolved_entities.get("first_name") or
-                resolved_entities.get("name")
+                entities.get("patient_name") or
+                entities.get("first_name") or
+                entities.get("name")
             )
             if collected_name:
                 return cls(
@@ -285,15 +285,24 @@ class ThinkingResult(BaseModel):
     # Keep legacy fields for backward compatibility during transition
     clarification_question: Optional[str] = None  # Deprecated: use response.clarification_question
     awaiting_info: Optional[str] = None  # Deprecated: use response.information_needed
-    resolved_entities: Optional[Dict[str, Any]] = None  # Deprecated: use response.resolved_entities
+    entities: Optional[Dict[str, Any]] = None  # Deprecated: use response.entities
     confirmation_summary: Optional[ConfirmationSummary] = None  # Deprecated: use response.confirmation_*
     
     # Internal flags
     detected_result_type: Optional[ToolResultType] = None
+    
+    # Tool expansion
+    request_all_tools: bool = False
+    tool_expansion_reason: Optional[str] = None
 
-    # NEW: Updated, session-scoped resolved entities after this thinking step.
+    # NEW: Updated, session-scoped entities after this thinking step.
     # This is the canonical conversation memory to be persisted in GlobalState.
-    updated_resolved_entities: Dict[str, Any] = Field(default_factory=dict)
+    updated_entities: Dict[str, Any] = Field(default_factory=dict)
+
+    # NEW: LLM-only entity delta (from entities_to_update)
+    # ISOLATED from multi-source entities - contains ONLY what LLM explicitly updated
+    # Used to track and persist LLM entity updates separately from internal entities
+    llm_delta: Dict[str, Any] = Field(default_factory=dict)
 
 
 class CompletionCheck(BaseModel):

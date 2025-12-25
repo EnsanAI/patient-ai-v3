@@ -9,9 +9,10 @@ import asyncio
 import hashlib
 import time as time_module
 import concurrent.futures
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta
 from datetime import datetime as dt
+from rapidfuzz import fuzz, process
 
 from .base_agent import BaseAgent
 from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
@@ -108,6 +109,69 @@ class AppointmentManagerAgent(BaseAgent):
         """Appointment-specific behavioral instructions."""
         return """MANDATORY: Confirm with user before scheduling, rescheduling, cancelling or updating appointment in anyway. ONCE confirmed, call the appropriate tool immediately."""
 
+    @staticmethod
+    def _normalize_name_for_matching(name: str) -> str:
+        """
+        Normalize a name for fuzzy matching in multilingual environment.
+
+        Handles:
+        - Arabic transliteration numbers (7->h, 3->a/e, 2->a, etc.)
+        - Common variations
+        - Case normalization
+
+        Args:
+            name: The name to normalize
+
+        Returns:
+            Normalized name string
+        """
+        # Convert to lowercase
+        normalized = name.lower()
+
+        # Remove common prefixes
+        normalized = normalized.replace("dr.", "").replace("dr ", "").strip()
+
+        # Handle Arabic transliteration numbers to letters
+        # Common mappings: 7->h, 3->a/e, 2->a, 8->gh, 5->kh, 9->q
+        arabic_number_map = {
+            '7': 'h',
+            '3': 'a',  # Can be 'a' or 'e', we use 'a' as base
+            '2': 'a',
+            '8': 'gh',
+            '5': 'kh',
+            '9': 'q',
+            '6': 't'
+        }
+
+        for num, letter in arabic_number_map.items():
+            normalized = normalized.replace(num, letter)
+
+        # Remove extra whitespace
+        normalized = ' '.join(normalized.split())
+
+        return normalized
+
+    @staticmethod
+    def _calculate_name_similarity(search_name: str, doctor_name: str) -> float:
+        """
+        Calculate similarity score between two names using fuzzy matching.
+
+        Uses token sort ratio which handles word order differences well.
+
+        Args:
+            search_name: The name being searched for
+            doctor_name: The doctor's name to compare against
+
+        Returns:
+            Similarity score from 0-100
+        """
+        # Normalize both names
+        norm_search = AppointmentManagerAgent._normalize_name_for_matching(search_name)
+        norm_doctor = AppointmentManagerAgent._normalize_name_for_matching(doctor_name)
+
+        # Use token sort ratio - handles word order and partial matches well
+        return fuzz.token_sort_ratio(norm_search, norm_doctor)
+
     def _register_tools(self):
         """Register appointment-related tools."""
 
@@ -121,6 +185,20 @@ class AppointmentManagerAgent(BaseAgent):
                     "type": "string",
                     "description": "Optional: Filter doctors by specialty, e.g. 'cardiology', 'pediatrics'. Leave empty to show all."
                 },
+            }
+        )
+
+        # Find doctor by name (with fuzzy matching)
+        self.register_tool(
+            name="find_doctor_by_name",
+            function=self.tool_find_doctor_by_name,
+            description="Find a doctor by name using smart fuzzy matching.",
+            parameters={
+                "doctor_name": {
+                    "type": "string",
+                    "description": "The doctor's name to search for (e.g., 'Mohamed Atef', 'Dr. Ahmed', 'mo7amed')",
+                    "required": True
+                }
             }
         )
 
@@ -138,15 +216,18 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "doctor_id": {
                     "type": "string",
-                    "description": "Doctor's UUID (NOT name - use list_doctors tool first to get the UUID)"
+                    "description": "Doctor's UUID (NOT name - use list_doctors tool first to get the UUID)",
+                    "required": True
                 },
                 "date": {
                     "type": "string",
-                    "description": f"Date in YYYY-MM-DD format (e.g., '{tomorrow_str}'). Parse 'tomorrow' to actual date based on today ({today_str}). Always calculate tomorrow dynamically from the current date."
+                    "description": f"Date in YYYY-MM-DD format (e.g., '{tomorrow_str}'). Parse 'tomorrow' to actual date based on today ({today_str}). Always calculate tomorrow dynamically from the current date.",
+                    "required": True
                 },
                 "requested_time": {
                     "type": "string",
-                    "description": "Optional: Specific time to check (e.g., '14:00', '2pm', '2:00 PM'). If provided, returns whether that specific time is available plus alternatives if not. If omitted, returns availability ranges."
+                    "description": "Optional: Specific time to check (e.g., '14:00', '2pm', '2:00 PM'). If provided, returns whether that specific time is available plus alternatives if not. If omitted, returns availability ranges.",
+                    "required": False
                 }
             }
         )
@@ -159,23 +240,28 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "patient_id": {
                     "type": "string",
-                    "description": "Patient's ID (get from Patient ID in PATIENT INFORMATION section - REQUIRED)"
+                    "description": "Patient's ID (get from Patient ID in PATIENT INFORMATION section - REQUIRED)",
+                    "required": True
                 },
                 "doctor_id": {
                     "type": "string",
-                    "description": "Doctor's UUID (from find_doctor_by_name tool result - REQUIRED)"
+                    "description": "Doctor's UUID (from find_doctor_by_name tool result - REQUIRED)",
+                    "required": True
                 },
                 "date": {
                     "type": "string",
-                    "description": "Appointment date in YYYY-MM-DD format (e.g., '2025-11-26' - REQUIRED)"
+                    "description": "Appointment date in YYYY-MM-DD format (e.g., '2025-11-26' - REQUIRED)",
+                    "required": True
                 },
                 "time": {
                     "type": "string",
-                    "description": "Appointment time in HH:MM format (e.g., '15:00' for 3:00 PM - REQUIRED)"
+                    "description": "Appointment time in HH:MM format (e.g., '15:00' for 3:00 PM - REQUIRED)",
+                    "required": True
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Extract the EXACT reason/procedure/symptom from user's message. Use user's own words. ONLY use 'general consultation' if user did not mention any specific reason."
+                    "description": "Extract the EXACT reason/procedure/symptom from user's message. Use user's own words. ONLY use 'general consultation' if user did not mention any specific reason.",
+                    "required": True
                 }
             }
         )
@@ -188,7 +274,8 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "patient_id": {
                     "type": "string",
-                    "description": "Patient's ID"
+                    "description": "Patient's ID",
+                    "required": True
                 },
                 "appointment_date": {
                     "type": "string",
@@ -211,11 +298,13 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "appointment_id": {
                     "type": "string",
-                    "description": "Appointment ID to cancel"
+                    "description": "Appointment ID to cancel",
+                    "required": True
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Reason for cancellation"
+                    "description": "Reason for cancellation",
+                    "required": True
                 }
             }
         )
@@ -228,15 +317,18 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "appointment_id": {
                     "type": "string",
-                    "description": "Appointment ID to reschedule"
+                    "description": "Appointment ID to reschedule",
+                    "required": True
                 },
                 "new_date": {
                     "type": "string",
-                    "description": "New date (YYYY-MM-DD)"
+                    "description": "New date (YYYY-MM-DD)",
+                    "required": True
                 },
                 "new_time": {
                     "type": "string",
-                    "description": "New time (HH:MM)"
+                    "description": "New time (HH:MM)",
+                    "required": True
                 }
             }
         )
@@ -249,63 +341,78 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "appointment_id": {
                     "type": "string",
-                    "description": "Appointment ID to update (REQUIRED)"
+                    "description": "Appointment ID to update (REQUIRED)",
+                    "required": True
                 },
                 "doctor_id": {
                     "type": "string",
-                    "description": "Optional: New doctor ID (UUID)"
+                    "description": "Optional: New doctor ID (UUID)",
+                    "required": False
                 },
                 "clinic_id": {
                     "type": "string",
-                    "description": "Optional: New clinic ID (UUID)"
+                    "description": "Optional: New clinic ID (UUID)",
+                    "required": False
                 },
                 "patient_id": {
                     "type": "string",
-                    "description": "Optional: New patient ID (UUID)"
+                    "description": "Optional: New patient ID (UUID)",
+                    "required": False
                 },
                 "appointment_type_id": {
                     "type": "string",
-                    "description": "Optional: New appointment type ID (UUID)"
+                    "description": "Optional: New appointment type ID (UUID)",
+                    "required": False
                 },
                 "appointment_date": {
                     "type": "string",
-                    "description": "Optional: New appointment date (YYYY-MM-DD format)"
+                    "description": "Optional: New appointment date (YYYY-MM-DD format)",
+                    "required": False
                 },
                 "start_time": {
                     "type": "string",
-                    "description": "Optional: New start time (HH:MM format, 24-hour)"
+                    "description": "Optional: New start time (HH:MM format, 24-hour)",
+                    "required": False
                 },
                 "end_time": {
                     "type": "string",
-                    "description": "Optional: New end time (HH:MM format, 24-hour). If start_time is provided, end_time will be calculated automatically if not specified."
+                    "description": "Optional: New end time (HH:MM format, 24-hour). If start_time is provided, end_time will be calculated automatically if not specified.",
+                    "required": False
                 },
                 "status": {
                     "type": "string",
-                    "description": "Optional: New status. Valid values: scheduled, confirmed, checked_in, in_progress, completed, cancelled, no_show, rescheduled"
+                    "description": "Optional: New status. Valid values: scheduled, confirmed, checked_in, in_progress, completed, cancelled, no_show, rescheduled",
+                    "required": False
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Optional: Update appointment reason/description"
+                    "description": "Optional: Update appointment reason/description",
+                    "required": False
                 },
                 "notes": {
                     "type": "string",
-                    "description": "Optional: Update appointment notes"
+                    "description": "Optional: Update appointment notes",
+                    "required": False
                 },
                 "emergency_level": {
                     "type": "string",
-                    "description": "Optional: Change emergency level. Valid values: routine, urgent, emergency, critical"
+                    "description": "Optional: Change emergency level. Valid values: routine, urgent, emergency, critical",
+                    "required": False
                 },
                 "follow_up_required": {
                     "type": "boolean",
-                    "description": "Optional: Set whether follow-up is required"
+                    "description": "Optional: Set whether follow-up is required",
+                    "required": False
                 },
                 "follow_up_days": {
                     "type": "integer",
-                    "description": "Optional: Number of days until follow-up"
+                    "description": "Optional: Number of days until follow-up",
+                    "required": False
                 },
                 "procedure_type": {
                     "type": "string",
-                    "description": "Optional: Update procedure type"
+                    "description": "Optional: Update procedure type",
+                    "required": False
                 }
             }
         )
@@ -318,11 +425,13 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "patient_id": {
                     "type": "string",
-                    "description": "Patient's ID (same for all appointments - get from Patient ID in PATIENT INFORMATION section - REQUIRED)"
+                    "description": "Patient's ID (same for all appointments - get from Patient ID in PATIENT INFORMATION section - REQUIRED)",
+                    "required": True
                 },
                 "appointments": {
                     "type": "array",
                     "description": "List of appointments to book. Each appointment is an object with doctor_id, date, time, and reason.",
+                    "required": True,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -718,64 +827,109 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             }
 
     def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
-        """Find a doctor by name."""
+        """
+        Find a doctor by name using semantic/fuzzy matching.
+
+        Handles multilingual name variations including:
+        - Different romanizations (Mohamed vs Muhammed vs Mohammed)
+        - Arabic transliterations (mo7amed, 3atef)
+        - Spelling variations (Atef vs Atif)
+
+        Args:
+            session_id: The session identifier
+            doctor_name: The doctor's name to search for
+
+        Returns:
+            Dictionary with doctor information or error
+        """
         try:
             # Get all doctors
             doctors = self.db_client.get_doctors()
 
             if not doctors:
-                return {"error": "No doctors found"}
-
-            # Clean doctor name (remove "Dr.", "Dr", etc.)
-            doctor_name_clean = doctor_name.lower().replace("dr.", "").replace("dr", "").strip()
-            # Split into words for better matching
-            search_words = [w.strip() for w in doctor_name_clean.split() if len(w.strip()) > 2]
-            
-            matching_doctors = []
-            
-            for doctor in doctors:
-                first_name = doctor.get("first_name", "").lower()
-                last_name = doctor.get("last_name", "").lower()
-                full_name = f"{first_name} {last_name}".strip()
-                
-                # Multi-word search: all words should match (e.g., "mohammed atef" requires both words)
-                if len(search_words) > 1:
-                    # Check if all search words are in the full name
-                    if all(word in full_name for word in search_words):
-                        matching_doctors.append(doctor)
-                else:
-                    # Single word search: check if it's in first name, last name, or full name
-                    search_term = search_words[0] if search_words else doctor_name_clean
-                    if (search_term in first_name or 
-                        search_term in last_name or 
-                        search_term in full_name):
-                        matching_doctors.append(doctor)
-
-            if not matching_doctors:
                 return {
                     "success": False,
-                    "error": f"No doctor found matching '{doctor_name}'",
-                    "suggestion": "Use list_doctors tool to see all available doctors"
+                    "error": "No doctors found in the system",
+                    "suggestion": "Please contact support"
                 }
 
-            # Return the first matching doctor (best match)
-            doctor = matching_doctors[0]
-            
-            return {
+            # Calculate similarity scores for all doctors
+            doctor_scores: List[Tuple[Dict[str, Any], float]] = []
+
+            for doctor in doctors:
+                first_name = doctor.get("first_name", "")
+                last_name = doctor.get("last_name", "")
+                full_name = f"{first_name} {last_name}".strip()
+
+                # Calculate similarity score
+                similarity = self._calculate_name_similarity(doctor_name, full_name)
+                doctor_scores.append((doctor, similarity))
+
+            # Sort by similarity score (highest first)
+            doctor_scores.sort(key=lambda x: x[1], reverse=True)
+
+            # Define thresholds
+            EXACT_MATCH_THRESHOLD = 95  # 95+ is considered exact match
+            GOOD_MATCH_THRESHOLD = 70   # 70+ is considered a good match (minimum to return)
+
+            best_match, best_score = doctor_scores[0]
+
+            logger.info(f"Doctor search: '{doctor_name}' -> Best match: '{best_match.get('first_name')} {best_match.get('last_name')}' (score: {best_score:.1f})")
+
+            # Check if we have a good enough match (minimum 70%)
+            if best_score < GOOD_MATCH_THRESHOLD:
+                # Show top 3 suggestions if no good match
+                suggestions = []
+                for doctor, score in doctor_scores[:3]:
+                    suggestions.append(f"Dr. {doctor.get('first_name')} {doctor.get('last_name')} ({doctor.get('specialty', 'N/A')})")
+
+                return {
+                    "success": False,
+                    "error": f"No close match found for '{doctor_name}'",
+                    "suggestion": f"Did you mean one of these? {', '.join(suggestions)}. Use list_doctors tool to see all available doctors."
+                }
+
+            # If we have multiple similar matches (within 10 points), suggest them
+            similar_matches = [
+                (doc, score) for doc, score in doctor_scores
+                if score >= GOOD_MATCH_THRESHOLD and score >= best_score - 10
+            ]
+
+            result = {
                 "success": True,
                 "doctor": {
-                    "id": doctor.get("id"),
-                    "name": f"Dr. {doctor.get('first_name')} {doctor.get('last_name')}",
-                    "first_name": doctor.get("first_name"),
-                    "last_name": doctor.get("last_name"),
-                    "specialty": doctor.get("specialty"),
-                    "languages": doctor.get("languages", ["en"])
-                }
+                    "id": best_match.get("id"),
+                    "name": f"Dr. {best_match.get('first_name')} {best_match.get('last_name')}",
+                    "first_name": best_match.get("first_name"),
+                    "last_name": best_match.get("last_name"),
+                    "specialty": best_match.get("specialty"),
+                    "languages": best_match.get("languages", ["en"])
+                },
+                "confidence": "exact" if best_score >= EXACT_MATCH_THRESHOLD else "high" if best_score >= GOOD_MATCH_THRESHOLD else "medium",
+                "similarity_score": round(best_score, 1)
             }
 
+            # Add alternative suggestions if there are other close matches
+            if len(similar_matches) > 1 and best_score < EXACT_MATCH_THRESHOLD:
+                alternatives = []
+                for doc, score in similar_matches[1:4]:  # Up to 3 alternatives
+                    alternatives.append({
+                        "name": f"Dr. {doc.get('first_name')} {doc.get('last_name')}",
+                        "specialty": doc.get("specialty"),
+                        "score": round(score, 1)
+                    })
+                result["alternatives"] = alternatives
+                result["note"] = "Multiple similar matches found. Please confirm this is the correct doctor."
+
+            return result
+
         except Exception as e:
-            logger.error(f"Error finding doctor by name: {e}")
-            return {"error": str(e)}
+            logger.error(f"Error finding doctor by name: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"System error while searching for doctor: {str(e)}",
+                "should_retry": True
+            }
 
     def _merge_timeslots_to_ranges(self, timeslots: List[Dict[str, Any]]) -> List[str]:
         """
@@ -1004,7 +1158,51 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         if normalized:
             return normalized
         return time_str  # Fallback to original if normalization fails
-    
+
+    def _normalize_date(self, date_str: str) -> str:
+        """
+        Normalize date to YYYY-MM-DD format.
+
+        Handles:
+        - "2025-12-25" (already normalized)
+        - "25/12/2025", "12/25/2025" (slash formats)
+        - "25-12-2025" (DD-MM-YYYY)
+        - Strips extra text like "(Tomorrow)" or " (Wednesday)"
+
+        Returns:
+            Date in YYYY-MM-DD format, or original if parsing fails
+        """
+        if not date_str:
+            return date_str
+
+        # Strip any parenthetical text like "(Tomorrow)" or " (Wednesday)"
+        import re
+        cleaned = re.sub(r'\s*\([^)]*\)', '', date_str).strip()
+
+        # Already in correct format YYYY-MM-DD
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', cleaned):
+            return cleaned
+
+        # Try various formats
+        from datetime import datetime
+        formats = [
+            "%Y-%m-%d",      # 2025-12-25 (already correct)
+            "%d/%m/%Y",      # 25/12/2025
+            "%m/%d/%Y",      # 12/25/2025 (US format)
+            "%d-%m-%Y",      # 25-12-2025
+            "%Y/%m/%d",      # 2025/12/25
+        ]
+
+        for fmt in formats:
+            try:
+                date_obj = datetime.strptime(cleaned, fmt)
+                return date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+        # Fallback to original if all parsing fails
+        return date_str
+
     def _convert_12_to_24(self, hour: str, minute: str, period: Optional[str]) -> str:
         """Convert 12-hour time to 24-hour format."""
         h = int(hour)
@@ -1581,17 +1779,21 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "message": "Unable to determine appointment type. Please try again."
                 }
             
-            # Step 5: Calculate end time
-            start_dt = dt.strptime(time, "%H:%M")
+            # Step 5: Normalize inputs and calculate end time
+            # Normalize date format (handles "25/12/2025 (Tomorrow)" -> "2025-12-25")
+            normalized_date = self._normalize_date(date)
+            # Normalize time format (handles "16:30 (4:30 PM)" -> "16:30")
+            normalized_time_for_calc = self._normalize_time(time)
+            start_dt = dt.strptime(normalized_time_for_calc, "%H:%M")
             end_dt = start_dt + timedelta(minutes=30)
             end_time = end_dt.strftime("%H:%M")
-            
+
             # Step 5.5: Verify time is still available (double-check)
             normalized_time = self._normalize_time(time)
             try:
                 available_slots = self.db_client.get_available_time_slots(
                     doctor_id=doctor_id,
-                    date=date,
+                    date=normalized_date,
                     slot_duration_minutes=30
                 )
                 if available_slots:
@@ -1623,8 +1825,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     patient_id=patient_id,
                     doctor_id=doctor_id,
                     appointment_type_id=appointment_type_id,
-                    appointment_date=date,
-                    start_time=time,
+                    appointment_date=normalized_date,
+                    start_time=normalized_time_for_calc,
                     end_time=end_time,
                     reason=reason,
                     emergency_level="routine",
@@ -1658,7 +1860,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     try:
                         available_slots = self.db_client.get_available_time_slots(
                             doctor_id=doctor_id,
-                            date=date,
+                            date=normalized_date,
                             slot_duration_minutes=30
                         )
                         if available_slots:
@@ -1787,14 +1989,14 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             
             # Format date for display
             try:
-                date_obj = dt.strptime(date, "%Y-%m-%d")
+                date_obj = dt.strptime(normalized_date, "%Y-%m-%d")
                 date_display = date_obj.strftime("%B %d, %Y")
             except:
-                date_display = date
-            
+                date_display = normalized_date
+
             # Format time for display
             try:
-                time_obj = dt.strptime(time, "%H:%M")
+                time_obj = dt.strptime(normalized_time_for_calc, "%H:%M")
                 time_display = time_obj.strftime("%I:%M %p")
             except:
                 time_display = time

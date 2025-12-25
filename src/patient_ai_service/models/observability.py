@@ -8,36 +8,74 @@ from pydantic import BaseModel, Field
 
 
 class TokenUsage(BaseModel):
-    """Token usage information for an LLM call."""
+    """Token usage tracking with cache support."""
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     
+    # Cache tracking (Anthropic-specific)
+    cache_creation_input_tokens: int = 0  # Tokens written to cache (1.25x cost)
+    cache_read_input_tokens: int = 0       # Tokens read from cache (0.1x cost)
+    
+    @property
+    def cache_hit_rate(self) -> float:
+        """Calculate cache hit rate (0.0 to 1.0)."""
+        total_cacheable = self.cache_creation_input_tokens + self.cache_read_input_tokens
+        if total_cacheable == 0:
+            return 0.0
+        return self.cache_read_input_tokens / total_cacheable
+    
+    @property
+    def regular_input_tokens(self) -> int:
+        """Input tokens not involved in caching."""
+        return self.input_tokens - self.cache_creation_input_tokens - self.cache_read_input_tokens
+    
     def __add__(self, other: "TokenUsage") -> "TokenUsage":
-        """Add two TokenUsage objects together."""
+        """Add two TokenUsage instances."""
         return TokenUsage(
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
-            total_tokens=self.total_tokens + other.total_tokens
+            total_tokens=self.total_tokens + other.total_tokens,
+            cache_creation_input_tokens=self.cache_creation_input_tokens + other.cache_creation_input_tokens,
+            cache_read_input_tokens=self.cache_read_input_tokens + other.cache_read_input_tokens,
         )
 
 
 class CostInfo(BaseModel):
-    """Cost information for an LLM call."""
+    """Cost information for API calls with cache breakdown."""
     input_cost_usd: float = 0.0
     output_cost_usd: float = 0.0
     total_cost_usd: float = 0.0
     model: str = ""
     provider: str = ""
     
+    # Cache cost breakdown
+    cache_creation_cost_usd: float = 0.0  # Cost of writing to cache (1.25x)
+    cache_read_cost_usd: float = 0.0       # Cost of reading from cache (0.1x)
+    regular_input_cost_usd: float = 0.0    # Cost of non-cached input tokens
+    
+    @property
+    def cache_savings_usd(self) -> float:
+        """Estimated savings from cache hits vs full price."""
+        # If we had paid full price for cache_read tokens instead of 0.1x
+        # Savings = (full_price - discounted_price) for cache reads
+        if self.cache_read_cost_usd > 0:
+            # cache_read is at 0.1x, so full price would be 10x
+            full_price = self.cache_read_cost_usd * 10
+            return full_price - self.cache_read_cost_usd
+        return 0.0
+    
     def __add__(self, other: "CostInfo") -> "CostInfo":
-        """Add two CostInfo objects together."""
+        """Add two CostInfo instances."""
         return CostInfo(
             input_cost_usd=self.input_cost_usd + other.input_cost_usd,
             output_cost_usd=self.output_cost_usd + other.output_cost_usd,
             total_cost_usd=self.total_cost_usd + other.total_cost_usd,
             model=self.model or other.model,
-            provider=self.provider or other.provider
+            provider=self.provider or other.provider,
+            cache_creation_cost_usd=self.cache_creation_cost_usd + other.cache_creation_cost_usd,
+            cache_read_cost_usd=self.cache_read_cost_usd + other.cache_read_cost_usd,
+            regular_input_cost_usd=self.regular_input_cost_usd + other.regular_input_cost_usd,
         )
 
 
@@ -121,6 +159,7 @@ class AgentExecutionDetails(BaseModel):
     total_cost: CostInfo = Field(default_factory=CostInfo)
     duration_seconds: float = 0.0  # Changed from duration_ms to duration_seconds
     response_preview: str = ""  # First 200 chars of response
+    tool_scoping_stats: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ValidationDetails(BaseModel):

@@ -58,6 +58,7 @@ class UnifiedReasoning:
         awaiting: Optional[str],
         awaiting_context: Optional[str],              # NEW
         pending_action: Optional[Dict[str, Any]],     # NEW
+        information_collection: Optional[Dict[str, Any]],  # NEW
         recent_turns: List[Dict[str, str]],
         existing_plan: Optional[AgentPlan]
     ) -> UnifiedReasoningOutput:
@@ -88,6 +89,27 @@ class UnifiedReasoning:
         logger.info(f"[UnifiedReasoning] Awaiting context: {awaiting_context}")  # NEW
         logger.info(f"[UnifiedReasoning] Has pending action: {pending_action is not None}")  # NEW
         logger.info(f"[UnifiedReasoning] Has plan: {existing_plan is not None}")
+        
+        # 🔍 ADD DETAILED PLAN LOGGING
+        if existing_plan:
+            logger.info(f"🔍🔍🔍 [UNIFIED_REASONING] PLAN RECEIVED ══════════════════")
+            logger.info(f"🔍 Session ID: {session_id}")
+            logger.info(f"🔍 Plan object type: {type(existing_plan)}")
+            logger.info(f"🔍 Plan agent_name: {existing_plan.agent_name}")
+            logger.info(f"🔍 Plan status: {existing_plan.status.value}")
+            logger.info(f"🔍 Plan objective: {existing_plan.objective}")
+            logger.info(f"🔍 Plan tasks: {len(existing_plan.tasks)}")
+            logger.info(f"🔍 Plan awaiting: {existing_plan.awaiting_info or 'None'}")
+            logger.info(f"🔍 Plan entities: {list(existing_plan.entities.keys()) if existing_plan.entities else 'None'}")
+            logger.info(f"🔍 Plan is_blocked: {existing_plan.is_blocked()}")
+            logger.info(f"🔍 Plan is_terminal: {existing_plan.is_terminal()}")
+            logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
+        else:
+            logger.info(f"🔍🔍🔍 [UNIFIED_REASONING] NO PLAN RECEIVED ═════════════")
+            logger.info(f"🔍 Session ID: {session_id}")
+            logger.info(f"🔍 existing_plan is None")
+            logger.info(f"🔍 active_agent: {active_agent}")
+            logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
 
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
@@ -100,6 +122,7 @@ class UnifiedReasoning:
             awaiting=awaiting,
             awaiting_context=awaiting_context,    # NEW
             pending_action=pending_action,         # NEW
+            information_collection=information_collection,  # NEW
             recent_turns=recent_turns,
             existing_plan=existing_plan
         )
@@ -120,10 +143,26 @@ class UnifiedReasoning:
                 agent_name="unified_reasoning",
                 function_name="reason"
             )
+            logger.info(
+                f"🔍 [UnifiedReasoning] Using LLM: provider={llm_config.provider}, "
+                f"model={llm_config.model}, temperature={llm_config.temperature}"
+            )
+            
             llm_client = self.llm_config_manager.get_client(
                 agent_name="unified_reasoning",
                 function_name="reason"
             )
+            
+            # Verify the client model matches config
+            if hasattr(llm_client, 'model'):
+                logger.info(
+                    f"✅ [UnifiedReasoning] LLM client initialized with model: {llm_client.model}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️  [UnifiedReasoning] LLM client doesn't have 'model' attribute. "
+                    f"Client type: {type(llm_client)}"
+                )
             
             # Make LLM call with token tracking
             llm_start_time = time.time()
@@ -239,16 +278,19 @@ no_plan: IF routing decision IS fast_path or general_assistant
 create_new: New intent, no existing plan
 resume: Continue existing plan unchanged
 abandon_create: New intent/topic_shift with existing plan to abandon
+complete: Plan is complete, clear it (similar to no_plan but explicitly marks completion)
 
 ═══════════════════════════════════════════════════════════════════════════════
 TASK
 ═══════════════════════════════════════════════════════════════════════════════
 
-Analyze the user message in context. Determine:
-1. What type of situation is this?
-2. Does this need an agent, and if so, which one can fulfill what the user actually wants?
-3. What should happen with the current plan (if any)?
-4. What is the user trying to achieve?
+Read the RECENT CONVERSATION carefully. Understand what just happened before this message.
+
+Then determine:
+1. Given what the assistant last said, what is this message responding to?
+2. What type of situation is this in context?
+3. Does this need an agent, and if so, which one?
+4. What should happen with the current plan (if any)?
 
 Consider: What the user wants may differ from what the active agent can provide.
 
@@ -259,30 +301,42 @@ OUTPUT
 FOR FAST-PATH (greeting, farewell, thanks, pleasantry):
 {"route_type": "fast_path", "situation_type": "..."}
 
-FOR AGENT ROUTING:
+
+FOR ROUTING ACTION (confirmation or information collection in progress):
+{"routing_action": "execute_confirmed_action|collect_information", "agent": "...", "plan_decision": "resume"}
+
+
+FOR AGENT ROUTING (all other cases):
 {
   "route_type": "agent",
   "is_continuation": true|false,
   "situation_type": "...",
   "confidence": 0.0-1.0,
   "agent": "registration|appointment_manager|emergency_response|general_assistant|medical_inquiry",
-  "plan_decision": "no_plan|create_new|resume|abandon_create",
+  "plan_decision": "no_plan|create_new|resume|abandon_create|complete",
   "plan_reasoning": "Why this plan decision",
-  "what_user_means": "Plain English explanation of what user actually wants",
+  "what_user_means": "Plain English explanation of what user actually wants + what do we need to do to help them + what's bloking us (if anything)",
   "objective": "Goal for the agent (empty if resume)",
-  "routing_action": "execute_confirmed_action|null"
+  "routing_action": null
 }
 
-IMPORTANT: When a pending action is awaiting confirmation:
-- If user confirms (yes, yeah, sure, okay, etc.) → routing_action MUST be "execute_confirmed_action"
-- If user rejects (no, cancel, etc.) → routing_action is null (agent will think normally)
-- If user modifies (yes but..., change to..., etc.) → routing_action is null (agent will think normally)
-- Otherwise → routing_action is null
+IMPORTANT: Special routing actions:
 
-Note: Only explicit confirmations get special routing. Rejections and modifications
-go through normal agent thinking where _think() will decide the appropriate response.
+1. CONFIRMATION FLOW - When a pending action is awaiting confirmation:
+   - If user confirms (yes, yeah, sure, okay, etc.) → USE ROUTING ACTION FORMAT with "execute_confirmed_action"
+   - If user rejects (no, cancel, etc.) → USE AGENT ROUTING FORMAT with routing_action: null
+   - If user modifies (yes but..., change to..., etc.) → USE AGENT ROUTING FORMAT with routing_action: null
+
+2. INFORMATION COLLECTION FLOW - When information is being collected:
+   - If user provides ANY information (flexible, include vague/partial answers) → USE ROUTING ACTION FORMAT with "collect_information"
+   - If user shifts topic or asks unrelated question → USE AGENT ROUTING FORMAT with routing_action: null
+
+   The lightweight responder will determine if information is sufficient to proceed.
+
+3. Otherwise → USE AGENT ROUTING FORMAT with routing_action: null
 
 JSON only. No explanation outside JSON."""
+
 
     def _build_prompt(
         self,
@@ -292,6 +346,7 @@ JSON only. No explanation outside JSON."""
         awaiting: Optional[str],
         awaiting_context: Optional[str],              # NEW
         pending_action: Optional[Dict[str, Any]],     # NEW
+        information_collection: Optional[Dict[str, Any]],  # NEW
         recent_turns: List[Dict[str, str]],
         existing_plan: Optional[AgentPlan]
     ) -> str:
@@ -302,10 +357,10 @@ JSON only. No explanation outside JSON."""
         patient_name = f"{patient_info.get('first_name', 'Unknown')} {patient_info.get('last_name', '')}".strip()
         is_registered = bool(patient_info.get("patient_id"))
 
-        # Format recent turns
+        # Format recent turns with timestamps
         if recent_turns:
             turns_formatted = "\n".join([
-                f"{'User' if t['role'] == 'user' else 'Assistant'}: {t['content'][:200]}"
+                f"[{t.get('timestamp', 'unknown time')}] {'User' if t['role'] == 'user' else 'Assistant'}: {t['content'][:200]}"
                 for t in recent_turns[-6:]
             ])
         else:
@@ -377,6 +432,41 @@ If user asks something UNRELATED (what are your hours?, who is Dr. X?, something
 
 """
 
+        # NEW: Build information collection section
+        information_collection_section = ""
+        if awaiting == "information" and information_collection:
+            information_collection_section = f"""
+═══════════════════════════════════════════════════════════════════════════════
+INFORMATION COLLECTION IN PROGRESS
+═══════════════════════════════════════════════════════════════════════════════
+
+WHAT WE'RE COLLECTING: {information_collection.get('information_needed', 'user information')}
+CONTEXT: {information_collection.get('context', 'general inquiry')}
+QUESTION ASKED: {information_collection.get('information_question', 'N/A')}
+
+ROUTING RULES FOR INFORMATION COLLECTION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If user PROVIDES requested information (direct answer, partial answer, preferences):
+  → routing_action: "collect_information"
+  → situation_type: "direct_answer"
+
+  IMPORTANT - Be FLEXIBLE with what counts as "providing information":
+  - "I recommend..." → Valid answer
+  - "Anything is fine" → Valid answer
+  - "I don't care" → Valid answer
+  - "I don't know" → Valid answer
+  - Partial information → Valid answer
+  - Vague or indirect answer → Still valid
+
+  The lightweight responder will assess if enough info was provided.
+
+If user asks UNRELATED question or shifts topic:
+  → routing_action: null (route to appropriate agent)
+  → situation_type: "new_intent" or "topic_shift"
+
+"""
+
         return f"""═══════════════════════════════════════════════════════════════════════════════
 CONTEXT
 ═══════════════════════════════════════════════════════════════════════════════
@@ -393,6 +483,7 @@ RECENT CONVERSATION:
 {turns_formatted}
 {registration_status_section}
 {pending_action_section}
+{information_collection_section}
 {plan_context}
 
 Analyze and respond with JSON only."""
@@ -404,18 +495,40 @@ Analyze and respond with JSON only."""
     ) -> str:
         """Build plan context with agent capabilities."""
 
+        import logging
+        logger = logging.getLogger(__name__)
+
         lines = ["═══════════════════════════════════════════════════════════════════════════════",
                  "PLAN STATE",
                  "═══════════════════════════════════════════════════════════════════════════════"]
 
         if existing_plan:
+            logger.info(f"🔍🔍🔍 [UNIFIED_REASONING] FORMATTING PLAN ════════════")
+            logger.info(f"🔍 Plan object type: {type(existing_plan)}")
+            logger.info(f"🔍 Plan agent_name: {existing_plan.agent_name}")
+            logger.info(f"🔍 Plan status: {existing_plan.status.value}")
+            logger.info(f"🔍 Plan objective: {existing_plan.objective}")
+            logger.info(f"🔍 Plan tasks: {len(existing_plan.tasks)}")
+            logger.info(f"🔍 Plan awaiting: {existing_plan.awaiting_info or 'None'}")
+            logger.info(f"🔍 Plan entities: {list(existing_plan.entities.keys()) if existing_plan.entities else 'None'}")
+            logger.info(f"🔍 Plan is_blocked: {existing_plan.is_blocked()}")
+            logger.info(f"🔍 Will show: Plan exists: YES")
+            logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
+
             lines.append(f"Plan exists: YES")
             lines.append(f"Plan agent: {existing_plan.agent_name}")
             lines.append(f"Plan objective: {existing_plan.objective}")
             lines.append(f"Plan status: {'BLOCKED - waiting for: ' + (existing_plan.awaiting_info or 'user input') if existing_plan.is_blocked() else existing_plan.status.value}")
-            if existing_plan.resolved_entities:
-                lines.append(f"Resolved entities: {existing_plan.resolved_entities}")
+            if existing_plan.entities:
+                lines.append(f"Resolved entities: {existing_plan.entities}")
         else:
+            logger.info(f"🔍🔍🔍 [UNIFIED_REASONING] NO PLAN ═════════════════════")
+            logger.info(f"🔍 existing_plan is None/False")
+            logger.info(f"🔍 existing_plan value: {existing_plan}")
+            logger.info(f"🔍 active_agent: {active_agent}")
+            logger.info(f"🔍 Will show: Plan exists: NO")
+            logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
+
             lines.append("Plan exists: NO")
 
         # Add agent capability context (critical for the handoff bug fix)

@@ -25,6 +25,7 @@ from patient_ai_service.models.patient_entities import PatientEntities, EntitySo
 from patient_ai_service.models.derived_entities import DerivedEntitiesManager
 from patient_ai_service.models.entity_state import EntityState
 from patient_ai_service.models.agent_plan import AgentPlan, PlanStatus
+from patient_ai_service.models.fifo_dict import FIFODict
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -73,17 +74,31 @@ class ContinuationContext(BaseModel):
     #   "action_type": "booking",  # booking, cancellation, reschedule, registration
     #   "summary": "Book appointment with Dr. Smith on December 20th at 3pm"
     # }
-    
+
+    # NEW: Information collection details (for info collection non-brainer)
+    information_collection: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    # Structure:
+    # {
+    #   "information_needed": "free-form description of what info is needed",
+    #   "information_question": "the question asked to the user",
+    #   "context": "additional context for the collection"
+    # }
+
     # Options we presented
     presented_options: List[Any] = Field(default_factory=list)
     
     # What the user originally requested
     original_request: Optional[str] = None
     
-    # Partial progress we've made
-    resolved_entities: Dict[str, Any] = Field(default_factory=dict)
+    # Partial progress we've made - entities accumulated during execution
+    # Store as regular dict for serialization, but use FIFODict for manipulation
+    entities: Dict[str, Any] = Field(default_factory=dict)
     # Example: {"doctor_id": "uuid-123", "date": "2025-12-06", "procedure": "cleaning"}
-    
+
+    # NEW: LLM-only entity updates (shown in prompts)
+    # ISOLATED from multi-source entities - only contains what LLM explicitly updates
+    llm_entities: Dict[str, Any] = Field(default_factory=dict)
+
     # Blocked criteria
     blocked_criteria: List[str] = Field(default_factory=list)
     
@@ -92,6 +107,30 @@ class ContinuationContext(BaseModel):
     
     # How many turns we've been waiting
     waiting_turns: int = 0
+
+    def get_entities_fifo(self) -> FIFODict:
+        """Get entities as FIFODict for manipulation."""
+        return FIFODict.from_dict(self.entities, max_size=8)
+
+    def set_entities_from_fifo(self, fifo_dict: FIFODict):
+        """Update entities from FIFODict."""
+        self.entities = fifo_dict.to_dict()
+
+    def get_llm_entities_fifo(self) -> FIFODict:
+        """
+        Get LLM entities as FIFODict for manipulation.
+
+        Uses the same FIFODict from ENTITY_INTEGRATION_PLAN.md with:
+        - Max size 8 items
+        - FIFO eviction (oldest first)
+        - Update moves item to end (newest)
+        - Eviction logging
+        """
+        return FIFODict.from_dict(self.llm_entities, max_size=8)
+
+    def set_llm_entities_from_fifo(self, fifo_dict: FIFODict):
+        """Update LLM entities from FIFODict."""
+        self.llm_entities = fifo_dict.to_dict()
 
 
 class AgenticExecutionState(BaseModel):
@@ -662,22 +701,26 @@ class StateManager:
         awaiting: str,
         awaiting_context: Optional[str] = None,        # NEW
         pending_action: Optional[Dict[str, Any]] = None,  # NEW
+        information_collection: Optional[Dict[str, Any]] = None,  # NEW
         options: List[Any] = None,
         original_request: str = None,
-        resolved_entities: Dict[str, Any] = None,
+        entities: Dict[str, Any] = None,
+        llm_entities: Dict[str, Any] = None,  # NEW
         blocked_criteria: List[str] = None
     ):
         """
         Set continuation context for resuming after user input.
-        
+
         Args:
             session_id: Session identifier
-            awaiting: What we're waiting for (e.g., "confirmation", "time_selection")
+            awaiting: What we're waiting for (e.g., "confirmation", "time_selection", "information")
             awaiting_context: Human-readable summary of what we're awaiting (NEW)
             pending_action: Structured pending action details for confirmations (NEW)
+            information_collection: Structured information collection details (NEW)
             options: Options presented to user
             original_request: User's original request
-            resolved_entities: Entities resolved so far
+            entities: Entities accumulated so far (multi-source)
+            llm_entities: LLM-only entity updates (ISOLATED track)
             blocked_criteria: Blocked success criteria
         """
         state = self.get_agentic_state(session_id)
@@ -704,13 +747,46 @@ class StateManager:
             pass
         #endregion
 
+        # Convert entities to FIFODict if needed
+        entities_dict = entities or {}
+        if not isinstance(entities_dict, FIFODict):
+            entities_fifo = FIFODict.from_dict(entities_dict, max_size=8)
+        else:
+            entities_fifo = entities_dict
+
+        # Log if any entities were evicted during conversion
+        eviction_log = entities_fifo.get_eviction_log()
+        if eviction_log:
+            logger.warning(
+                f"⚠️ {len(eviction_log)} internal entities evicted when creating continuation context: "
+                f"{[e['key'] for e in eviction_log]}"
+            )
+
+        # NEW: Convert LLM entities to FIFODict (same pattern)
+        llm_entities_dict = llm_entities or {}
+        if not isinstance(llm_entities_dict, FIFODict):
+            llm_entities_fifo = FIFODict.from_dict(llm_entities_dict, max_size=8)
+        else:
+            llm_entities_fifo = llm_entities_dict
+
+        # Log if any LLM entities were evicted during conversion
+        llm_eviction_log = llm_entities_fifo.get_eviction_log()
+        if llm_eviction_log:
+            logger.warning(
+                f"⚠️ {len(llm_eviction_log)} LLM entities evicted when creating continuation context: "
+                f"{[e['key'] for e in llm_eviction_log]}"
+            )
+
+        # Store as regular dict for serialization
         state.continuation_context = ContinuationContext(
             awaiting=awaiting,
             awaiting_context=awaiting_context,           # NEW
             pending_action=pending_action or {},         # NEW
+            information_collection=information_collection or {},  # NEW
             presented_options=options or [],
             original_request=original_request,
-            resolved_entities=resolved_entities or {},
+            entities=entities_fifo.to_dict(),  # Convert FIFODict to dict for storage
+            llm_entities=llm_entities_fifo.to_dict(),  # NEW - same pattern
             blocked_criteria=blocked_criteria or state.blocked_criteria.copy(),
             waiting_turns=0
         )
@@ -731,7 +807,12 @@ class StateManager:
             reasoning_state.active_agent = global_state.active_agent
         self.save_reasoning_state(session_id, reasoning_state)
 
-        logger.info(f"Set continuation context: awaiting={awaiting}, options={len(options or [])}")
+        logger.info(
+            f"💾 Continuation context saved: "
+            f"awaiting={awaiting}, "
+            f"internal_entities={len(entities_fifo)}, "
+            f"llm_entities={len(llm_entities_fifo)}"
+        )
 
     def get_continuation_context(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -894,16 +975,21 @@ class StateManager:
     # Utility Methods
 
     def get_agent_context(self, session_id: str, agent_name: str) -> Dict[str, Any]:
-        """Get full context for an agent (global + local state)."""
+        """Get full context for an agent (global + local state).
+
+        NOTE: entities are NOT stored in GlobalState.
+        They flow through:
+          - ContinuationContext.entities (between turns)
+          - AgentPlan.entities (during plan execution)
+          - task_context["entities"] (runtime, passed via set_context)
+        """
         global_state = self.get_global_state(session_id)
         context = {
             "session_id": session_id,
             "patient_profile": global_state.patient_profile.model_dump(),
             "conversation_stage": global_state.conversation_stage,
             "detected_language": global_state.detected_language,
-            # Backward-compatible alias: keep entities_collected in context,
-            # but source it from the canonical resolved_entities.
-            "entities_collected": getattr(global_state, "resolved_entities", {}) or global_state.entities_collected,
+            # entities removed from GlobalState - see ContinuationContext instead
         }
 
         # Add agent-specific state
@@ -981,16 +1067,24 @@ class StateManager:
         session_id: str,
         tool_name: str,
         tool_params: Dict[str, Any],
-        tool_result: Dict[str, Any]
+        tool_result: Dict[str, Any],
+        agent_name: Optional[str] = None
     ) -> List[str]:
         """
         Process a tool result and store derived entities.
+        
+        Args:
+            session_id: Session identifier
+            tool_name: Name of the tool that was called
+            tool_params: Parameters used in the tool call
+            tool_result: The result from the tool
+            agent_name: Name of the agent that called this tool
         
         Returns:
             List of derived entity keys that were stored
         """
         entity_state = self.get_entity_state(session_id)
-        stored = entity_state.store_tool_result(tool_name, tool_params, tool_result)
+        stored = entity_state.store_tool_result(tool_name, tool_params, tool_result, agent_name)
         self.save_entity_state(session_id, entity_state)
         
         stored_keys = [e.key for e in stored]
@@ -1086,19 +1180,33 @@ class StateManager:
     ):
         """
         Store an agent's plan.
-        
+
         Args:
             session_id: Session identifier
             plan: AgentPlan to store
         """
+        logger.info(f"🔍🔍🔍 [STATE_MANAGER] STORING PLAN ═══════════════════")
+        logger.info(f"🔍 Session ID: {session_id}")
+        logger.info(f"🔍 Agent name: {plan.agent_name}")
+        logger.info(f"🔍 Status: {plan.status}")
+        logger.info(f"🔍 Objective: {plan.objective[:100] if plan.objective else 'None'}")
+        logger.info(f"🔍 Entities: {list(plan.entities.keys()) if plan.entities else '[]'}")
+
         if not isinstance(plan, AgentPlan):
             logger.error(f"📋 [StateManager] Invalid plan type: {type(plan)}")
+            logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
             return
-        
+
         plan_key = self._make_key(session_id, f"plan:{plan.agent_name}")
+        logger.info(f"🔍 Redis key: {plan_key}")
+
         data = json.dumps(plan.model_dump(), default=str)
+        logger.info(f"🔍 Data size: {len(data)} bytes")
+
         self.backend.set(plan_key, data, ttl=self.ttl)
-        
+        logger.info(f"🔍 ✅ Plan stored successfully")
+        logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
+
         logger.info(f"📋 [StateManager] Stored plan for {plan.agent_name}: {plan.get_summary()}")
     
     def get_any_active_plan(
@@ -1107,29 +1215,61 @@ class StateManager:
     ) -> Optional[AgentPlan]:
         """
         Get any active (non-terminal) plan for the session.
-        
+
         Checks all known agents and returns the first active plan found.
-        
+
         Args:
             session_id: Session identifier
-            
+
         Returns:
             First active AgentPlan found, or None if no active plans
         """
+        logger.info(f"🔍🔍🔍 [STATE_MANAGER] RETRIEVING PLAN ════════════════")
+        logger.info(f"🔍 Session ID: {session_id}")
+
         known_agents = [
-            "appointment_manager",
+            "AppointmentManager",
             "registration",
-            "general_assistant",
-            "emergency_response",
-            "medical_inquiry"
+            "GeneralAssistant",
+            "EmergencyResponse",
+            "MedicalInquiry"
         ]
-        
+
+        logger.info(f"🔍 Searching {len(known_agents)} known agents: {known_agents}")
+
+        found_plans = []
         for agent_name in known_agents:
             plan = self.get_agent_plan(session_id, agent_name)
-            if plan and not plan.is_terminal():
-                logger.debug(f"📋 [StateManager] Found active plan for {agent_name}")
-                return plan
-        
+            if plan:
+                found_plans.append(plan)
+                logger.info(f"🔍 Found plan for {agent_name}: status={plan.status.value}, terminal={plan.is_terminal()}")
+
+        if found_plans:
+            logger.info(f"🔍 Found {len(found_plans)} total plan(s):")
+            for p in found_plans:
+                logger.info(f"🔍   - Agent: {p.agent_name}, Status: {p.status.value}, Objective: {p.objective[:50]}")
+        else:
+            logger.info(f"🔍 ❌ NO PLANS FOUND for session {session_id}")
+
+        # Filter for active (non-terminal) plans
+        active_plans = [p for p in found_plans if not p.is_terminal()]
+
+        if not active_plans:
+            logger.info(f"🔍 ❌ NO ACTIVE PLANS after filtering")
+            if found_plans:
+                logger.info(f"🔍 All plan statuses: {[p.status.value for p in found_plans]}")
+                logger.info(f"🔍 Terminal statuses filtered out: {[p.agent_name for p in found_plans if p.is_terminal()]}")
+        else:
+            logger.info(f"🔍 ✅ Found {len(active_plans)} active plan(s)")
+            result_plan = active_plans[0]
+            logger.info(f"🔍 Returning plan for: {result_plan.agent_name}")
+
+        logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
+
+        if active_plans:
+            logger.debug(f"📋 [StateManager] Found active plan for {active_plans[0].agent_name}")
+            return active_plans[0]
+
         logger.debug(f"📋 [StateManager] No active plans found for session: {session_id}")
         return None
     
@@ -1148,11 +1288,11 @@ class StateManager:
             reason: Reason for abandoning (e.g., "topic_change", "user_request")
         """
         known_agents = [
-            "appointment_manager",
+            "AppointmentManager",
             "registration",
-            "general_assistant",
-            "emergency_response",
-            "medical_inquiry"
+            "GeneralAssistant",
+            "EmergencyResponse",
+            "MedicalInquiry"
         ]
 
         abandoned_count = 0

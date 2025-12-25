@@ -346,7 +346,32 @@ class ObservabilityLogger:
             return None
         
         # Calculate cost
+        # VALIDATION: Log token breakdown before cost calculation
+        logger.info(f"🔍 [Observability] Recording LLM call: {component}")
+        logger.info(f"🔍 [Observability] Token breakdown:")
+        logger.info(f"🔍 [Observability]   - Total input: {tokens.input_tokens}")
+        logger.info(f"🔍 [Observability]   - Cache creation: {tokens.cache_creation_input_tokens}")
+        logger.info(f"🔍 [Observability]   - Cache read: {tokens.cache_read_input_tokens}")
+        logger.info(f"🔍 [Observability]   - Regular (calculated): {tokens.regular_input_tokens}")
+        logger.info(f"🔍 [Observability]   - Output: {tokens.output_tokens}")
+        
+        # VALIDATION: Verify token math
+        expected_regular = tokens.input_tokens - tokens.cache_creation_input_tokens - tokens.cache_read_input_tokens
+        if tokens.regular_input_tokens != expected_regular:
+            logger.warning(f"⚠️ [Observability] Token calculation mismatch!")
+            logger.warning(f"⚠️ [Observability]   Expected regular: {expected_regular}, got: {tokens.regular_input_tokens}")
+            logger.warning(f"⚠️ [Observability]   Input: {tokens.input_tokens}, Cache creation: {tokens.cache_creation_input_tokens}, Cache read: {tokens.cache_read_input_tokens}")
+        
         cost = self.cost_calculator.calculate_cost(tokens, model, provider) if settings.cost_tracking_enabled else CostInfo()
+        
+        # VALIDATION: Log cost breakdown
+        if settings.cost_tracking_enabled:
+            logger.info(f"🔍 [Observability] Cost breakdown:")
+            logger.info(f"🔍 [Observability]   - Regular input cost: ${cost.regular_input_cost_usd:.6f}")
+            logger.info(f"🔍 [Observability]   - Cache creation cost: ${cost.cache_creation_cost_usd:.6f}")
+            logger.info(f"🔍 [Observability]   - Cache read cost: ${cost.cache_read_cost_usd:.6f}")
+            logger.info(f"🔍 [Observability]   - Output cost: ${cost.output_cost_usd:.6f}")
+            logger.info(f"🔍 [Observability]   - Total cost: ${cost.total_cost_usd:.6f}")
         
         # Track tokens
         self.token_tracker.record_tokens(component, tokens.input_tokens, tokens.output_tokens)
@@ -656,10 +681,35 @@ class ObservabilityLogger:
             for llm_call in step_data['llm_calls']:
                 logger.info(f"    - {llm_call.component}")
                 logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
-                logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
-                           f"(total: {llm_call.tokens.total_tokens})")
+                logger.info(f"      Tokens: {llm_call.tokens.total_tokens} total")
+                
+                # Token breakdown - always show cache status
+                has_cache = llm_call.tokens.cache_read_input_tokens > 0 or llm_call.tokens.cache_creation_input_tokens > 0
+
+                if has_cache:
+                    if llm_call.tokens.cache_read_input_tokens > 0:
+                        logger.info(f"        ├─ Cache Read: {llm_call.tokens.cache_read_input_tokens} tokens (0.1x rate)")
+                    if llm_call.tokens.cache_creation_input_tokens > 0:
+                        logger.info(f"        ├─ Cache Write: {llm_call.tokens.cache_creation_input_tokens} tokens (1.25x rate)")
+                    logger.info(f"        ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                    logger.info(f"        └─ Output: {llm_call.tokens.output_tokens} tokens")
+                else:
+                    logger.info(f"        ├─ Cache: Not used")
+                    logger.info(f"        ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                    logger.info(f"        └─ Output: {llm_call.tokens.output_tokens} tokens")
+                
+                # Cost breakdown
                 if settings.cost_tracking_enabled:
                     logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+                    if llm_call.cost.cache_read_cost_usd > 0:
+                        logger.info(f"        ├─ Cache Read: ${llm_call.cost.cache_read_cost_usd:.6f}")
+                    if llm_call.cost.cache_creation_cost_usd > 0:
+                        logger.info(f"        ├─ Cache Write: ${llm_call.cost.cache_creation_cost_usd:.6f}")
+                    logger.info(f"        ├─ Regular Input: ${llm_call.cost.regular_input_cost_usd:.6f}")
+                    logger.info(f"        └─ Output: ${llm_call.cost.output_cost_usd:.6f}")
+                    
+                    if llm_call.cost.cache_savings_usd > 0:
+                        logger.info(f"      💰 Savings: ${llm_call.cost.cache_savings_usd:.6f}")
 
             if settings.cost_tracking_enabled:
                 logger.info(f"  Step Total Cost: ${step_data['total_cost']:.6f}")
@@ -685,10 +735,36 @@ class ObservabilityLogger:
                     logger.info(f"\n    Iteration {idx}:")
                     logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                     logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
-                    logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
-                               f"(total: {llm_call.tokens.total_tokens})")
+                    logger.info(f"      Tokens: {llm_call.tokens.total_tokens} total")
+                    
+                    # Token breakdown - always show cache status for transparency
+                    has_cache = llm_call.tokens.cache_read_input_tokens > 0 or llm_call.tokens.cache_creation_input_tokens > 0
+
+                    if has_cache:
+                        if llm_call.tokens.cache_read_input_tokens > 0:
+                            logger.info(f"        ├─ Cache Read: {llm_call.tokens.cache_read_input_tokens} tokens (0.1x rate)")
+                        if llm_call.tokens.cache_creation_input_tokens > 0:
+                            logger.info(f"        ├─ Cache Write: {llm_call.tokens.cache_creation_input_tokens} tokens (1.25x rate)")
+                        logger.info(f"        ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                        logger.info(f"        └─ Output: {llm_call.tokens.output_tokens} tokens")
+                    else:
+                        # No caching - show it clearly
+                        logger.info(f"        ├─ Cache: Not used (Cache disabled or not supported)")
+                        logger.info(f"        ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                        logger.info(f"        └─ Output: {llm_call.tokens.output_tokens} tokens")
+                    
+                    # Cost breakdown
                     if settings.cost_tracking_enabled:
                         logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+                        if llm_call.cost.cache_read_cost_usd > 0:
+                            logger.info(f"        ├─ Cache Read: ${llm_call.cost.cache_read_cost_usd:.6f}")
+                        if llm_call.cost.cache_creation_cost_usd > 0:
+                            logger.info(f"        ├─ Cache Write: ${llm_call.cost.cache_creation_cost_usd:.6f}")
+                        logger.info(f"        ├─ Regular Input: ${llm_call.cost.regular_input_cost_usd:.6f}")
+                        logger.info(f"        └─ Output: ${llm_call.cost.output_cost_usd:.6f}")
+                        
+                        if llm_call.cost.cache_savings_usd > 0:
+                            logger.info(f"      💰 Savings: ${llm_call.cost.cache_savings_usd:.6f}")
 
             # Log response generation
             if response_calls:
@@ -697,10 +773,35 @@ class ObservabilityLogger:
                     logger.info(f"    Component: {llm_call.component}")
                     logger.info(f"    Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                     logger.info(f"    Duration: {self._format_duration(llm_call.duration_seconds)}")
-                    logger.info(f"    Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
-                               f"(total: {llm_call.tokens.total_tokens})")
+                    logger.info(f"    Tokens: {llm_call.tokens.total_tokens} total")
+                    
+                    # Token breakdown - always show cache status
+                    has_cache = llm_call.tokens.cache_read_input_tokens > 0 or llm_call.tokens.cache_creation_input_tokens > 0
+
+                    if has_cache:
+                        if llm_call.tokens.cache_read_input_tokens > 0:
+                            logger.info(f"      ├─ Cache Read: {llm_call.tokens.cache_read_input_tokens} tokens (0.1x rate)")
+                        if llm_call.tokens.cache_creation_input_tokens > 0:
+                            logger.info(f"      ├─ Cache Write: {llm_call.tokens.cache_creation_input_tokens} tokens (1.25x rate)")
+                        logger.info(f"      ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                        logger.info(f"      └─ Output: {llm_call.tokens.output_tokens} tokens")
+                    else:
+                        logger.info(f"      ├─ Cache: Not used")
+                        logger.info(f"      ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                        logger.info(f"      └─ Output: {llm_call.tokens.output_tokens} tokens")
+                    
+                    # Cost breakdown
                     if settings.cost_tracking_enabled:
                         logger.info(f"    Cost: ${llm_call.cost.total_cost_usd:.6f}")
+                        if llm_call.cost.cache_read_cost_usd > 0:
+                            logger.info(f"      ├─ Cache Read: ${llm_call.cost.cache_read_cost_usd:.6f}")
+                        if llm_call.cost.cache_creation_cost_usd > 0:
+                            logger.info(f"      ├─ Cache Write: ${llm_call.cost.cache_creation_cost_usd:.6f}")
+                        logger.info(f"      ├─ Regular Input: ${llm_call.cost.regular_input_cost_usd:.6f}")
+                        logger.info(f"      └─ Output: ${llm_call.cost.output_cost_usd:.6f}")
+                        
+                        if llm_call.cost.cache_savings_usd > 0:
+                            logger.info(f"    💰 Savings: ${llm_call.cost.cache_savings_usd:.6f}")
 
             # Other agent calls (plan, verify, etc.)
             if other_calls:
@@ -709,10 +810,36 @@ class ObservabilityLogger:
                     logger.info(f"    {llm_call.component}")
                     logger.info(f"      Provider: {llm_call.provider} | Model: {llm_call.model} | Temperature: {llm_call.temperature or 'N/A'}")
                     logger.info(f"      Duration: {self._format_duration(llm_call.duration_seconds)}")
-                    logger.info(f"      Tokens: {llm_call.tokens.input_tokens}/{llm_call.tokens.output_tokens} "
-                               f"(total: {llm_call.tokens.total_tokens})")
+                    logger.info(f"      Tokens: {llm_call.tokens.total_tokens} total")
+                    
+                    # Token breakdown - always show cache status for transparency
+                    has_cache = llm_call.tokens.cache_read_input_tokens > 0 or llm_call.tokens.cache_creation_input_tokens > 0
+
+                    if has_cache:
+                        if llm_call.tokens.cache_read_input_tokens > 0:
+                            logger.info(f"        ├─ Cache Read: {llm_call.tokens.cache_read_input_tokens} tokens (0.1x rate)")
+                        if llm_call.tokens.cache_creation_input_tokens > 0:
+                            logger.info(f"        ├─ Cache Write: {llm_call.tokens.cache_creation_input_tokens} tokens (1.25x rate)")
+                        logger.info(f"        ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                        logger.info(f"        └─ Output: {llm_call.tokens.output_tokens} tokens")
+                    else:
+                        # No caching - show it clearly
+                        logger.info(f"        ├─ Cache: Not used (Cache disabled or not supported)")
+                        logger.info(f"        ├─ Regular Input: {llm_call.tokens.regular_input_tokens} tokens")
+                        logger.info(f"        └─ Output: {llm_call.tokens.output_tokens} tokens")
+                    
+                    # Cost breakdown
                     if settings.cost_tracking_enabled:
                         logger.info(f"      Cost: ${llm_call.cost.total_cost_usd:.6f}")
+                        if llm_call.cost.cache_read_cost_usd > 0:
+                            logger.info(f"        ├─ Cache Read: ${llm_call.cost.cache_read_cost_usd:.6f}")
+                        if llm_call.cost.cache_creation_cost_usd > 0:
+                            logger.info(f"        ├─ Cache Write: ${llm_call.cost.cache_creation_cost_usd:.6f}")
+                        logger.info(f"        ├─ Regular Input: ${llm_call.cost.regular_input_cost_usd:.6f}")
+                        logger.info(f"        └─ Output: ${llm_call.cost.output_cost_usd:.6f}")
+                        
+                        if llm_call.cost.cache_savings_usd > 0:
+                            logger.info(f"      💰 Savings: ${llm_call.cost.cache_savings_usd:.6f}")
 
             # Agent total
             if observability.agent and settings.cost_tracking_enabled:
@@ -861,6 +988,32 @@ class ObservabilityLogger:
                 if settings.cost_tracking_enabled:
                     logger.info(f"   Cost: ${llm_call.cost.total_cost_usd:.6f}")
 
+        # Add cache summary section
+        total_cache_reads = 0
+        total_cache_writes = 0
+        total_cache_savings = 0.0
+        
+        for llm_call in self._llm_calls:
+            total_cache_reads += llm_call.tokens.cache_read_input_tokens
+            total_cache_writes += llm_call.tokens.cache_creation_input_tokens
+            total_cache_savings += llm_call.cost.cache_savings_usd
+        
+        if total_cache_reads > 0 or total_cache_writes > 0:
+            logger.info("\n" + "=" * 80)
+            logger.info("🎯 CACHE METRICS:")
+            logger.info("=" * 80)
+            logger.info(f"Cache Reads: {total_cache_reads} tokens")
+            logger.info(f"Cache Writes: {total_cache_writes} tokens")
+            
+            # Calculate overall cache hit rate
+            total_cacheable = total_cache_reads + total_cache_writes
+            if total_cacheable > 0:
+                hit_rate = total_cache_reads / total_cacheable
+                logger.info(f"Cache Hit Rate: {hit_rate:.1%}")
+            
+            if settings.cost_tracking_enabled and total_cache_savings > 0:
+                logger.info(f"Cache Savings: ${total_cache_savings:.6f}")
+
         # PIPELINE COST BREAKDOWN (Per Step)
         logger.info("\n" + "=" * 80)
         logger.info("💵 PIPELINE COST BREAKDOWN (Per Step):")
@@ -993,4 +1146,94 @@ def clear_observability_logger(session_id: str):
         # Optionally delete the logger (or keep it for session continuity)
         # For now, we'll keep it but reset it
         # del _session_loggers[session_id]
+
+
+# =============================================================================
+# PROMETHEUS METRICS FOR ENTITY SYSTEM
+# =============================================================================
+
+try:
+    from prometheus_client import Counter, Histogram
+    
+    # FIFO eviction metrics
+    fifo_eviction_count = Counter(
+        'entity_fifo_evictions_total',
+        'Total number of FIFO evictions',
+        ['evicted_key']
+    )
+    
+    entity_count_at_eviction = Histogram(
+        'entity_count_at_eviction',
+        'Entity count when eviction occurred',
+        buckets=[5, 7, 10, 13, 15, 18, 20]
+    )
+    
+    # Entity count metrics
+    entity_count = Histogram(
+        'entity_count',
+        'Number of entities in context',
+        buckets=[0, 5, 10, 15, 20, 30, 50]
+    )
+    
+    derived_entity_count = Histogram(
+        'derived_entity_count',
+        'Number of derived entities',
+        buckets=[0, 2, 5, 10, 15, 20]
+    )
+    
+    # Derived entity hit/miss metrics
+    derived_entity_hit_rate = Counter(
+        'derived_entity_hit',
+        'Derived entity cache hits',
+        ['entity_key', 'agent_name']
+    )
+    
+    derived_entity_miss_rate = Counter(
+        'derived_entity_miss',
+        'Derived entity cache misses (invalid/expired)',
+        ['entity_key', 'reason']
+    )
+    
+    derived_entity_age = Histogram(
+        'derived_entity_age_seconds',
+        'Age of derived entities when accessed',
+        buckets=[0, 60, 300, 600, 1800, 3600]  # 0s, 1m, 5m, 10m, 30m, 1h
+    )
+    
+    # Delta format metrics
+    delta_update_count = Counter(
+        'entity_delta_updates_total',
+        'Number of delta updates vs complete state',
+        ['format']  # 'delta' or 'complete'
+    )
+    
+    delta_size = Histogram(
+        'entity_delta_size',
+        'Number of entities in delta update',
+        buckets=[0, 1, 2, 3, 5, 8, 10]
+    )
+    
+except ImportError:
+    # Prometheus not available - create no-op metrics
+    class NoOpCounter:
+        def labels(self, **kwargs):
+            return self
+        def inc(self):
+            pass
+    
+    class NoOpHistogram:
+        def observe(self, value):
+            pass
+    
+    fifo_eviction_count = NoOpCounter()
+    entity_count_at_eviction = NoOpHistogram()
+    entity_count = NoOpHistogram()
+    derived_entity_count = NoOpHistogram()
+    derived_entity_hit_rate = NoOpCounter()
+    derived_entity_miss_rate = NoOpCounter()
+    derived_entity_age = NoOpHistogram()
+    delta_update_count = NoOpCounter()
+    delta_size = NoOpHistogram()
+    
+    logger.warning("Prometheus client not available - entity metrics disabled")
 

@@ -24,6 +24,7 @@ class PlanDecision(str, Enum):
     CREATE_NEW = "create_new"        # New intent, no existing plan
     RESUME = "resume"                # Continue existing plan unchanged
     ABANDON_CREATE = "abandon_create" # Abandon old plan, create new
+    COMPLETE = "complete"            # Plan is complete, clear it
 
 
 class UnifiedReasoningOutput(BaseModel):
@@ -47,10 +48,12 @@ class UnifiedReasoningOutput(BaseModel):
     is_continuation: bool = False
     continuation_type: Optional[str] = None
     
-    # NEW: Direct routing action for confirmations only
+    # NEW: Direct routing action for special flows
     routing_action: Optional[str] = None
-    # Values: "execute_confirmed_action", None
-    # Note: rejection and modification have routing_action=None and go through normal thinking
+    # Values:
+    #   - "execute_confirmed_action": Execute pending action immediately (confirmation flow)
+    #   - "collect_information": Generate lightweight response for info collection (information collection flow)
+    #   - None: Route to agent normally
 
     @classmethod
     def fast_path(cls, situation_type: SituationType) -> "UnifiedReasoningOutput":

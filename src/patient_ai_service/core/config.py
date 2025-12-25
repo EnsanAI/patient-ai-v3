@@ -213,35 +213,6 @@ class Settings(BaseSettings):
         description="Enable cost tracking for LLM calls"
     )
     
-    # Entity Architecture Migration Feature Flags
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Entity Delta Migration (Stage 1-11)
-    # ═══════════════════════════════════════════════════════════════════════════
-    # These flags control the new delta-based entity architecture migration.
-    # When enabled, the system uses:
-    #   - ConversationEntitiesManager (global, max 7, FIFO)
-    #   - AgentScopedDerivedEntitiesManager (agent-specific, max 7 per agent)
-    #   - Delta updates (only changes, not complete state)
-    #   - Smart merging (overwrite existing, append new, FIFO evict)
-    #
-    # Migration stages:
-    #   Stage 1-2: Foundation (flags disabled, building infrastructure)
-    #   Stage 3: LLM testing (flags disabled, isolated testing)
-    #   Stage 4-9: Integration (flags enabled for gradual rollout)
-    #   Stage 10: Validation (flags enabled, parallel operation)
-    #   Stage 11: Cutover (flags removed, new system only)
-    # ═══════════════════════════════════════════════════════════════════════════
-    use_delta_entities: bool = Field(
-        default=False,
-        alias="USE_DELTA_ENTITIES",
-        description="Enable delta-based entity updates (only changes, not complete state)"
-    )
-    use_agent_scoped_derived: bool = Field(
-        default=False,
-        alias="USE_AGENT_SCOPED_DERIVED",
-        description="Enable agent-scoped derived entities (isolated namespaces per agent)"
-    )
-    
     # Prompt caching configuration
     prompt_cache_enabled: bool = Field(
         default=False,  # Start disabled

@@ -147,13 +147,31 @@ class GlobalState(BaseModel):
     conversation_stage: ConversationStage = ConversationStage.INITIAL
     active_agent: Optional[str] = None
     intent_history: List[str] = Field(default_factory=list)
-    # Deprecated: use resolved_entities for conversation-scoped resolved facts/preferences
-    entities_collected: Dict[str, Any] = Field(default_factory=dict)
-    # Canonical conversation-scoped resolved entities for the session.
-    # This is updated by the agent `_think` loop and used as dynamic, non-persistent
-    # conversational memory (preferences, choices, clarified entities, etc.).
-    resolved_entities: Dict[str, Any] = Field(default_factory=dict)
     conversation_summary: str = ""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ENTITY STORAGE CLARIFICATION (2024-12 Refactor)
+    # ═══════════════════════════════════════════════════════════════════════════
+    #
+    # entities are NO LONGER stored in GlobalState.
+    #
+    # The canonical storage locations are:
+    #   1. ContinuationContext.entities (in state_manager.py)
+    #      - Persists entities between conversation turns
+    #      - Used when agent pauses for user input (CLARIFY, COLLECT_INFO)
+    #
+    #   2. AgentPlan.entities (in agent_plan.py)
+    #      - Accumulates entities during plan execution
+    #      - Scoped to a single plan's lifetime
+    #
+    #   3. task_context["entities"] (runtime only)
+    #      - Passed to agents via set_context()
+    #      - Merged from continuation + reasoning at start of each turn
+    #
+    # REMOVED FIELDS (previously caused confusion):
+    #   - entities_collected: Was deprecated, never used
+    #   - entities: Was written but rarely read (prompt display only)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     # [NEW] Unified language context (replaces detected_language)
     language_context: LanguageContext = Field(default_factory=LanguageContext)
