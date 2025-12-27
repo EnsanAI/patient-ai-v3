@@ -53,6 +53,8 @@ class FeatureFlags:
             "entity_caching": settings.v2.enable_entity_caching,
             "script_detection": settings.v2.enable_script_detection,
             "conversational_fast_path": settings.v2.enable_conversational_fast_path,
+            "planning": settings.v2.enable_planning,
+            "tool_result_override": settings.v2.enable_tool_result_override,
         }
         return flag_map.get(feature, False)
     
@@ -100,4 +102,12 @@ def is_script_detection_enabled(session_id: str = None) -> bool:
 
 def is_conversational_fast_path_enabled(session_id: str = None) -> bool:
     return FeatureFlags.is_enabled("conversational_fast_path", session_id)
+
+def is_planning_enabled(session_id: str = None) -> bool:
+    """Check if agent planning is enabled for A/B testing."""
+    return FeatureFlags.is_enabled("planning", session_id)
+
+def is_tool_result_override_enabled(session_id: str = None) -> bool:
+    """Check if tool result type override is enabled (FATAL/USER_INPUT bypass LLM)."""
+    return FeatureFlags.is_enabled("tool_result_override", session_id)
 

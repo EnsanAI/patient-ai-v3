@@ -27,7 +27,11 @@ class ArchitectureV2Settings(BaseSettings):
     enable_entity_caching: bool = True
     enable_script_detection: bool = True
     enable_conversational_fast_path: bool = True
-    
+    enable_planning: bool = False  # Enable/disable agent plan generation for A/B testing
+
+    # Tool Result Processing
+    enable_tool_result_override: bool = False  # When enabled, FATAL/USER_INPUT/SYSTEM_ERROR override agentic workflow
+
     # Situation Assessor
     assessor_confidence_threshold: float = 0.7
     assessor_temperature: float = 0.1

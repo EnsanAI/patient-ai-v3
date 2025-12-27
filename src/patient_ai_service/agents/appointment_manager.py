@@ -154,23 +154,48 @@ class AppointmentManagerAgent(BaseAgent):
     @staticmethod
     def _calculate_name_similarity(search_name: str, doctor_name: str) -> float:
         """
-        Calculate similarity score between two names using fuzzy matching.
+        Calculate similarity score between two names using multiple fuzzy matching strategies.
 
-        Uses token sort ratio which handles word order differences well.
+        Combines:
+        - token_set_ratio: handles subset matching (e.g., "Heba" → "Heba Al Ali")
+        - WRatio: weighted combo that handles partial matches
+        - First token comparison: catches spelling variations (e.g., "mohamed" vs "mohammed")
 
         Args:
             search_name: The name being searched for
             doctor_name: The doctor's name to compare against
 
         Returns:
-            Similarity score from 0-100
+            Similarity score from 0-100 (max of all strategies)
         """
         # Normalize both names
         norm_search = AppointmentManagerAgent._normalize_name_for_matching(search_name)
         norm_doctor = AppointmentManagerAgent._normalize_name_for_matching(doctor_name)
 
-        # Use token sort ratio - handles word order and partial matches well
-        return fuzz.token_sort_ratio(norm_search, norm_doctor)
+        # Strategy 1: token_set_ratio - handles subset matching
+        score_token_set = fuzz.token_set_ratio(norm_search, norm_doctor)
+
+        # Strategy 2: WRatio - weighted combination of multiple ratios
+        score_wratio = fuzz.WRatio(norm_search, norm_doctor)
+
+        # Strategy 3: Compare first tokens (first names) directly with partial ratio
+        # This catches cases like "mohamed" vs "mohammed atef"
+        search_tokens = norm_search.split()
+        doctor_tokens = norm_doctor.split()
+        score_first_token = 0
+        if search_tokens and doctor_tokens:
+            # Compare search term against each token in doctor name
+            for doc_token in doctor_tokens:
+                token_score = fuzz.ratio(search_tokens[0], doc_token)
+                score_first_token = max(score_first_token, token_score)
+
+        # Return the maximum score from all strategies
+        return max(score_token_set, score_wratio, score_first_token)
+
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
+    TODAY = today.strftime('%Y-%m-%d')
+    TOMORROW = tomorrow.strftime('%Y-%m-%d')
 
     def _register_tools(self):
         """Register appointment-related tools."""
@@ -196,7 +221,7 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "doctor_name": {
                     "type": "string",
-                    "description": "The doctor's name to search for (e.g., 'Mohamed Atef', 'Dr. Ahmed', 'mo7amed')",
+                    "description": "Doctor name to search for",
                     "required": True
                 }
             }
@@ -208,11 +233,14 @@ class AppointmentManagerAgent(BaseAgent):
         tomorrow = today + timedelta(days=1)
         today_str = today.strftime('%Y-%m-%d')
         tomorrow_str = tomorrow.strftime('%Y-%m-%d')
+        TODAY = today.strftime('%Y-%m-%d')
+        TOMORROW = tomorrow.strftime('%Y-%m-%d')
+
         
         self.register_tool(
             name="check_availability",
             function=self.tool_check_availability,
-            description=f"Check doctor availability with TWO MODES:\n\n1. RANGE MODE (no requested_time): Returns availability_ranges - continuous time blocks where the doctor is available. Example: ['9:00-10:00', '10:30-15:00', '15:30-17:00']. Use these ranges to suggest appointment times naturally.\n\n2. SPECIFIC TIME MODE (with requested_time): Checks if a specific time is available. Returns true/false and alternatives if unavailable. Example: requested_time='14:00' returns available_at_requested_time=true/false plus alternative_slots=['14:30', '15:00', '13:30'] if false.\n\nIMPORTANT: doctor_id must be a UUID (use list_doctors first to get it), not a doctor name. When parsing 'tomorrow', calculate it dynamically: today is {today_str}, so tomorrow is {tomorrow_str}.",
+            description=f"Check doctor availability. Without requested_time → returns availability_ranges. With requested_time → returns available_at_requested_time + alternative_slots if unavailable. Today={TODAY}, tomorrow={TOMORROW}.",
             parameters={
                 "doctor_id": {
                     "type": "string",
@@ -220,14 +248,14 @@ class AppointmentManagerAgent(BaseAgent):
                     "required": True
                 },
                 "date": {
-                    "type": "string",
-                    "description": f"Date in YYYY-MM-DD format (e.g., '{tomorrow_str}'). Parse 'tomorrow' to actual date based on today ({today_str}). Always calculate tomorrow dynamically from the current date.",
-                    "required": True
+                "type": "string",
+                "description": f"YYYY-MM-DD",
+                "required": True
                 },
                 "requested_time": {
-                    "type": "string",
-                    "description": "Optional: Specific time to check (e.g., '14:00', '2pm', '2:00 PM'). If provided, returns whether that specific time is available plus alternatives if not. If omitted, returns availability ranges.",
-                    "required": False
+                "type": "string",
+                "description": "HH:MM to check specific slot. Omit for availability ranges.",
+                "required": False
                 }
             }
         )
@@ -240,22 +268,22 @@ class AppointmentManagerAgent(BaseAgent):
             parameters={
                 "patient_id": {
                     "type": "string",
-                    "description": "Patient's ID (get from Patient ID in PATIENT INFORMATION section - REQUIRED)",
+                    "description": "",
                     "required": True
                 },
                 "doctor_id": {
                     "type": "string",
-                    "description": "Doctor's UUID (from find_doctor_by_name tool result - REQUIRED)",
+                    "description": "UUID from find_doctor_by_name or list_doctors tool",
                     "required": True
                 },
                 "date": {
                     "type": "string",
-                    "description": "Appointment date in YYYY-MM-DD format (e.g., '2025-11-26' - REQUIRED)",
+                    "description": "YYYY-MM-DD",
                     "required": True
                 },
                 "time": {
                     "type": "string",
-                    "description": "Appointment time in HH:MM format (e.g., '15:00' for 3:00 PM - REQUIRED)",
+                    "description": "HH:MM",
                     "required": True
                 },
                 "reason": {
@@ -279,12 +307,12 @@ class AppointmentManagerAgent(BaseAgent):
                 },
                 "appointment_date": {
                     "type": "string",
-                    "description": "Optional date in YYYY-MM-DD format to filter appointments (e.g., '2025-11-26')",
+                    "description": "Optional, Filter: YYYY-MM-DD)",
                     "required": False
                 },
                 "start_time": {
                     "type": "string",
-                    "description": "Optional time in HH:MM format to filter appointments (e.g., '15:00' for 3:00 PM)",
+                    "description": "Optional, Filter: HH:MM",
                     "required": False
                 }
             }
@@ -379,11 +407,6 @@ class AppointmentManagerAgent(BaseAgent):
                     "description": "Optional: New end time (HH:MM format, 24-hour). If start_time is provided, end_time will be calculated automatically if not specified.",
                     "required": False
                 },
-                "status": {
-                    "type": "string",
-                    "description": "Optional: New status. Valid values: scheduled, confirmed, checked_in, in_progress, completed, cancelled, no_show, rescheduled",
-                    "required": False
-                },
                 "reason": {
                     "type": "string",
                     "description": "Optional: Update appointment reason/description",
@@ -421,7 +444,7 @@ class AppointmentManagerAgent(BaseAgent):
         self.register_tool(
             name="book_multiple_appointments",
             function=self.tool_book_multiple_appointments,
-            description="Book multiple appointments at once with different parameters for each. Use this when the user requests multiple appointments in a single interaction (e.g., 'book 3 appointments', 'book root canal at 3pm and cleaning at 3:30pm'). Each appointment can have different doctor, date, time, and reason.",
+            description="Book multiple appointments in one call. Use when user requests >1 appointment.",
             parameters={
                 "patient_id": {
                     "type": "string",
@@ -435,22 +458,10 @@ class AppointmentManagerAgent(BaseAgent):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "doctor_id": {
-                                "type": "string",
-                                "description": "Doctor's UUID (from list_doctors tool - REQUIRED)"
-                            },
-                            "date": {
-                                "type": "string",
-                                "description": "Appointment date in YYYY-MM-DD format (e.g., '2025-11-26' - REQUIRED)"
-                            },
-                            "time": {
-                                "type": "string",
-                                "description": "Appointment time in HH:MM format (e.g., '15:00' for 3:00 PM - REQUIRED)"
-                            },
-                            "reason": {
-                                "type": "string",
-                                "description": "Extract the EXACT reason/procedure/symptom from user's message. Use user's own words. ONLY use 'general consultation' if user did not mention any specific reason."
-                            }
+                            "doctor_id": {"type": "string", "description": "Doctor UUID"},
+                            "date": {"type": "string", "description": "YYYY-MM-DD"},
+                            "time": {"type": "string", "description": "HH:MM"},
+                            "reason": {"type": "string", "description": "User's words or 'general consultation'"}
                         },
                         "required": ["doctor_id", "date", "time", "reason"]
                     }
@@ -878,15 +889,25 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
             # Check if we have a good enough match (minimum 70%)
             if best_score < GOOD_MATCH_THRESHOLD:
-                # Show top 3 suggestions if no good match
-                suggestions = []
-                for doctor, score in doctor_scores[:3]:
-                    suggestions.append(f"Dr. {doctor.get('first_name')} {doctor.get('last_name')} ({doctor.get('specialty', 'N/A')})")
+                # Return top matches for LLM to decide
+                matches = []
+                for doctor, score in doctor_scores[:5]:
+                    matches.append({
+                        "id": doctor.get("id"),
+                        "name": f"Dr. {doctor.get('first_name')} {doctor.get('last_name')}",
+                        "first_name": doctor.get("first_name"),
+                        "last_name": doctor.get("last_name"),
+                        "specialty": doctor.get("specialty", "N/A"),
+                        "similarity_score": round(score, 1)
+                    })
 
                 return {
-                    "success": False,
-                    "error": f"No close match found for '{doctor_name}'",
-                    "suggestion": f"Did you mean one of these? {', '.join(suggestions)}. Use list_doctors tool to see all available doctors."
+                    "success": True,
+                    "result_type": "user_input",
+                    "confidence": "low",
+                    "search_term": doctor_name,
+                    "matches": matches,
+                    "message": f"Found {len(matches)} possible matches for '{doctor_name}'. Review and confirm with user if needed."
                 }
 
             # If we have multiple similar matches (within 10 points), suggest them
@@ -910,16 +931,19 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             }
 
             # Add alternative suggestions if there are other close matches
-            if len(similar_matches) > 1 and best_score < EXACT_MATCH_THRESHOLD:
+            # Show alternatives even for exact matches if multiple doctors match equally
+            if len(similar_matches) > 1:
                 alternatives = []
                 for doc, score in similar_matches[1:4]:  # Up to 3 alternatives
                     alternatives.append({
+                        "id": doc.get("id"),
                         "name": f"Dr. {doc.get('first_name')} {doc.get('last_name')}",
                         "specialty": doc.get("specialty"),
                         "score": round(score, 1)
                     })
                 result["alternatives"] = alternatives
-                result["note"] = "Multiple similar matches found. Please confirm this is the correct doctor."
+                result["result_type"] = "user_input"
+                result["message"] = f"Multiple doctors match '{doctor_name}'. Ask user to clarify which one."
 
             return result
 
@@ -1158,6 +1182,50 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         if normalized:
             return normalized
         return time_str  # Fallback to original if normalization fails
+
+    def _slim_appointment(self, appointment: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract only essential appointment fields for LLM context.
+
+        Reduces token usage by removing nested objects (patient, user, doctor, clinic)
+        and keeping only what the LLM needs to generate responses.
+        """
+        if not appointment:
+            return {}
+
+        # Extract doctor name from nested object if present
+        doctor_name = None
+        doctor_obj = appointment.get('doctor')
+        if isinstance(doctor_obj, dict):
+            title = doctor_obj.get('title', 'Dr.')
+            first_name = doctor_obj.get('first_name', '')
+            last_name = doctor_obj.get('last_name', '')
+            doctor_name = f"{title} {first_name} {last_name}".strip()
+
+        # Extract clinic name from nested object if present
+        clinic_name = None
+        clinic_obj = appointment.get('clinic')
+        if isinstance(clinic_obj, dict):
+            clinic_name = clinic_obj.get('name')
+
+        # Extract appointment type name
+        apt_type_name = None
+        apt_type_obj = appointment.get('appointmentType')
+        if isinstance(apt_type_obj, dict):
+            apt_type_name = apt_type_obj.get('name')
+
+        return {
+            'id': appointment.get('id'),
+            'appointment_date': appointment.get('appointment_date'),
+            'start_time': appointment.get('start_time'),
+            'end_time': appointment.get('end_time'),
+            'status': appointment.get('status'),
+            'reason': appointment.get('reason'),
+            'doctor_id': appointment.get('doctor_id'),
+            'doctor_name': doctor_name,
+            'clinic_name': clinic_name,
+            'appointment_type': apt_type_name,
+        }
 
     def _normalize_date(self, date_str: str) -> str:
         """
@@ -1492,8 +1560,12 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     error_response["availability_ranges"] = []
                 return error_response
 
-            # Validate doctor exists (simplified check - in real implementation, call get_doctor)
-            # For now, we'll proceed and let the availability check handle it
+            # Get doctor name for user-friendly responses
+            doctor = self.db_client.get_doctor_by_id(doctor_id)
+            if doctor:
+                doctor_name = f"Dr. {doctor.get('first_name', '')} {doctor.get('last_name', '')}".strip()
+            else:
+                doctor_name = "The doctor"
 
             # Get available timeslots (pre-filtered by API)
             logger.debug(f"Fetching available timeslots for doctor {doctor_id} on {date} (session: {session_id})")
@@ -1521,7 +1593,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                         "alternatives": [],
                         "next_available_date": next_date,
                         "blocks_criteria": "appointment booked",
-                        "suggested_response": f"Dr. {doctor_id} is not available on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
+                        "suggested_response": f"{doctor_name} is not available on {date}. The next available date is {next_date}. Would that work?" if next_date else f"{doctor_name} is fully booked on {date}. Would you like to try a different date?"
                     }
                 else:
                     return {
@@ -1535,7 +1607,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                         "reason": "no_availability_on_date",
                         "next_available_date": next_date,
                         "blocks_criteria": "appointment booked",
-                        "suggested_response": f"Dr. {doctor_id} is fully booked on {date}. The next available date is {next_date}. Would that work?" if next_date else f"Dr. {doctor_id} is fully booked on {date}. Would you like to try a different date?"
+                        "suggested_response": f"{doctor_name} is fully booked on {date}. The next available date is {next_date}. Would that work?" if next_date else f"{doctor_name} is fully booked on {date}. Would you like to try a different date?"
                     }
 
             # Extract available slot times as strings (HH:MM format)
@@ -2029,7 +2101,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "success": True,
                 "result_type": ToolResultType.SUCCESS.value,
                 "verified": True,
-                "appointment": verified_appointment,
+                "appointment": self._slim_appointment(verified_appointment),
                 "appointment_id": appointment_id,
                 "satisfies_criteria": [
                     f"{procedure_str} appointment booked",
@@ -2726,6 +2798,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "id": apt.get("id"),
                     "date": apt.get("date") or apt.get("appointment_date"),
                     "time": apt.get("time") or apt.get("start_time"),
+                    "doctor_id": apt.get("doctor_id"),
                     "doctor_name": doctor_name,
                     "reason": apt.get("reason"),
                     "status": apt.get("status")
@@ -3223,7 +3296,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                 return {
                                     "success": False,
                                     "error": error_msg,
-                                    "appointment": fetched_appointment,
+                                    "appointment": self._slim_appointment(fetched_appointment),
                                     "updated_fields": succeeded_fields,
                                     "failed_fields": failed_fields,
                                     "doctor_id_update_failed": True
@@ -3239,7 +3312,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 updated_fields = list(updates.keys())
                 return {
                     "success": True,
-                    "appointment": result,
+                    "appointment": self._slim_appointment(result),
                     "updated_fields": updated_fields,
                     "message": f"Appointment updated successfully. Updated fields: {', '.join(updated_fields)}"
                 }

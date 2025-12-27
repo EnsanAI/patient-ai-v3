@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any, List
 from patient_ai_service.core.llm import LLMClient, get_llm_client
 from patient_ai_service.core.llm_config import get_llm_config_manager
 from patient_ai_service.core.config import settings
+from patient_ai_service.core.feature_flags import FeatureFlags
 from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.models.unified_reasoning import (
     UnifiedReasoningOutput,
@@ -60,7 +61,8 @@ class UnifiedReasoning:
         pending_action: Optional[Dict[str, Any]],     # NEW
         information_collection: Optional[Dict[str, Any]],  # NEW
         recent_turns: List[Dict[str, str]],
-        existing_plan: Optional[AgentPlan]
+        existing_plan: Optional[AgentPlan],
+        planning_enabled: bool = True  # A/B testing: when False, plan sections removed from prompt
     ) -> UnifiedReasoningOutput:
         """
         Perform unified reasoning in a single LLM call.
@@ -114,7 +116,12 @@ class UnifiedReasoning:
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
 
-        # Build prompt
+        # Check if planning is enabled (combine passed flag with session-specific check)
+        planning_enabled_for_session = planning_enabled and FeatureFlags.is_enabled("planning", session_id)
+        if not planning_enabled_for_session:
+            logger.info(f"📋 [UnifiedReasoning] Planning DISABLED for session {session_id}")
+
+        # Build prompt (conditionally includes plan sections)
         prompt = self._build_prompt(
             message=message,
             patient_info=patient_info,
@@ -124,11 +131,12 @@ class UnifiedReasoning:
             pending_action=pending_action,         # NEW
             information_collection=information_collection,  # NEW
             recent_turns=recent_turns,
-            existing_plan=existing_plan
+            existing_plan=existing_plan if planning_enabled_for_session else None,
+            planning_enabled=planning_enabled_for_session
         )
 
         # Log the built prompt
-        system_prompt = self._get_system_prompt()
+        system_prompt = self._get_system_prompt(planning_enabled=planning_enabled_for_session)
         logger.info("=" * 80)
         logger.info("☘️ [UnifiedReasoning] BUILT PROMPT:")
         logger.info("=" * 80)
@@ -243,18 +251,21 @@ class UnifiedReasoning:
                 objective=""
             )
 
-    def _get_system_prompt(self) -> str:
-        """Get system prompt for unified reasoning."""
-        return """You are the unified reasoning engine for a clinic AI.
+    def _get_system_prompt(self, planning_enabled: bool = True) -> str:
+        """Get system prompt for unified reasoning.
 
-═══════════════════════════════════════════════════════════════════════════════
+        Args:
+            planning_enabled: When False, plan decision sections are excluded from prompt
+        """
+        # Base situation types - always included
+        situation_types_section = """═══════════════════════════════════════════════════════════════════════════════
 SITUATION TYPES
 ═══════════════════════════════════════════════════════════════════════════════
 
-(route_type="fast_path", plan_decision="no_plan"):
+(route_type="fast_path"):
 - greeting, farewell, thanks, pleasantry
 
-(route_type="agent", is_continuation=true, usually resume plan):
+(route_type="agent", is_continuation=true):
 - direct_continuation: User responds to our previous message
 - direct_answer: Answers what we're awaiting
 - selection: Picks from presented options
@@ -262,13 +273,18 @@ SITUATION TYPES
 - rejection: Declines/cancels
 - modification: Changes something already set
 
-(route_type="agent", is_continuation=false, plan_decision="create_new" or "abandon_create"):
+(route_type="agent", is_continuation=false):
 - new_intent: New request OR confirmation of something active agent CANNOT do
 - topic_shift: Changing subject or request entirely
 
 SPECIAL:
 - emergency: Route to emergency_response immediately
-- ambiguous: Route to general_assistant for clarification
+- ambiguous: Route to general_assistant for clarification"""
+
+        # Plan decisions section - ONLY included when planning is enabled
+        plan_decisions_section = ""
+        if planning_enabled:
+            plan_decisions_section = """
 
 ═══════════════════════════════════════════════════════════════════════════════
 PLAN DECISIONS
@@ -278,7 +294,10 @@ no_plan: IF routing decision IS fast_path or general_assistant
 create_new: New intent, no existing plan
 resume: Continue existing plan unchanged
 abandon_create: New intent/topic_shift with existing plan to abandon
-complete: Plan is complete, clear it (similar to no_plan but explicitly marks completion)
+complete: Plan is complete, clear it (similar to no_plan but explicitly marks completion)"""
+
+        # Task section - step 4 only when planning enabled
+        task_section = """
 
 ═══════════════════════════════════════════════════════════════════════════════
 TASK
@@ -289,10 +308,18 @@ Read the RECENT CONVERSATION carefully. Understand what just happened before thi
 Then determine:
 1. Given what the assistant last said, what is this message responding to?
 2. What type of situation is this in context?
-3. Does this need an agent, and if so, which one?
-4. What should happen with the current plan (if any)?
+3. Does this need an agent, and if so, which one?"""
 
-Consider: What the user wants may differ from what the active agent can provide.
+        if planning_enabled:
+            task_section += """
+4. What should happen with the current plan (if any)?"""
+
+        task_section += """
+
+Consider: What the user wants may differ from what the active agent can provide."""
+
+        # Output section - conditionally include plan_decision fields
+        output_section = """
 
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT
@@ -302,8 +329,16 @@ FOR FAST-PATH (greeting, farewell, thanks, pleasantry):
 {"route_type": "fast_path", "situation_type": "..."}
 
 
-FOR ROUTING ACTION (confirmation or information collection in progress):
-{"routing_action": "execute_confirmed_action|collect_information", "agent": "...", "plan_decision": "resume"}
+FOR ROUTING ACTION (confirmation or information collection in progress):"""
+
+        if planning_enabled:
+            output_section += """
+{"routing_action": "execute_confirmed_action|collect_information", "agent": "...", "plan_decision": "resume"}"""
+        else:
+            output_section += """
+{"routing_action": "execute_confirmed_action|collect_information", "agent": "..."}"""
+
+        output_section += """
 
 
 FOR AGENT ROUTING (all other cases):
@@ -312,9 +347,14 @@ FOR AGENT ROUTING (all other cases):
   "is_continuation": true|false,
   "situation_type": "...",
   "confidence": 0.0-1.0,
-  "agent": "registration|appointment_manager|emergency_response|general_assistant|medical_inquiry",
+  "agent": "registration|appointment_manager|emergency_response|general_assistant|medical_inquiry","""
+
+        if planning_enabled:
+            output_section += """
   "plan_decision": "no_plan|create_new|resume|abandon_create|complete",
-  "plan_reasoning": "Why this plan decision",
+  "plan_reasoning": "Why this plan decision","""
+
+        output_section += """
   "what_user_means": "Plain English explanation of what user actually wants + what do we need to do to help them + what's bloking us (if anything)",
   "objective": "Goal for the agent (empty if resume)",
   "routing_action": null
@@ -322,6 +362,10 @@ FOR AGENT ROUTING (all other cases):
 
 Respond strictly in
 JSON only. No explanation outside JSON."""
+
+        return f"""You are the unified reasoning engine for a clinic AI.
+
+{situation_types_section}{plan_decisions_section}{task_section}{output_section}"""
 
 
     def _build_prompt(
@@ -334,7 +378,8 @@ JSON only. No explanation outside JSON."""
         pending_action: Optional[Dict[str, Any]],     # NEW
         information_collection: Optional[Dict[str, Any]],  # NEW
         recent_turns: List[Dict[str, str]],
-        existing_plan: Optional[AgentPlan]
+        existing_plan: Optional[AgentPlan],
+        planning_enabled: bool = True  # A/B testing: when False, plan context excluded
     ) -> str:
         """Build the unified reasoning prompt."""
 
@@ -352,15 +397,15 @@ JSON only. No explanation outside JSON."""
         else:
             turns_formatted = "(No previous messages)"
 
-        # Build plan context
-        plan_context = self._build_plan_context(existing_plan, active_agent)
+        # Build plan context (empty string when planning disabled)
+        plan_context = self._build_plan_context(existing_plan, active_agent, planning_enabled)
 
         # Build registration status section - ONLY when patient is NOT registered
         registration_status_section = ""
         if not is_registered:
             registration_status_section = """
 ═══════════════════════════════════════════════════════════════════════════════
-REGISTRATION STATUS - IMPORTANT
+REGISTRATION STATUS - VERY IMPORTANT
 ═══════════════════════════════════════════════════════════════════════════════
 
 ⚠️ PATIENT IS NOT REGISTERED
@@ -369,13 +414,6 @@ The patient can ONLY inquire about the clinic through the general_assistant agen
 
 For any other actions (booking appointments, managing appointments, etc.),
 the patient MUST register first through the registration agent.
-
-ROUTING RULES FOR UNREGISTERED PATIENTS:
-- General inquiries about the clinic → general_assistant (allowed)
-- Appointment booking, management, or any patient-specific actions → registration (must register first)
-- Medical inquiries → registration (must register first)
-- Emergency situations → emergency_response (always allowed)
-
 """
 
         # NEW: Build pending action section for confirmations
@@ -391,30 +429,21 @@ SUMMARY: {pending_action.get('summary', awaiting_context or 'Pending action')}
 TOOL TO EXECUTE: {pending_action.get('tool', 'unknown')}
 TOOL PARAMETERS: {json.dumps(pending_action.get('tool_input', {}), default=str)}
 
-ROUTING RULES FOR THIS CONFIRMATION:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USER RESPONSE → ROUTING:
 
-If user CONFIRMS (yes, yeah, sure, okay, do it, proceed, confirm, go ahead, yep, yup, absolutely, please do):
-  → routing_action: "execute_confirmed_action"
-  → situation_type: "confirmation"
+CONFIRMS (yes/yeah/sure/okay/proceed/go ahead/yep/absolutely):
+  routing_action="execute_confirmed_action", situation_type="confirmation"
 
-If user REJECTS (no, nope, cancel, nevermind, don't, stop, forget it, actually no):
-  → routing_action: null (let agent think normally)
-  → situation_type: "rejection"
-  → continuation_type: "rejection"
-  → plan_decision: "resume"
+REJECTS (no/nope/cancel/nevermind/stop/forget it):
+  routing_action=null, situation_type="rejection", continuation_type="rejection"
 
-If user MODIFIES (yes but at 4pm, change to Dr. X, different day, make it earlier):
-  → routing_action: null (let agent think normally)
-  → situation_type: "modification"
-  → continuation_type: "modification"
-  → plan_decision: "resume"
-  → Extract the modification in objective/what_user_means
+MODIFIES ("yes but [change]", "change to...", "different...", "make it..."):
+  routing_action=null, situation_type="modification", continuation_type="modification"
+  Extract modification → objective/what_user_means
 
-If user asks something UNRELATED (what are your hours?, who is Dr. X?, something completely different):
-  → routing_action: null
-  → situation_type: "new_intent" or "topic_shift"
-  → Route to appropriate agent (this abandons the pending action)
+UNRELATED (other questions/requests):
+  routing_action=null, situation_type="new_intent" or "topic_shift"
+  Route appropriately (abandons pending action)
 
 """
 
@@ -475,13 +504,34 @@ Analyze and respond with JSON only."""
     def _build_plan_context(
         self,
         existing_plan: Optional[AgentPlan],
-        active_agent: Optional[str]
+        active_agent: Optional[str],
+        planning_enabled: bool = True  # A/B testing: when False, skip plan state section
     ) -> str:
-        """Build plan context with agent capabilities."""
+        """Build plan context with agent capabilities.
 
+        Args:
+            existing_plan: The current plan if any
+            active_agent: Currently active agent name
+            planning_enabled: When False, PLAN STATE section is excluded entirely
+        """
         import logging
         logger = logging.getLogger(__name__)
 
+        # If planning is disabled, skip the entire PLAN STATE section
+        # Only return agent capability context if there's an active agent
+        if not planning_enabled:
+            logger.info(f"🔍 [UNIFIED_REASONING] Planning DISABLED - skipping plan context")
+            if active_agent and active_agent in AGENT_CAPABILITIES:
+                return f"""═══════════════════════════════════════════════════════════════════════════════
+ACTIVE AGENT CAPABILITY
+═══════════════════════════════════════════════════════════════════════════════
+
+{active_agent}: {AGENT_CAPABILITIES[active_agent]}
+
+⚠️  If user wants something this agent CANNOT do → treat as new_intent"""
+            return ""
+
+        # Original logic when planning is enabled
         lines = ["═══════════════════════════════════════════════════════════════════════════════",
                  "PLAN STATE",
                  "═══════════════════════════════════════════════════════════════════════════════"]

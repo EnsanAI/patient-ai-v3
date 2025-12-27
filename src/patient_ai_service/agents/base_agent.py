@@ -38,6 +38,7 @@ from patient_ai_service.core.llm import LLMClient
 from patient_ai_service.core.state_manager import StateManager
 from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.core.config import settings
+from patient_ai_service.core.feature_flags import FeatureFlags
 from patient_ai_service.core.llm_config import (
     LLMConfig,
     LLMConfigManager,
@@ -322,10 +323,10 @@ class ExecutionContext:
             status = "✅" if obs.is_success() else "❌"
             result_type_str = f"[{obs.result_type.value}]" if obs.result_type else ""
             
-            # Format result (truncate if too long)
+            # Format result (truncate if too long - 1000 chars to preserve important fields)
             result_str = json.dumps(obs.result, indent=2, default=str)
-            if len(result_str) > 500:
-                result_str = result_str[:500] + "..."
+            if len(result_str) > 1000:
+                result_str = result_str[:1000] + "..."
             
             lines.append(
                 f"[Iteration {obs.iteration}] {status} {obs.type}: {obs.name} {result_type_str}\n"
@@ -1168,13 +1169,47 @@ Output ONLY valid JSON."""
                 
                 # Execute immediately - no thinking required
                 tool_result = await self._execute_tool(pending_tool, pending_tool_input, execution_log)
-                
+
                 logger.info(f"[{self.agent_name}] ⚡ Result: success={tool_result.get('success')}")
-                
+
+                # ═══════════════════════════════════════════════════════════════
+                # FAST PATH: If tool succeeded, skip _think() entirely
+                # ═══════════════════════════════════════════════════════════════
+                if tool_result.get('success'):
+                    logger.info(f"[{self.agent_name}] ⚡ FAST PATH: Tool succeeded, generating response directly")
+
+                    # Clear continuation context - action has been taken
+                    self.state_manager.clear_continuation_context(session_id)
+
+                    # Build AgentResponseData from tool result
+                    from patient_ai_service.models.agentic import AgentResponseData
+                    response_data = AgentResponseData(
+                        completion_summary=tool_result.get('message', f"{pending_tool} completed successfully"),
+                        completion_details=tool_result.get('data', tool_result),
+                        entities=pending_tool_input  # Pass the entities used
+                    )
+
+                    # Create minimal exec_context for response generation
+                    exec_context = ExecutionContext(session_id, 1, user_request=message)
+                    exec_context.add_observation("tool", pending_tool, tool_result)
+
+                    # Generate response directly (skip planning, skip _think)
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_COMPLETE,
+                        response_data,
+                        exec_context
+                    )
+
+                    return response, execution_log
+
+                # Tool failed - fall through to normal agentic flow for error handling
+                logger.info(f"[{self.agent_name}] ⚡ Tool failed, falling through to normal agentic flow")
+
                 # Store for injection into exec_context later
                 pre_executed_observation = ("tool", pending_tool, tool_result)
-                
-                # Clear continuation context - action has been taken
+
+                # Clear continuation context - action has been taken (even on failure)
                 self.state_manager.clear_continuation_context(session_id)
             else:
                 logger.warning(f"[{self.agent_name}] execute_confirmed_action but no pending_tool found!")
@@ -1190,52 +1225,78 @@ Output ONLY valid JSON."""
         # ═══════════════════════════════════════════════════════════════
         # PLAN LIFECYCLE MANAGEMENT (Phase 4)
         # ═══════════════════════════════════════════════════════════════
-        plan_action_str = context.get("plan_action", "create_new")
-        existing_plan_data = context.get("existing_plan")
+
+        # Check if planning is enabled for this session (A/B testing support)
+        planning_enabled = FeatureFlags.is_enabled("planning", session_id)
 
         plan = None
-        if plan_action_str == "no_plan":
-            # Skip planning entirely (fast-path or general assistant)
-            logger.info(f"📋 [{self.agent_name}] Skipping plan creation (no_plan action)")
+
+        if not planning_enabled:
+            # Planning disabled - skip plan creation entirely
+            logger.info(f"📋 [{self.agent_name}] Planning DISABLED (feature flag). Proceeding without plan.")
             plan = None
+            # NOTE: exec_context.task_context will still be set below to preserve
+            # objective, entities, constraints for _think()
+        else:
+            # Original plan lifecycle logic (planning enabled)
+            plan_action_str = context.get("plan_action", "create_new")
+            existing_plan_data = context.get("existing_plan")
 
-        elif plan_action_str == "create_new" or plan_action_str == "abandon_create":
-            # Generate new plan
-            logger.info(f"📋 [{self.agent_name}] Creating new plan...")
-            plan = await self._plan(
-                session_id=session_id,
-                objective=context.get("objective", ""),
-                entities=context.get("entities", {}),
-                constraints=context.get("constraints", [])
-            )
-            # NEW: Initialize plan with llm_entities from context
-            if context.get("llm_entities"):
-                plan.llm_entities = context["llm_entities"].copy()
-                logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
-            self.state_manager.store_agent_plan(session_id, plan)
+            if plan_action_str == "no_plan":
+                # Skip planning entirely (fast-path or general assistant)
+                logger.info(f"📋 [{self.agent_name}] Skipping plan creation (no_plan action)")
+                plan = None
 
-        elif plan_action_str in ["resume", "update_resume"]:
-            # Load existing plan
-            if existing_plan_data:
-                plan = AgentPlan(**existing_plan_data)
-                logger.info(f"📋 [{self.agent_name}] Resuming plan: {plan.get_summary()}")
+            elif plan_action_str == "create_new" or plan_action_str == "abandon_create":
+                # Generate new plan
+                logger.info(f"📋 [{self.agent_name}] Creating new plan...")
+                plan = await self._plan(
+                    session_id=session_id,
+                    objective=context.get("objective", ""),
+                    entities=context.get("entities", {}),
+                    constraints=context.get("constraints", [])
+                )
+                # NEW: Initialize plan with llm_entities from context
+                if context.get("llm_entities"):
+                    plan.llm_entities = context["llm_entities"].copy()
+                    logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
+                self.state_manager.store_agent_plan(session_id, plan)
 
-                if plan_action_str == "update_resume":
-                    # Add new entities from this turn
-                    new_entities = context.get("entities", {})
-                    plan.unblock_with_info(new_entities)
-                    logger.info(f"📋 [{self.agent_name}] Updated plan with: {list(new_entities.keys())}")
-                    logger.info(f"🧠 [{self.agent_name}] Plan status: {plan.status.value}")
+            elif plan_action_str in ["resume", "update_resume"]:
+                # Load existing plan
+                if existing_plan_data:
+                    plan = AgentPlan(**existing_plan_data)
+                    logger.info(f"📋 [{self.agent_name}] Resuming plan: {plan.get_summary()}")
 
-                    # NEW: Restore llm_entities from context if resuming
+                    if plan_action_str == "update_resume":
+                        # Add new entities from this turn
+                        new_entities = context.get("entities", {})
+                        plan.unblock_with_info(new_entities)
+                        logger.info(f"📋 [{self.agent_name}] Updated plan with: {list(new_entities.keys())}")
+                        logger.info(f"🧠 [{self.agent_name}] Plan status: {plan.status.value}")
+
+                        # NEW: Restore llm_entities from context if resuming
+                        if context.get("llm_entities"):
+                            plan.update_llm_entities_with_fifo(context["llm_entities"])
+                            logger.info(f"📋 [{self.agent_name}] Restored {len(context['llm_entities'])} LLM entities to plan")
+
+                        self.state_manager.store_agent_plan(session_id, plan)
+                else:
+                    # Fallback: create new if no existing plan data
+                    logger.warning(f"📋 [{self.agent_name}] No existing plan data for {plan_action_str}, creating new")
+                    plan = await self._plan(
+                        session_id=session_id,
+                        objective=context.get("objective", context.get("user_intent", "")),
+                        entities=context.get("entities", {})
+                    )
+                    # NEW: Initialize plan with llm_entities from context
                     if context.get("llm_entities"):
-                        plan.update_llm_entities_with_fifo(context["llm_entities"])
-                        logger.info(f"📋 [{self.agent_name}] Restored {len(context['llm_entities'])} LLM entities to plan")
-
+                        plan.llm_entities = context["llm_entities"].copy()
+                        logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
                     self.state_manager.store_agent_plan(session_id, plan)
             else:
-                # Fallback: create new if no existing plan data
-                logger.warning(f"📋 [{self.agent_name}] No existing plan data for {plan_action_str}, creating new")
+                # Fallback: create new
+                logger.warning(f"📋 [{self.agent_name}] Unknown plan_action: {plan_action_str}, creating new")
                 plan = await self._plan(
                     session_id=session_id,
                     objective=context.get("objective", context.get("user_intent", "")),
@@ -1246,19 +1307,6 @@ Output ONLY valid JSON."""
                     plan.llm_entities = context["llm_entities"].copy()
                     logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
                 self.state_manager.store_agent_plan(session_id, plan)
-        else:
-            # Fallback: create new
-            logger.warning(f"📋 [{self.agent_name}] Unknown plan_action: {plan_action_str}, creating new")
-            plan = await self._plan(
-                session_id=session_id,
-                objective=context.get("objective", context.get("user_intent", "")),
-                entities=context.get("entities", {})
-            )
-            # NEW: Initialize plan with llm_entities from context
-            if context.get("llm_entities"):
-                plan.llm_entities = context["llm_entities"].copy()
-                logger.info(f"📋 [{self.agent_name}] Initialized plan with {len(plan.llm_entities)} LLM entities")
-            self.state_manager.store_agent_plan(session_id, plan)
         
         # Initialize execution context
         exec_context = ExecutionContext(session_id, self.max_iterations, user_request=message)
@@ -1276,6 +1324,7 @@ Output ONLY valid JSON."""
             "continuation_type": context.get("continuation_type"),
             "selected_option": context.get("selected_option"),
             "action": context.get("action", context.get("routing_action", "")),
+            "planning_enabled": planning_enabled,  # Track for debugging
         }
         
         # Load continuation context if resuming
@@ -1354,18 +1403,23 @@ Output ONLY valid JSON."""
                         f"{list(exec_context.plan.entities.keys())}"
                     )
 
-                    # Update LLM-only entities in both plan and GlobalState
+                    # Update LLM-only entities in plan (if exists)
                     if thinking.llm_delta:
                         # Update plan (for current execution context)
                         exec_context.plan.update_llm_entities_with_fifo(thinking.llm_delta)
-
-                        # NEW: Persist to GlobalState (permanent session memory)
-                        self.state_manager.update_llm_entities(session_id, thinking.llm_delta)
-
                         logger.info(
-                            f"📝 [{self.agent_name}]   → Updated llm_entities: +{len(thinking.llm_delta)} "
-                            f"(Plan: {len(exec_context.plan.llm_entities)}, Global: {len(self.state_manager.get_llm_entities(session_id))})"
+                            f"📝 [{self.agent_name}]   → Updated plan.llm_entities: +{len(thinking.llm_delta)} "
+                            f"(Plan: {len(exec_context.plan.llm_entities)})"
                         )
+
+            # MOVED OUTSIDE plan block: Persist LLM entities to GlobalState regardless of plan existence
+            # This ensures entities persist even when planning is disabled
+            if thinking.llm_delta:
+                self.state_manager.update_llm_entities(session_id, thinking.llm_delta)
+                logger.info(
+                    f"📝 [{self.agent_name}]   → Persisted llm_entities to GlobalState: +{len(thinking.llm_delta)} "
+                    f"(Global: {len(self.state_manager.get_llm_entities(session_id))})"
+                )
 
             # -----------------------------------------------------------------
             # HANDLE TOOL EXPANSION REQUEST
@@ -1494,16 +1548,16 @@ Output ONLY valid JSON."""
                             )
                             
                             if recovery_override:
-                                response = self._handle_override(recovery_override, exec_context)
+                                response = await self._handle_override(session_id, recovery_override, exec_context)
                                 if response:
                                     return response, execution_log
-                            
+
                             # Recovery executed, continue loop
                             exec_context.recovery_executed = False
                             continue
-                    
+
                     # Handle other overrides normally
-                    response = self._handle_override(override, exec_context)
+                    response = await self._handle_override(session_id, override, exec_context)
                     if response:
                         return response, execution_log
             
@@ -1543,10 +1597,10 @@ Output ONLY valid JSON."""
                     )
                     
                     if override:
-                        response = self._handle_override(override, exec_context)
+                        response = await self._handle_override(session_id, override, exec_context)
                         if response:
                             return response, execution_log
-                    
+
                     # Recovery executed, continue loop to see if it helped
                     exec_context.recovery_executed = False  # Reset flag
                     continue
@@ -3362,17 +3416,10 @@ RETRY:
             if information_collection and information_collection.get('information_needed'):
                 collected = information_collection.get('collected_information', [])
                 info_section = f"""
-Information Collection:
-  Needed: {information_collection.get('information_needed')}
-  Collected: {collected}
-  Count: {len(collected)} pieces
+Collected Information:
+{collected}
 """
 
-            continuation_section = f"""
-CONTINUATION:
-Type: {continuation_type or 'unknown'}
-Selected: {selected_option or 'None'}
-{info_section}"""
 
         # Get plan status (compact)
         plan_status = "No plan"
@@ -3385,6 +3432,15 @@ Selected: {selected_option or 'None'}
         # Build compact observations summary
         observations = exec_context.get_observations_summary() or "(none yet)"
 
+        # Format LLM entities (max 9 shown)
+        if llm_entities:
+            entities_json = json.dumps(dict(list(llm_entities.items())[:9]), indent=2, default=str)
+            if len(llm_entities) > 9:
+                entities_json += f"\n  ... and {len(llm_entities) - 9} more"
+            formatted_entities = entities_json
+        else:
+            formatted_entities = "  (empty - start fresh or patient_id will be injected)"
+
         # Assemble complete dynamic prompt with JSON schema
         prompt = f"""
 ═══════════════════════════════════════════════════════════════════════════════
@@ -3393,20 +3449,18 @@ CURRENT SITUATION
 
 User's Message: {message}
 
-Reasoning Engine Analysis:
-  Intent: {user_intent}
-  Recommended Action: {routing_action}
+Identidfied Intent: {routing_action} | {user_intent}
 
-LLM-Managed Entities (ISOLATED):
-{json.dumps(llm_entities, indent=2, default=str) if llm_entities else '  (empty - start fresh or patient_id will be injected)'}
+
+Your short-term memory of relevant collected information NEEDED to fulfill the user's request or WILL BE NEEDED LATER:
+{formatted_entities}
 
 IMPORTANT: These are ONLY entities YOU explicitly manage via entities_to_update.
 - patient_id is auto-injected for you
-- NO other entities from tools, reasoning, or system are shown here
-- Update these by including entities_to_update in your response
+- The latest collected entities are at the bottom
+- Update it with any new important information you collected from user message or tool results or Identidfied Intent
+- Update these by including entities_to_update in your response with information.
 - Use tools to get other data (available slots, doctor info, etc.)
-
-{continuation_section}
 
 ═══════════════════════════════════════════════════════════════════════════════
 EXECUTION STATUS
@@ -3428,6 +3482,7 @@ Follow the OUTPUT FORMAT and DECISION GUIDE from the system prompt.
 
         logger.info(f"📝 [{self.agent_name}] Dynamic prompt: {len(prompt)} chars")
         return prompt
+
 
     def _filter_relevant_entities(
         self,
@@ -4944,8 +4999,15 @@ DECISION RULES:
                     exec_context.mark_task_complete(task_id, tool_result)
                 
                 exec_context.task_plan.update_metrics()
-        
-        # Step 3: Handle based on result type
+
+        # Check if tool result override is enabled
+        from patient_ai_service.core.feature_flags import is_tool_result_override_enabled
+        if not is_tool_result_override_enabled(session_id):
+            logger.info(f"🔧 [{self.agent_name}] Tool result override DISABLED - returning to LLM")
+            logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
+            return None  # Let LLM see the result and decide
+
+        # Step 3: Handle based on result type (OVERRIDE LOGIC)
         logger.info(f"🔧 [{self.agent_name}] Step 3: Handling result based on type: {result_type.value}")
         
         if result_type == ToolResultType.SUCCESS:
@@ -5172,26 +5234,109 @@ DECISION RULES:
         logger.info(f"🔧 [{self.agent_name}] ════════════════════════════════════════════════════════")
         return None
 
-    def _handle_override(
+    async def _handle_override(
         self,
+        session_id: str,
         override: AgentDecision,
         exec_context: ExecutionContext
     ) -> Optional[str]:
-        """Handle an override decision from result processing."""
-        
+        """
+        Handle an override decision from result processing.
+
+        Routes through _generate_response for proper LLM-based response generation
+        with full context (including suggestions, alternatives, etc.).
+        """
+
         if override == AgentDecision.RESPOND_WITH_OPTIONS:
-            return self._generate_options_response(exec_context)
-        
+            # Build AgentResponseData from exec_context
+            response_data = self._build_options_response_data(exec_context)
+            return await self._generate_response(
+                session_id,
+                AgentDecision.RESPOND_WITH_OPTIONS,
+                response_data,
+                exec_context
+            )
+
         elif override == AgentDecision.RESPOND_IMPOSSIBLE:
-            return self._generate_failure_response(exec_context)
-        
+            # Build AgentResponseData from fatal_error
+            response_data = self._build_failure_response_data(exec_context)
+            return await self._generate_response(
+                session_id,
+                AgentDecision.RESPOND_IMPOSSIBLE,
+                response_data,
+                exec_context
+            )
+
         elif override == AgentDecision.RETRY:
             return None  # Continue loop
-        
+
         elif override == AgentDecision.EXECUTE_RECOVERY:
             return None  # Continue loop (handled in main loop)
-        
+
         return None
+
+    def _build_options_response_data(self, exec_context: ExecutionContext) -> AgentResponseData:
+        """Build AgentResponseData for RESPOND_WITH_OPTIONS from exec_context."""
+        options = []
+        options_reason = None
+        options_context = None
+
+        # Check for pending user options (from USER_INPUT result)
+        if exec_context.pending_user_options:
+            options = exec_context.pending_user_options
+
+        # Check blocked criteria for additional context
+        blocked = exec_context.get_blocked_criteria()
+        if blocked and blocked[0].blocked_options:
+            if not options:
+                options = blocked[0].blocked_options
+            options_reason = blocked[0].blocked_reason
+
+        # Get options_context from continuation context
+        if exec_context.continuation_context:
+            options_context = exec_context.continuation_context.get("awaiting", "user_selection")
+
+        return AgentResponseData(
+            options=options,
+            options_reason=options_reason,
+            options_context=options_context
+        )
+
+    def _build_failure_response_data(self, exec_context: ExecutionContext) -> AgentResponseData:
+        """Build AgentResponseData for RESPOND_IMPOSSIBLE from exec_context."""
+        failure_reason = None
+        failure_suggestion = None
+
+        if exec_context.fatal_error:
+            error = exec_context.fatal_error
+            # Extract error message
+            failure_reason = (
+                error.get("message") or
+                error.get("error_message") or
+                error.get("error", "Unable to complete request")
+            )
+            # Extract suggestion - check multiple fields
+            failure_suggestion = (
+                error.get("suggestion") or  # "Did you mean one of these?..."
+                error.get("failure_suggestion") or
+                (f"Available alternatives: {', '.join(error['alternatives'][:3])}"
+                 if error.get("alternatives") else None)
+            )
+        else:
+            # Check failed criteria
+            failed = [c for c in exec_context.criteria.values() if c.state == CriterionState.FAILED]
+            if failed:
+                reasons = [c.failed_reason for c in failed if c.failed_reason]
+                if reasons:
+                    failure_reason = reasons[0]
+
+        if not failure_reason:
+            failure_reason = "Unable to complete your request"
+
+        return AgentResponseData(
+            failure_reason=failure_reason,
+            failure_suggestion=failure_suggestion
+        )
 
     def _generate_options_response(self, exec_context: ExecutionContext) -> str:
         """Generate response presenting options to user."""

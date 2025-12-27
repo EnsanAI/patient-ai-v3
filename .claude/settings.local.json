@@ -5,7 +5,8 @@
       "Bash(python3:*)",
       "Bash(source:*)",
       "Bash(pip install:*)",
-      "Bash(python -m pip:*)"
+      "Bash(python -m pip:*)",
+      "Bash(done)"
     ],
     "deny": [],
     "ask": []
