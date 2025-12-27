@@ -320,21 +320,7 @@ FOR AGENT ROUTING (all other cases):
   "routing_action": null
 }
 
-IMPORTANT: Special routing actions:
-
-1. CONFIRMATION FLOW - When a pending action is awaiting confirmation:
-   - If user confirms (yes, yeah, sure, okay, etc.) → USE ROUTING ACTION FORMAT with "execute_confirmed_action"
-   - If user rejects (no, cancel, etc.) → USE AGENT ROUTING FORMAT with routing_action: null
-   - If user modifies (yes but..., change to..., etc.) → USE AGENT ROUTING FORMAT with routing_action: null
-
-2. INFORMATION COLLECTION FLOW - When information is being collected:
-   - If user provides ANY information (flexible, include vague/partial answers) → USE ROUTING ACTION FORMAT with "collect_information"
-   - If user shifts topic or asks unrelated question → USE AGENT ROUTING FORMAT with routing_action: null
-
-   The lightweight responder will determine if information is sufficient to proceed.
-
-3. Otherwise → USE AGENT ROUTING FORMAT with routing_action: null
-
+Respond strictly in
 JSON only. No explanation outside JSON."""
 
 
@@ -435,36 +421,34 @@ If user asks something UNRELATED (what are your hours?, who is Dr. X?, something
         # NEW: Build information collection section
         information_collection_section = ""
         if awaiting == "information" and information_collection:
+            information_needed = information_collection.get('information_needed', 'user information')
+            collected_info = information_collection.get('collected_information', [])
+
+            # Format collected information for display
+            if collected_info:
+                collected_display = "\n".join([f"  ✓ {item}" for item in collected_info])
+            else:
+                collected_display = "  (Nothing collected yet)"
+
             information_collection_section = f"""
 ═══════════════════════════════════════════════════════════════════════════════
-INFORMATION COLLECTION IN PROGRESS
+INFORMATION COLLECTION IN PROGRESS (MULTI-TURN)
 ═══════════════════════════════════════════════════════════════════════════════
 
-WHAT WE'RE COLLECTING: {information_collection.get('information_needed', 'user information')}
-CONTEXT: {information_collection.get('context', 'general inquiry')}
-QUESTION ASKED: {information_collection.get('information_question', 'N/A')}
+INFORMATION NEEDED (overall):
+[{information_needed}]
 
-ROUTING RULES FOR INFORMATION COLLECTION:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INFORMATON COLLECTED SO FAR:
+{collected_display}
+{message}
 
-If user PROVIDES requested information (direct answer, partial answer, preferences):
-  → routing_action: "collect_information"
-  → situation_type: "direct_answer"
 
-  IMPORTANT - Be FLEXIBLE with what counts as "providing information":
-  - "I recommend..." → Valid answer
-  - "Anything is fine" → Valid answer
-  - "I don't care" → Valid answer
-  - "I don't know" → Valid answer
-  - Partial information → Valid answer
-  - Vague or indirect answer → Still valid
+IF all INFORMATON COLLECTED SO FAR cover INFORMATION NEEDED: "routing_action": "null" -> NORMAL AGENT ROUTING
+OTHERWISE: "routing_action": "collect_information" -> CONTINUE COLLECTION UNTIL ALL INFORMATION ARE PORIVED
 
-  The lightweight responder will assess if enough info was provided.
-
-If user asks UNRELATED question or shifts topic:
-  → routing_action: null (route to appropriate agent)
-  → situation_type: "new_intent" or "topic_shift"
-
+INFORMATION COLLECTED RULES:
+Be flexible - accept vague, partial, "I don't care", "anything", etc.
+If user provides MORE information than needed → incorporate it into what_user_means
 """
 
         return f"""═══════════════════════════════════════════════════════════════════════════════

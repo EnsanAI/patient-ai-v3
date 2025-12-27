@@ -380,26 +380,28 @@ Your response:"""
         language: str,
         dialect: Optional[str],
         patient_name: Optional[str]
-    ) -> Tuple[str, TokenUsage, bool]:
+    ) -> Tuple[str, TokenUsage, Optional[str]]:
         """
         Lightweight response for information collection non-brainer flow.
 
-        Uses GPT-4o mini with 8 recent messages for context. Decides:
-        1. If user provided sufficient information → return response and flag to route to agent
-        2. If user provided partial information → ask follow-up question
-        3. If user didn't provide information → re-ask the question
+        Uses GPT-4o mini with 8 recent messages for context. Extracts information from user's response
+        and generates a natural follow-up or acknowledgment. Does NOT decide if collection is complete
+        (that's unified reasoning's job on the next turn).
 
         Args:
             session_id: Session identifier
             message: User's latest message
-            information_collection: Dict with 'information_needed', 'information_question', etc.
+            information_collection: Dict with 'information_needed', 'information_question', 'collected_information', etc.
             recent_messages: Last 8 conversation turns for context
             language: Target response language code
             dialect: Target dialect code or None
             patient_name: Patient's first name if known
 
         Returns:
-            Tuple of (response_text, token_usage, should_route_to_agent)
+            Tuple of (response_text, token_usage, extracted_information)
+            - response_text: Natural language response to user
+            - token_usage: Token usage for this call
+            - extracted_information: String describing what info was provided (None if nothing useful)
         """
         # Log all inputs
         logger.info("=" * 80)
@@ -447,11 +449,15 @@ Your response:"""
         # Extract information collection details
         information_needed = information_collection.get('information_needed', 'user information')
         information_question = information_collection.get('information_question', '')
+        collected_so_far = information_collection.get('collected_information', [])
         context = information_collection.get('context', 'general inquiry')
+
+        # Format collected information for display
+        collected_display = "\n".join([f"  - {item}" for item in collected_so_far]) if collected_so_far else "  (Nothing collected yet)"
 
         # Build JSON example separately to avoid f-string brace escaping issues
         json_example = '''{
-  "route_to_agent": true|false,
+  "extracted_info": "concise description of what the user provided" OR null,
   "response": "Your natural response to the user"
 }'''
 
@@ -460,10 +466,13 @@ Your response:"""
 Patient: {name}
 Context: {context}
 
-INFORMATION NEEDED:
+INFORMATION NEEDED (overall):
 {information_needed}
 
-QUESTION WE ASKED:
+INFORMATION COLLECTED SO FAR:
+{collected_display}
+
+LATEST QUESTION WE ASKED:
 "{information_question}"
 
 USER'S LATEST RESPONSE:
@@ -471,34 +480,41 @@ USER'S LATEST RESPONSE:
 {conversation_context}
 
 YOUR TASK:
-Assess if the user's response provides the requested information. Be FLEXIBLE:
-- "I recommend..." is valid
-- "Anything is fine" is valid
-- "I don't care" is valid
-- "I don't know" is valid
-- Partial information is valid
-- Vague answers are valid (extract what you can)
+1. Extract what information the user provided (if any)
+2. Generate a natural response (follow-up question OR acknowledgment)
 
-DECISION OPTIONS:
+Be FLEXIBLE with what counts as information:
+- "I recommend..." → Valid information
+- "Anything is fine" → Valid information (user's preference)
+- "I don't care" → Valid information (no preference)
+- "I don't know" → Valid information (lack of knowledge)
+- Partial answers → Valid information
+- Vague answers → Extract what you can
 
-1. SUFFICIENT INFORMATION PROVIDED:
-   - User answered (even vaguely/partially)
-   - Set route_to_agent: true
-   - Acknowledge their response warmly
-   - Say you'll proceed with their request
-   - Example: "Great! I'll check available appointments for you."
+RESPONSE STRATEGY:
 
-2. PARTIAL/UNCLEAR INFORMATION:
-   - User provided something but more clarity would help
-   - Set route_to_agent: false
-   - Ask a specific follow-up question
-   - Example: "You mentioned afternoon - did you have a specific time in mind, like 2pm or 4pm?"
+If user provided NEW information:
+  - Set extracted_info to a concise description (e.g., "prefers afternoon appointments")
+  - Respond warmly acknowledging what they said
+  - If you notice something is still missing from INFORMATION NEEDED, ask a follow-up question
+  - If everything seems covered, acknowledge and say you'll help them
+  - Example: "Perfect! I see you prefer afternoon appointments. Let me find available slots for you."
 
-3. NO INFORMATION PROVIDED:
-   - User said something unrelated or didn't answer
-   - Set route_to_agent: false
-   - Gently re-ask the question
-   - Example: "I understand, but to help you book an appointment, I need to know what type of visit you need."
+If user provided NO information:
+  - Set extracted_info to null
+  - Gently re-ask the question or provide clarification
+  - Example: "I understand, but to help you, I need to know what type of visit you need."
+
+COMPLETION CHECK:
+After extracting info, assess if ALL required information from "{information_needed}" is now collected.
+
+If YES (all required fields are present in COLLECTED SO FAR):
+  → extracted_info: "COLLECTION_COMPLETE"
+  → response: Brief acknowledgment (e.g., "Thank you! I have everything needed to proceed.")
+
+If NO (still missing some pieces):
+  → extracted_info: Description of what user just provided
+  → response: Follow-up question for missing pieces
 
 {lang_instruction}
 
@@ -614,13 +630,13 @@ Respond in JSON format:
                 logger.info(f"⚡ [Info Collection] Cleaned response for parsing (removed markdown if present)")
 
                 result = json.loads(cleaned_response)
-                route_to_agent = result.get("route_to_agent", False)
+                extracted_info = result.get("extracted_info")  # Can be string or None
                 response = result.get("response", "I'm not sure I understood. Could you please provide the information I requested?")
 
                 logger.info("=" * 80)
                 logger.info(f"⚡ [Info Collection] PARSED RESPONSE:")
                 logger.info("=" * 80)
-                logger.info(f"⚡ [Info Collection] Route to agent: {route_to_agent}")
+                logger.info(f"⚡ [Info Collection] Extracted info: {extracted_info if extracted_info else '(none)'}")
                 logger.info(f"⚡ [Info Collection] Response length: {len(response)} chars")
                 logger.info(f"⚡ [Info Collection] Response:\n{response}")
                 logger.info("=" * 80)
@@ -632,13 +648,13 @@ Respond in JSON format:
                 logger.error(f"⚡ [Info Collection] Error: {e}")
                 logger.error(f"⚡ [Info Collection] Raw response: {response_text}")
                 logger.error("=" * 80)
-                route_to_agent = False
+                extracted_info = None
                 response = "I'm not sure I understood. Could you please provide the information I requested?"
 
             logger.info(f"⚡ [Info Collection] ✅ Information collection response completed successfully")
-            logger.info(f"⚡ [Info Collection] Final decision: {'ROUTE TO AGENT' if route_to_agent else 'ASK FOLLOW-UP'}")
+            logger.info(f"⚡ [Info Collection] Final result: {'Info extracted: ' + str(extracted_info) if extracted_info else 'No info extracted'}")
 
-            return response, tokens, route_to_agent
+            return response, tokens, extracted_info
 
         except Exception as e:
             logger.error("=" * 80)
@@ -655,7 +671,7 @@ Respond in JSON format:
                 fallback_response = "لم أفهم جيداً. هل يمكنك تقديم هذه المعلومات مرة أخرى؟"
 
             logger.info(f"⚡ [Info Collection] Returning fallback response: {fallback_response}")
-            return fallback_response, TokenUsage(), False
+            return fallback_response, TokenUsage(), None
 
     async def process_message(
         self,
@@ -818,6 +834,15 @@ Respond in JSON format:
             pending_action = continuation_context.get("pending_action") if continuation_context else None      # NEW
             information_collection = continuation_context.get("information_collection") if continuation_context else None  # NEW
 
+            # DEBUG: Log information_collection state
+            if information_collection:
+                logger.info("=" * 80)
+                logger.info(f"📥 [DEBUG] LOADED information_collection from state:")
+                logger.info(f"📥 Has information_needed: {'information_needed' in information_collection}")
+                logger.info(f"📥 information_needed: {information_collection.get('information_needed', 'MISSING')}")
+                logger.info(f"📥 collected_information: {information_collection.get('collected_information', [])}")
+                logger.info("=" * 80)
+
             # Get existing plan
             existing_plan = self.state_manager.get_any_active_plan(session_id)
 
@@ -975,12 +1000,21 @@ Respond in JSON format:
             if unified_output.routing_action == "collect_information":
                 logger.info(f"⚡ [Information Collection] Non-brainer response for info collection")
 
-                # Get information collection context
-                continuation_context = self.state_manager.get_continuation_context(session_id)
-                information_collection = continuation_context.get("information_collection", {}) if continuation_context else {}
-
-                if not information_collection:
-                    logger.warning("⚡ [Info Collection] routing_action is collect_information but no information_collection in context!")
+                # Validate context exists (reuse from line 820-824)
+                if not continuation_context:
+                    logger.error("⚡ [Info Collection] CRITICAL: continuation_context is None!")
+                    logger.error("⚡ [Info Collection] routing_action was 'collect_information' but no context found")
+                    # Fall through to normal agent routing
+                elif not information_collection:
+                    logger.error("⚡ [Info Collection] CRITICAL: information_collection is None/empty!")
+                    logger.error("⚡ [Info Collection] routing_action was 'collect_information' but information_collection is missing")
+                    # Fall through to normal agent routing
+                elif 'information_needed' not in information_collection:
+                    logger.error("=" * 80)
+                    logger.error("⚡ [Info Collection] CRITICAL: information_needed is missing from context!")
+                    logger.error(f"⚡ [Info Collection] information_collection: {information_collection}")
+                    logger.error(f"⚡ [Info Collection] This should have been set by agent._think() and persisted")
+                    logger.error("=" * 80)
                     # Fall through to normal agent routing
                 else:
                     with obs_logger.pipeline_step(5, "information_collection_response", "orchestrator",
@@ -995,7 +1029,7 @@ Respond in JSON format:
 
                         # Generate lightweight response
                         info_start = time.time()
-                        english_response, info_tokens, route_to_agent = await self._information_collection_response(
+                        english_response, info_tokens, extracted_info = await self._information_collection_response(
                             session_id=session_id,
                             message=english_message,
                             information_collection=information_collection,
@@ -1006,7 +1040,52 @@ Respond in JSON format:
                         )
                         info_duration = (time.time() - info_start) * 1000
                         logger.info(f"⚡ [Information Collection] Response generated in {info_duration:.0f}ms")
-                        logger.info(f"⚡ [Information Collection] Route to agent: {route_to_agent}")
+                        logger.info(f"⚡ [Information Collection] Extracted info: {extracted_info if extracted_info else '(none)'}")
+
+                        # Check for completion signal
+                        if extracted_info == "COLLECTION_COMPLETE":
+                            logger.info("=" * 80)
+                            logger.info("⚡ [Info Collection] COMPLETION DETECTED!")
+                            logger.info("⚡ [Info Collection] Lightweight agent determined all info collected")
+                            logger.info("⚡ [Info Collection] Proceeding to normal agentic workflow")
+                            logger.info(f"⚡ [Info Collection] Will use agent: {unified_output.agent}")
+                            logger.info(f"⚡ [Info Collection] Will use plan_decision: {unified_output.plan_decision}")
+                            logger.info("=" * 80)
+
+                            # Clear awaiting state and save final information_collection
+                            information_collection['collection_status'] = 'complete'
+                            information_collection['completion_message'] = english_response
+
+                            # Save with cleared awaiting
+                            updated_context_dict = {
+                                'awaiting': '',  # Clear awaiting
+                                'awaiting_context': None,
+                                'waiting_turns': continuation_context.get('waiting_turns', 0) + 1,
+                                'information_collection': information_collection,
+                                'pending_action': continuation_context.get('pending_action', {}),
+                                'presented_options': continuation_context.get('presented_options', []),
+                                'original_request': continuation_context.get('original_request'),
+                                'entities': continuation_context.get('entities', {}),
+                                'llm_entities': continuation_context.get('llm_entities', {}),
+                                'blocked_criteria': continuation_context.get('blocked_criteria', []),
+                                'created_at': continuation_context.get('created_at'),
+                            }
+
+                            updated_context = ContinuationContext(**updated_context_dict)
+                            state = self.state_manager.get_agentic_state(session_id)
+                            state.continuation_context = updated_context
+                            state.last_updated_at = datetime.utcnow()
+                            self.state_manager._save_state(session_id, "agentic_state", state)
+
+                            # Add acknowledgment to memory
+                            self.memory_manager.add_assistant_turn(session_id, english_response)
+
+                            logger.info("⚡ [Info Collection] State saved, falling through to agent routing")
+                            logger.info("=" * 80)
+
+                            # DON'T return - fall through to agent routing (line 1180+)
+                            # Skip the rest of information collection logic and go to agent routing
+                            pass
 
                         # Build execution log
                         execution_log = ExecutionLog(
@@ -1015,98 +1094,144 @@ Respond in JSON format:
                             tools_used=[]
                         )
 
-                        if route_to_agent:
-                            # User provided sufficient information - clear continuation and route to agent
-                            logger.info(f"⚡ [Information Collection] Sufficient info provided - routing to agent on next turn")
+                        # Update collected_information if user provided new info (skip if COLLECTION_COMPLETE)
+                        if extracted_info and extracted_info != "COLLECTION_COMPLETE":
+                            logger.info(f"⚡ [Information Collection] User provided new information - updating collected_information")
 
-                            # Clear continuation context
-                            self.state_manager.clear_continuation_context(session_id)
+                            # Get current collected_information list
+                            collected_info_list = information_collection.get('collected_information', [])
 
-                            # Update agentic state to active (no longer blocked)
-                            self.state_manager.update_agentic_state(
-                                session_id,
-                                status="active",
-                                active_agent=unified_output.agent or global_state.active_agent
-                            )
+                            # Append new info
+                            collected_info_list.append(extracted_info)
 
-                            # Add lightweight response to memory
-                            self.memory_manager.add_assistant_turn(session_id, english_response)
+                            # Update information_collection dict
+                            # CRITICAL: Preserve information_needed (set by agent._think(), must never be lost)
+                            information_collection['collected_information'] = collected_info_list
 
-                            # For this turn, return the acknowledgment response
-                            # The agent will process on the NEXT turn
-                            step5_duration = (time.time() - step5_start) * 1000
-                            logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
+                            # Update the question asked for context on next turn
+                            information_collection['information_question'] = english_response
 
-                            total_duration = (time.time() - pipeline_start_time) * 1000
-                            logger.info("=" * 100)
-                            logger.info("ORCHESTRATOR: process_message() COMPLETED (Information Collection - Routing)")
-                            logger.info("=" * 100)
-                            logger.info(f"Session ID: {session_id}")
-                            logger.info(f"Final Response: {english_response[:200]}...")
-                            logger.info(f"Route: information_collection → {unified_output.agent or global_state.active_agent}")
-                            logger.info(f"Total Duration: {total_duration:.0f}ms")
-                            logger.info("=" * 100)
-
-                            # Clear observability for next request
-                            if obs_logger:
-                                obs_logger.log_summary()
-                                clear_observability_logger(session_id)
-
-                            return ChatResponse(
-                                session_id=session_id,
-                                response=english_response,
-                                intent="information_collected",
-                                metadata={
-                                    "route": "information_collection",
-                                    "will_route_to_agent": unified_output.agent or global_state.active_agent,
-                                    "duration_ms": total_duration
-                                }
-                            )
+                            logger.info(f"⚡ [Information Collection] Total pieces collected: {len(collected_info_list)}")
+                            logger.info(f"⚡ [Information Collection] Collected so far: {collected_info_list}")
                         else:
-                            # User didn't provide sufficient information - ask follow-up
-                            logger.info(f"⚡ [Information Collection] Insufficient info - asking follow-up")
+                            logger.info(f"⚡ [Information Collection] User didn't provide new information - keeping same state")
 
-                            # Keep continuation context intact (stay in info collection mode)
-                            # Increment waiting turns
-                            if continuation_context:
-                                continuation_context['waiting_turns'] = continuation_context.get('waiting_turns', 0) + 1
-                                # Update the continuation context with incremented waiting_turns
-                                updated_context = ContinuationContext(**continuation_context)
-                                state = self.state_manager.get_agentic_state(session_id)
-                                state.continuation_context = updated_context
-                                self.state_manager._save_state(session_id, "agentic_state", state)
+                        # Verify information_needed is still present before saving
+                        if 'information_needed' not in information_collection:
+                            logger.error(f"⚡ [Info Collection] CRITICAL: information_needed was lost during update!")
+                            logger.error(f"⚡ [Info Collection] This is a bug - information_needed should always persist")
+                            # This should never happen, but if it does, we can't continue safely
+                            raise ValueError("information_needed was lost from information_collection context")
 
-                            # Add response to memory
-                            self.memory_manager.add_assistant_turn(session_id, english_response)
+                        # Update continuation context with updated collected_information
+                        # NEVER clear it - let unified reasoning decide on next turn if collection is complete
+                        if continuation_context:
+                            # CRITICAL: Validate required fields BEFORE updating
+                            if 'awaiting' not in continuation_context:
+                                logger.error("⚡ [Info Collection] CRITICAL: 'awaiting' missing from continuation_context!")
+                                logger.error(f"⚡ [Info Collection] Context keys: {list(continuation_context.keys())}")
+                                raise ValueError("Cannot update context without 'awaiting' field")
 
-                            step5_duration = (time.time() - step5_start) * 1000
-                            logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
+                            if continuation_context.get('awaiting') != 'information':
+                                logger.error("⚡ [Info Collection] CRITICAL: awaiting != 'information'!")
+                                logger.error(f"⚡ [Info Collection] awaiting = {continuation_context.get('awaiting')}")
+                                raise ValueError("Cannot collect information when awaiting != 'information'")
 
-                            total_duration = (time.time() - pipeline_start_time) * 1000
-                            logger.info("=" * 100)
-                            logger.info("ORCHESTRATOR: process_message() COMPLETED (Information Collection - Follow-up)")
-                            logger.info("=" * 100)
-                            logger.info(f"Session ID: {session_id}")
-                            logger.info(f"Final Response: {english_response[:200]}...")
-                            logger.info(f"Route: information_collection (follow-up)")
-                            logger.info(f"Total Duration: {total_duration:.0f}ms")
-                            logger.info("=" * 100)
+                            # Create new context dict with EXPLICIT field preservation
+                            updated_context_dict = {
+                                # CRITICAL: Preserve awaiting - never change it (only agent._think() can)
+                                'awaiting': continuation_context['awaiting'],
+                                'awaiting_context': continuation_context.get('awaiting_context'),
 
-                            # Clear observability for next request
-                            if obs_logger:
-                                obs_logger.log_summary()
-                                clear_observability_logger(session_id)
+                                # Update only these two fields
+                                'waiting_turns': continuation_context.get('waiting_turns', 0) + 1,
+                                'information_collection': information_collection,
 
-                            return ChatResponse(
-                                session_id=session_id,
-                                response=english_response,
-                                intent="information_collection_followup",
-                                metadata={
-                                    "route": "information_collection",
-                                    "awaiting": "information",
-                                    "duration_ms": total_duration
-                                }
-                            )
+                                # Preserve all other fields explicitly
+                                'pending_action': continuation_context.get('pending_action', {}),
+                                'presented_options': continuation_context.get('presented_options', []),
+                                'original_request': continuation_context.get('original_request'),
+                                'entities': continuation_context.get('entities', {}),
+                                'llm_entities': continuation_context.get('llm_entities', {}),
+                                'blocked_criteria': continuation_context.get('blocked_criteria', []),
+                                'created_at': continuation_context.get('created_at'),
+                            }
+
+                            # Validate critical fields before reconstruction
+                            if 'information_needed' not in information_collection:
+                                logger.error("⚡ [Info Collection] CRITICAL: information_needed missing from information_collection!")
+                                raise ValueError("Cannot save context without information_needed")
+
+                            # Log what we're saving
+                            logger.info("⚡ [Information Collection] Saving updated context:")
+                            logger.info(f"  awaiting: {updated_context_dict['awaiting']}")
+                            logger.info(f"  information_needed: {information_collection.get('information_needed')}")
+                            logger.info(f"  collected_information: {information_collection.get('collected_information', [])}")
+
+                            # Reconstruct and save
+                            updated_context = ContinuationContext(**updated_context_dict)
+                            state = self.state_manager.get_agentic_state(session_id)
+                            state.continuation_context = updated_context
+                            state.last_updated_at = datetime.utcnow()
+                            self.state_manager._save_state(session_id, "agentic_state", state)
+
+                            # VERIFICATION: Read back state to ensure persistence
+                            logger.info("⚡ [Information Collection] Verifying state was saved correctly...")
+                            verification = self.state_manager.get_continuation_context(session_id)
+
+                            if not verification:
+                                logger.error("⚡ [Info Collection] VERIFICATION FAILED: get_continuation_context returned None!")
+                                logger.error(f"⚡ [Info Collection] This means awaiting field might be empty or state wasn't saved")
+                                raise RuntimeError("State persistence verification failed - context is None")
+
+                            if verification.get('awaiting') != 'information':
+                                logger.error("⚡ [Info Collection] VERIFICATION FAILED: awaiting field lost!")
+                                logger.error(f"⚡ [Info Collection] Expected: 'information', Got: {verification.get('awaiting')}")
+                                raise RuntimeError("State persistence verification failed - awaiting field lost")
+
+                            if 'information_needed' not in verification.get('information_collection', {}):
+                                logger.error("⚡ [Info Collection] VERIFICATION FAILED: information_needed lost!")
+                                logger.error(f"⚡ [Info Collection] Verification context: {verification}")
+                                raise RuntimeError("State persistence verification failed - information_needed lost")
+
+                            logger.info(f"⚡ [Information Collection] ✅ State verified - awaiting='information', information_needed preserved")
+
+                            logger.info(f"⚡ [Information Collection] Updated continuation context with collected_information")
+                            logger.info(f"⚡ [Information Collection] ✅ information_needed persisted: {information_collection.get('information_needed', 'ERROR')}")
+
+                        # Add response to memory
+                        self.memory_manager.add_assistant_turn(session_id, english_response)
+
+                        step5_duration = (time.time() - step5_start) * 1000
+                        logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
+
+                        total_duration = (time.time() - pipeline_start_time) * 1000
+                        logger.info("=" * 100)
+                        logger.info("ORCHESTRATOR: process_message() COMPLETED (Information Collection)")
+                        logger.info("=" * 100)
+                        logger.info(f"Session ID: {session_id}")
+                        logger.info(f"Final Response: {english_response[:200]}...")
+                        logger.info(f"Route: information_collection (multi-turn)")
+                        logger.info(f"Collected pieces: {len(information_collection.get('collected_information', []))}")
+                        logger.info(f"Total Duration: {total_duration:.0f}ms")
+                        logger.info("=" * 100)
+
+                        # Clear observability for next request
+                        if obs_logger:
+                            obs_logger.log_summary()
+                            clear_observability_logger(session_id)
+
+                        return ChatResponse(
+                            session_id=session_id,
+                            response=english_response,
+                            intent="information_collection_ongoing",
+                            metadata={
+                                "route": "information_collection",
+                                "awaiting": "information",
+                                "collected_pieces": len(information_collection.get('collected_information', [])),
+                                "duration_ms": total_duration
+                            }
+                        )
 
             # === AGENT ROUTING ===
             with obs_logger.pipeline_step(6, "agent_routing", "orchestrator", {"agent": unified_output.agent, "plan_decision": unified_output.plan_decision.value if unified_output.plan_decision else None}) if obs_logger else nullcontext():
@@ -1125,7 +1250,7 @@ Respond in JSON format:
                         logger.info(f"📋 [Plan] Cleared completed plan for {existing_plan.agent_name}")
 
                 # Build reasoning-compatible output for agent activation
-                reasoning = self._build_reasoning_from_unified(unified_output, existing_plan, continuation_context)
+                reasoning = self._build_reasoning_from_unified(session_id, unified_output, existing_plan, continuation_context)
 
                 # Determine plan_action for agent context (map from unified plan_decision)
                 plan_action_map = {
@@ -1278,6 +1403,18 @@ Respond in JSON format:
                         agent.set_context(session_id, agent_context)
                 activation_duration = (time.time() - activation_start) * 1000
                 logger.info(f"Agent activation completed in {activation_duration:.2f}ms")
+
+                # Check if we're transitioning from information collection to agent execution
+                # Get continuation context to check for state transition
+                transition_context = self.state_manager.get_continuation_context(session_id)
+                if transition_context and transition_context.get('awaiting') == 'information':
+                    logger.info("⚡ [State Transition] Moving from information collection to agent execution")
+                    logger.info("⚡ [State Transition] Agent._think() will decide if collection is complete or needs continuation")
+                    # Don't clear here - let agent._think() decide
+                    # Agent will either:
+                    # 1. Return COLLECT_INFORMATION with updated information_needed (continue)
+                    # 2. Return EXECUTE_TOOL with collected information (complete)
+                    # 3. Return something else (abort collection)
 
                 # Execute agent with logging - PASS execution_log
                 execution_start = time.time()
@@ -1881,6 +2018,7 @@ Respond in JSON format:
 
     def _build_reasoning_from_unified(
         self,
+        session_id: str,
         unified_output: UnifiedReasoningOutput,
         existing_plan: Optional[AgentPlan],
         continuation_context: Optional[Dict[str, Any]]
@@ -1925,24 +2063,22 @@ Respond in JSON format:
             entities = {}
 
         # Merge entities from continuation context if available
+        # Restore multi-source entities from continuation context
         if continuation_context:
             resolved = continuation_context.get("entities", {})
             for k, v in resolved.items():
                 if k not in entities:
                     entities[k] = v
 
-        # NEW: Restore LLM entities SEPARATELY (ISOLATED from above)
-        # ONLY from continuation context, NO merging with other sources
-        llm_entities = {}
-        if continuation_context:
-            llm_entities = continuation_context.get("llm_entities", {}).copy()
-            logger.info(f"🔒 Restored ISOLATED LLM entities: {list(llm_entities.keys())}")
+        # NEW: Load LLM entities from GlobalState (persistent session memory)
+        llm_entities = self.state_manager.get_llm_entities(session_id)
+        logger.info(f"🔒 Loaded LLM entities from GlobalState: {list(llm_entities.keys())}")
 
         task_context = TaskContext(
             user_intent=unified_output.what_user_means or "",
             objective=objective,
             entities=entities,  # Internal only
-            llm_entities=llm_entities,  # NEW: ISOLATED LLM track
+            llm_entities=llm_entities,  # Persistent session memory
             is_continuation=unified_output.is_continuation,
             continuation_type=unified_output.continuation_type
         )
@@ -2050,23 +2186,25 @@ Respond in JSON format:
             logger.info(f"📊 Enhanced entities with {len(entities_added)} injection(s): {', '.join(entities_added)}")
         logger.info(f"📊 Final agent context entities: {json.dumps(entities, default=str)}")
 
-        # NEW: Build ISOLATED LLM entities (ONLY from LLM updates + patient_id)
-        llm_entities = task_context.get("llm_entities", {}).copy()
+        # Build ISOLATED LLM entities from GlobalState
+        llm_entities = self.state_manager.get_llm_entities(session_id)
 
-        # CRITICAL: ONLY inject patient_id into LLM entities, nothing else
+        # Inject patient_id if not present
         try:
             global_state = self.state_manager.get_global_state(session_id)
             if global_state and global_state.patient_profile:
                 patient_id = global_state.patient_profile.patient_id
                 if patient_id and patient_id.strip():
                     if "patient_id" not in llm_entities:
+                        # Add to session and save
                         llm_entities["patient_id"] = patient_id
-                        logger.info(f"🔒 Injected patient_id into ISOLATED LLM entities: {patient_id}")
+                        self.state_manager.update_llm_entities(session_id, {"patient_id": patient_id})
+                        logger.info(f"🔒 Injected patient_id into global llm_entities")
         except Exception as e:
-            logger.error(f"Error injecting patient_id into LLM entities: {e}")
+            logger.error(f"Error injecting patient_id: {e}")
 
         logger.info(
-            f"🔒 LLM entities (ISOLATED): {len(llm_entities)} items: {list(llm_entities.keys())}"
+            f"🔒 LLM entities (from GlobalState): {list(llm_entities.keys())}"
         )
         logger.info(
             f"📊 Internal entities (multi-source): {len(entities)} items"

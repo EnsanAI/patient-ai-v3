@@ -545,6 +545,22 @@ class ObservabilityLogger:
             except Exception as e:
                 logger.debug(f"Error broadcasting custom metric: {e}")
     
+    def record_custom_event(
+        self,
+        event_type: str,
+        data: Optional[Dict[str, Any]] = None
+    ):
+        """Record a custom event."""
+        if not self._enabled:
+            return
+        
+        # Store as a custom metric with event_type as name and data as value
+        self.record_custom_metric(
+            name=event_type,
+            value=data or {},
+            tags={"type": "event"}
+        )
+    
     def get_session_observability(self) -> SessionObservability:
         """Get complete observability data for the session."""
         if not self._enabled:

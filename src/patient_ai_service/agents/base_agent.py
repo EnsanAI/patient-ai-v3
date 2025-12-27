@@ -1354,12 +1354,17 @@ Output ONLY valid JSON."""
                         f"{list(exec_context.plan.entities.keys())}"
                     )
 
-                    # NEW: Update LLM-only entities for prompt display
+                    # Update LLM-only entities in both plan and GlobalState
                     if thinking.llm_delta:
+                        # Update plan (for current execution context)
                         exec_context.plan.update_llm_entities_with_fifo(thinking.llm_delta)
+
+                        # NEW: Persist to GlobalState (permanent session memory)
+                        self.state_manager.update_llm_entities(session_id, thinking.llm_delta)
+
                         logger.info(
-                            f"📝 [{self.agent_name}]   → Updated plan.llm_entities: +{len(thinking.llm_delta)} LLM updates "
-                            f"(Total LLM entities: {len(exec_context.plan.llm_entities)})"
+                            f"📝 [{self.agent_name}]   → Updated llm_entities: +{len(thinking.llm_delta)} "
+                            f"(Plan: {len(exec_context.plan.llm_entities)}, Global: {len(self.state_manager.get_llm_entities(session_id))})"
                         )
 
             # -----------------------------------------------------------------
@@ -1384,15 +1389,18 @@ Output ONLY valid JSON."""
                 if settings.enable_observability:
                     obs_logger = get_observability_logger(session_id)
                     if obs_logger:
-                        obs_logger.record_custom_event(
-                            event_type="tool_expansion",
-                            data={
-                                "iteration": exec_context.iteration,
-                                "reason": thinking.tool_expansion_reason,
-                                "original_tool_count": len(exec_context.plan.required_tools),
-                                "total_tool_count": len(self._tool_schemas)
-                            }
-                        )
+                        try:
+                            obs_logger.record_custom_event(
+                                event_type="tool_expansion",
+                                data={
+                                    "iteration": exec_context.iteration,
+                                    "reason": thinking.tool_expansion_reason,
+                                    "original_tool_count": len(exec_context.plan.required_tools),
+                                    "total_tool_count": len(self._tool_schemas)
+                                }
+                            )
+                        except Exception as obs_error:
+                            logger.warning(f"🔧 [{self.agent_name}] Error in observability logging (non-critical): {obs_error}")
                 
                 # Re-run _think() with expanded tools (don't increment iteration)
                 exec_context.iteration -= 1  # Compensate for loop increment
@@ -1728,6 +1736,30 @@ Output ONLY valid JSON."""
                     llm_entities=llm_entities,  # NEW
                     blocked_criteria=[c.description for c in exec_context.get_blocked_criteria()]
                 )
+
+                # ADD: Verification that state was saved correctly
+                verification = self.state_manager.get_continuation_context(session_id)
+                if not verification:
+                    logger.error(f"[{self.agent_name}] CRITICAL: set_continuation_context did not persist!")
+                    logger.error(f"[{self.agent_name}] get_continuation_context returned None after set")
+                    raise RuntimeError("Failed to set continuation context - verification failed")
+
+                if verification.get('awaiting') != 'information':
+                    logger.error(f"[{self.agent_name}] CRITICAL: awaiting field not persisted correctly!")
+                    logger.error(f"[{self.agent_name}] Expected: 'information', Got: {verification.get('awaiting')}")
+                    raise RuntimeError("Failed to set continuation context - awaiting field lost")
+
+                verified_info_collection = verification.get('information_collection', {})
+                if 'information_needed' not in verified_info_collection:
+                    logger.error(f"[{self.agent_name}] CRITICAL: information_needed not in persisted context!")
+                    logger.error(f"[{self.agent_name}] Expected: {information_collection}")
+                    logger.error(f"[{self.agent_name}] Got: {verified_info_collection}")
+                    raise RuntimeError("information_needed not persisted correctly")
+
+                logger.info(f"[{self.agent_name}] ✅ Verified continuation context persisted:")
+                logger.info(f"[{self.agent_name}]   awaiting='information'")
+                logger.info(f"[{self.agent_name}]   information_needed={information_needed}")
+                logger.info(f"[{self.agent_name}]   entities={list(resolved.keys())}")
                 
                 # Update agentic state to blocked
                 self.state_manager.update_agentic_state(
@@ -3320,11 +3352,27 @@ RETRY:
         if context.get('is_continuation', False):
             continuation_type = context.get('continuation_type') or context.get('situation_type')
             selected_option = context.get('selected_option')
+
+            # Extract information_collection if present
+            continuation_ctx = context.get('continuation_context', {})
+            information_collection = continuation_ctx.get('information_collection', {})
+
+            # Build information collection section if applicable
+            info_section = ""
+            if information_collection and information_collection.get('information_needed'):
+                collected = information_collection.get('collected_information', [])
+                info_section = f"""
+Information Collection:
+  Needed: {information_collection.get('information_needed')}
+  Collected: {collected}
+  Count: {len(collected)} pieces
+"""
+
             continuation_section = f"""
 CONTINUATION:
 Type: {continuation_type or 'unknown'}
 Selected: {selected_option or 'None'}
-"""
+{info_section}"""
 
         # Get plan status (compact)
         plan_status = "No plan"
@@ -5248,24 +5296,28 @@ DECISION RULES:
         # Format resolved entities
         known_info = self._format_entities(response_data.entities)
         
-        # Get recent conversation history (last 3 messages = 1.5 exchanges)
+        # Get recent conversation history from memory manager (same as orchestrator)
+        from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
+        memory_manager = get_conversation_memory_manager()
+        memory = memory_manager.get_memory(session_id)
+        
+        # Get last 3 messages (exclude current user message if it's the last one)
+        recent_turns = memory.recent_turns if memory.recent_turns else []
         # Exclude the current user message (not yet responded to)
-        history = self.conversation_history.get(session_id, [])
-        history_for_context = history[:-1] if history and history[-1].get("role") == "user" else history
+        if recent_turns and recent_turns[-1].role == "user":
+            recent_turns = recent_turns[:-1]
         
         # Get last 3 messages
-        recent_messages = history_for_context[-3:] if len(history_for_context) > 3 else history_for_context
+        recent_turns = recent_turns[-3:] if len(recent_turns) > 3 else recent_turns
         
-        # Format recent messages for inclusion in system prompt
-        recent_context = ""
-        if recent_messages:
-            recent_context = "\n\nRECENT CONVERSATION:\n"
-            for msg in recent_messages:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                role_label = "User" if role == "user" else "Assistant"
-                recent_context += f"{role_label}: {content}\n"
-            recent_context += "\nNOTE: Use this context for natural conversation flow, but avoid redundancy - don't repeat what was already said."
+        # Format recent messages for inclusion in system prompt (same format as unified_reasoning.py)
+        if recent_turns:
+            recent_context = "\n".join([
+                f"{'User' if turn.role == 'user' else 'Assistant'}: {turn.content[:200]}"
+                for turn in recent_turns
+            ])
+        else:
+            recent_context = "(No previous messages)"
         
         # Build decision-specific prompt
         if decision == AgentDecision.COLLECT_INFORMATION:
@@ -5332,7 +5384,7 @@ DECISION RULES:
             # Messages array is now just the instruction - conversation history is in system prompt
             messages = [{"role": "user", "content": "Generate the response."}]
             
-            logger.info(f"💬 [{self.agent_name}] Recent conversation context included in system prompt: {len(recent_messages)} messages")
+            logger.info(f"💬 [{self.agent_name}] Recent conversation context included in system prompt: {len(recent_turns)} messages")
 
             if hasattr(llm_client, 'create_message_with_usage'):
                 response, tokens = llm_client.create_message_with_usage(
@@ -5462,7 +5514,10 @@ WHAT WE ALREADY KNOW:
 
 WHAT WE NEED:
 {response_data.information_needed}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Ask ONLY for the missing information listed in "WHAT WE NEED"
 - Be conversational and natural
@@ -5518,7 +5573,10 @@ WHAT'S UNCLEAR:
 
 SUGGESTED QUESTION:
 {response_data.clarification_question or "Could you please clarify?"}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Ask a clarifying question
 - Be conversational and natural, but avoid redundancy - don't repeat what was already said
@@ -5571,7 +5629,10 @@ WHY OPTIONS ARE NEEDED:
 
 OPTIONS TO PRESENT ({response_data.options_context}):
 {options_formatted}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Briefly explain why we're offering alternatives
 - Present the options clearly
@@ -5623,7 +5684,10 @@ WHY IT'S NOT POSSIBLE:
 
 SUGGESTION FOR USER:
 {response_data.failure_suggestion or "No specific suggestion"}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Be empathetic but direct
 - Explain the issue clearly
@@ -5689,7 +5753,10 @@ DETAILS:
 
 EXECUTION LOG:
 {execution_summary}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Confirm the action was completed
 - Include key details (confirmation number, date, time, etc.)
@@ -5745,7 +5812,10 @@ DETAILS:
 
 SUGGESTED QUESTION:
 {response_data.confirmation_question or "Should I proceed?"}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Summarize what you're about to do
 - Include all relevant details
@@ -5795,7 +5865,10 @@ CONTEXT:
 
 EXECUTION LOG:
 {execution_summary}
+
+RECENT CONVERSATION:
 {recent_context}
+
 RULES:
 - Be conversational and natural, but avoid redundancy - don't repeat what was already said
 - {lang_instruction}

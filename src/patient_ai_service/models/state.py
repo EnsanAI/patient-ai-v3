@@ -176,6 +176,10 @@ class GlobalState(BaseModel):
     # [NEW] Unified language context (replaces detected_language)
     language_context: LanguageContext = Field(default_factory=LanguageContext)
 
+    # [NEW] LLM Entity Memory (session-scoped, FIFO-managed)
+    # Acts as agent's short-term conversational memory across all turns
+    llm_entities: Dict[str, Any] = Field(default_factory=dict)
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     version: int = 0

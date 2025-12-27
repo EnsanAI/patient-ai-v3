@@ -81,6 +81,7 @@ class ContinuationContext(BaseModel):
     # {
     #   "information_needed": "free-form description of what info is needed",
     #   "information_question": "the question asked to the user",
+    #   "collected_information": ["piece1", "piece2", ...],  # What's been gathered so far
     #   "context": "additional context for the collection"
     # }
 
@@ -343,6 +344,50 @@ class StateManager:
         state.version += 1
 
         self._save_state(session_id, "global_state", state)
+
+    def update_llm_entities(
+        self,
+        session_id: str,
+        entity_delta: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Update LLM entities in GlobalState with FIFO eviction (max 8).
+
+        Args:
+            session_id: Session identifier
+            entity_delta: New/updated entities from LLM
+
+        Returns:
+            Updated llm_entities dict
+        """
+        global_state = self.get_global_state(session_id)
+
+        # Convert to FIFODict for smart merge
+        from patient_ai_service.models.fifo_dict import FIFODict
+        fifo = FIFODict.from_dict(global_state.llm_entities, max_size=8)
+
+        # Apply updates
+        for key, value in entity_delta.items():
+            fifo[key] = value
+
+        # Log evictions
+        eviction_log = fifo.get_eviction_log()
+        if eviction_log:
+            evicted_keys = [e['key'] for e in eviction_log]
+            logger.warning(f"⚠️ LLM entities FIFO evicted: {evicted_keys}")
+
+        # Update GlobalState
+        global_state.llm_entities = fifo.to_dict()
+        global_state.updated_at = datetime.utcnow()
+        self._save_state(session_id, "global_state", global_state)
+
+        logger.info(f"✅ Updated global llm_entities: {list(global_state.llm_entities.keys())}")
+        return global_state.llm_entities
+
+    def get_llm_entities(self, session_id: str) -> Dict[str, Any]:
+        """Get current LLM entities from GlobalState."""
+        global_state = self.get_global_state(session_id)
+        return global_state.llm_entities.copy()
 
     # Appointment Agent State
 
@@ -820,9 +865,26 @@ class StateManager:
         """
         state = self.get_agentic_state(session_id)
 
+        # Check if continuation_context exists and has an awaiting field
+        # IMPORTANT: Don't use falsy check - empty string "" is valid for "no continuation"
+        # but we should explicitly check for None or empty ContinuationContext
         if state.continuation_context and state.continuation_context.awaiting:
-            return state.continuation_context.model_dump()
+            context_dict = state.continuation_context.model_dump()
 
+            # DEFENSIVE: Validate structure for information collection
+            if context_dict.get('awaiting') == 'information':
+                info_collection = context_dict.get('information_collection', {})
+                if not info_collection or 'information_needed' not in info_collection:
+                    logger.error("=" * 80)
+                    logger.error("📥 CRITICAL: Retrieved context has awaiting='information' but missing information_needed!")
+                    logger.error(f"📥 Context: {context_dict}")
+                    logger.error(f"📥 This indicates state corruption during save/load")
+                    logger.error("=" * 80)
+                    # Still return it so caller can handle, but log prominently
+
+            return context_dict
+
+        logger.debug(f"📥 get_continuation_context: No active continuation for session {session_id}")
         return None
 
     def has_continuation(self, session_id: str) -> bool:
@@ -838,8 +900,28 @@ class StateManager:
     def clear_continuation_context(self, session_id: str):
         """
         Clear continuation context after it's been handled.
+
+        IMPORTANT: This should ONLY be called when:
+        1. Agent successfully completes an action
+        2. User explicitly cancels/changes intent
+        3. Agent._think() decides to abort current flow
+
+        NEVER call this in the middle of information collection!
         """
         state = self.get_agentic_state(session_id)
+
+        # Log what we're clearing for debugging
+        if state.continuation_context and state.continuation_context.awaiting:
+            logger.info("=" * 80)
+            logger.info(f"💾 Clearing continuation context:")
+            logger.info(f"💾   awaiting: {state.continuation_context.awaiting}")
+            if state.continuation_context.awaiting == 'information':
+                logger.info(f"💾   ⚠️ Clearing information collection state!")
+                info_coll = state.continuation_context.information_collection
+                logger.info(f"💾   information_needed: {info_coll.get('information_needed', 'N/A') if info_coll else 'N/A'}")
+                logger.info(f"💾   collected: {info_coll.get('collected_information', []) if info_coll else []}")
+            logger.info("=" * 80)
+
         state.continuation_context = ContinuationContext()
         state.pending_user_options = []
         state.last_updated_at = datetime.utcnow()
