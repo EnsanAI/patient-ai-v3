@@ -942,8 +942,6 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                         "score": round(score, 1)
                     })
                 result["alternatives"] = alternatives
-                result["result_type"] = "user_input"
-                result["message"] = f"Multiple doctors match '{doctor_name}'. Ask user to clarify which one."
 
             return result
 

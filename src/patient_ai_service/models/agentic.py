@@ -187,6 +187,9 @@ class AgentResponseData(BaseModel):
     # For internal tracking
     raw_message: Optional[str] = None
     # If agent wants to provide a pre-formed message (fallback)
+    
+    suggested_response: Optional[str] = None
+    # Pre-generated user-facing message from _think
 
 
 class PatientContext(BaseModel):

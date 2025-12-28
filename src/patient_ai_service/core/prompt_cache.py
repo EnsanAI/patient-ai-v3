@@ -67,6 +67,7 @@ TOOL RESULT TYPES & REQUIRED ACTIONS
 | SYSTEM_ERROR  | Infrastructure failure   | RETRY once, then RESPOND_IMPOSSIBLE         |
 
 ⚠️ USER_INPUT_NEEDED: Not a failure. Tool worked but user must choose. DO NOT retry other tools.
+
 """
 
 UNIVERSAL_DECISION_GUIDE = """
@@ -80,6 +81,19 @@ CLARIFY → Missing or unclear required info (specify: clarification_question, a
 COLLECT_INFORMATION → Need user data before continuing (specify: awaiting_info, entities)
 REQUEST_CONFIRMATION → BEFORE critical actions. Stages tool call (confirmation_action=tool_name, confirmation_details=tool_input) + confirmation_question for user
 RETRY → result_type=SYSTEM_ERROR, within retry limit
+
+
+COLLECTED ENTITIES:
+
+How it works: 
+- Your short-term memory for fulfilling the user's request.
+- Latest entries appear at the bottom
+- Update with new important info from: user messages, tool results, or identified intents to fulfill the user's request or WILL BE NEEDED LATER
+
+How to update COLLECTED ENTITIES:
+- Only output NEW or CHANGED entities in entities_to_update
+- For CHANGED entities: use same key, new value
+- Nothing new → return empty: {}
 """
 
 
@@ -113,24 +127,10 @@ If CALL_TOOL - specify tool to call
     // RESPONSE DATA - Fill based on decision type
     // ═══════════════════════════════════════════════════════════════
     "response": {{
-        // ✅ DELTA UPDATE FORMAT (preferred): Only output entities that are NEW or CHANGED
-        // - Do NOT output entities that haven't changed
-        // - Only include what's different from the previous turn
-        // - If nothing changed, leave entities_to_update empty: {{}}
-        //
-        // Examples:
-        // - User says "3pm" → {{"time_preference": "3pm"}}
-        // - User changes doctor → {{"doctor_preference": "Dr. Jones"}}
-        // - Nothing new → {{}}
-        "entities_to_update": {{
-            // Only new or changed entities here
-            // Examples:
-               "time_preference": "3pm"  
-               "doctor_preference": "Dr. Jones"  
-        }},
+
+        "entities_to_update": {{}} // Only new or changed entities here
         
-        // FALLBACK: Complete state format (optional, if you find that that resolved_enities are too old or not useful at all)
-        // System will prefer entities_to_update if present
+        // FALLBACK: Complete state format (optional, if you find that that COLLECTED ENTITIES are too old or not useful ANYMORE for the current task)
         "entities": {{}},
 
         CLARIFY:
@@ -168,6 +168,24 @@ If CALL_TOOL - specify tool to call
             "confirmation_action": "<tool_name to execute after confirmation>",
             "confirmation_details": {<tool_input to execute after confirmation>},
             "confirmation_question": "<human-readable summary for user>"
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SUGGESTED_RESPONSE (REQUIRED for all decisions)
+    // ═══════════════════════════════════════════════════════════════
+    // Generate a real, informed user-facing response. Write the EXACT
+    // message content for the patient. Include all details (names, dates,
+    // times, confirmation IDs). Write in English.
+    //
+    // Examples:
+    // - CALL_TOOL: "Looking up Dr. Mohammed's availability for tomorrow..."
+    // - RESPOND_COMPLETE: "Your appointment is confirmed with Dr. Mohammed on Dec 30 at 5pm. Confirmation: abc123"
+    // - RESPOND_WITH_OPTIONS: "The 2pm slot is taken. Available: 10am, 3pm, 5pm"
+    // - COLLECT_INFORMATION: "I need your phone number to complete registration"
+    // - CLARIFY: "Did you mean Dr. Mohammed Atef or Dr. Mohammed Ali?"
+
+    "suggested_response": "<complete user-facing message in English>"
+}
 """
 
 
@@ -227,4 +245,5 @@ if _estimated_tokens < 1024:
     )
 else:
     logger.debug(f"Universal content estimated at ~{_estimated_tokens} tokens")
+
 

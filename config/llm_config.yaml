@@ -74,8 +74,14 @@ agents:
         max_tokens: 300
       _generate_response:
         provider: openai
-        model: gpt-5-mini-2025-08-07
+        model: gpt-4o-mini
         temperature: 0.7
+        max_tokens: 400
+      _humanize_response:
+        provider: openai
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
 
   # Medical inquiry agent
   medical_inquiry:
@@ -92,8 +98,14 @@ agents:
         max_tokens: 500
       _generate_response:
         provider: openai
-        model: gpt-5-mini-2025-08-07
-        temperature: 0.5
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
+      _humanize_response:
+        provider: openai
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
 
   # Emergency response agent
   emergency_response:
@@ -109,8 +121,14 @@ agents:
         temperature: 0.5
       _generate_response:
         provider: openai
-        model: gpt-5-mini-2025-08-07
-        temperature: 0.5
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
+      _humanize_response:
+        provider: openai
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
 
   # Registration agent
   registration:
@@ -127,8 +145,14 @@ agents:
         max_tokens: 300
       _generate_response:
         provider: openai
-        model: gpt-5-nano-2025-08-07
+        model: gpt-4o-mini
         temperature: 0.7
+        max_tokens: 400
+      _humanize_response:
+        provider: openai
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
 
 
   # General assistant agent
@@ -145,8 +169,14 @@ agents:
         temperature: 0.5
       _generate_response:
         provider: openai
-        model: gpt-5-mini-2025-08-07
-        temperature: 0.5
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
+      _humanize_response:
+        provider: openai
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 400
 
   # Conversational fast path (orchestrator)
   conversational_fast_path:

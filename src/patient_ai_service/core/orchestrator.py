@@ -189,8 +189,8 @@ class Orchestrator:
         Returns:
             Natural response in the user's language/dialect
         """
-        name = patient_name or "there"
-        
+        name = patient_name or "thier"
+
         # Build language instruction
         lang_instruction = ""
         if language == "ar":
@@ -643,7 +643,10 @@ Respond in JSON format:
                 result = json.loads(cleaned_response)
                 extracted_info = result.get("extracted_info")  # Can be string or None
                 collection_complete = result.get("collection_complete", False)  # Boolean flag
-                response = result.get("response", "I'm not sure I understood. Could you please provide the information I requested?")
+                response = result.get("response")  # Can be string or None
+                # Handle None response (when JSON has "response": null)
+                if response is None:
+                    response = "I'm not sure I understood. Could you please provide the information I requested?"
 
                 logger.info("=" * 80)
                 logger.info(f"⚡ [Info Collection] PARSED RESPONSE:")
@@ -737,18 +740,26 @@ Respond in JSON format:
             logger.info("-" * 100)
             logger.info(f"Original message: {message[:200]}")
             with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
-                translation_agent = self.agents["translation"]
+                from patient_ai_service.core.feature_flags import is_translation_enabled
+                if is_translation_enabled(session_id):
+                    translation_agent = self.agents["translation"]
 
-                # OPTIMIZED: Single LLM call for detection AND translation
-                translate_start = time.time()
-                english_message, detected_lang, detected_dialect, translation_succeeded = await translation_agent.detect_and_translate(message, session_id)
-                translate_duration = (time.time() - translate_start) * 1000
+                    # OPTIMIZED: Single LLM call for detection AND translation
+                    translate_start = time.time()
+                    english_message, detected_lang, detected_dialect, translation_succeeded = await translation_agent.detect_and_translate(message, session_id)
+                    translate_duration = (time.time() - translate_start) * 1000
 
-                logger.info(
-                    f"[FAST] Language: {detected_lang}-{detected_dialect or 'unknown'}, "
-                    f"translation_succeeded: {translation_succeeded} "
-                    f"(took {translate_duration:.2f}ms - single LLM call)"
-                )
+                    logger.info(
+                        f"[FAST] Language: {detected_lang}-{detected_dialect or 'unknown'}, "
+                        f"translation_succeeded: {translation_succeeded} "
+                        f"(took {translate_duration:.2f}ms - single LLM call)"
+                    )
+                else:
+                    logger.info("[SKIP] Translation disabled, using original message")
+                    english_message = message
+                    detected_lang = "en"
+                    detected_dialect = None
+                    translation_succeeded = True
 
                 # Get current language context
                 global_state = self.state_manager.get_global_state(session_id)

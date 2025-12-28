@@ -38,7 +38,7 @@ from patient_ai_service.core.llm import LLMClient
 from patient_ai_service.core.state_manager import StateManager
 from patient_ai_service.core.observability import get_observability_logger
 from patient_ai_service.core.config import settings
-from patient_ai_service.core.feature_flags import FeatureFlags
+from patient_ai_service.core.feature_flags import FeatureFlags, is_humanizer_enabled
 from patient_ai_service.core.llm_config import (
     LLMConfig,
     LLMConfigManager,
@@ -71,6 +71,64 @@ from patient_ai_service.models.agentic import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HUMANIZER PROMPT - Natural, human-like clinic receptionist
+# ═══════════════════════════════════════════════════════════════════════════════
+HUMANIZE_SYSTEM_PROMPT = """You are a natural, human-like clinic receptionist. Your goal: patients never realize you're AI. Humanize system's SUGGESTED RESPONSE and make it relevant to conversation. 
+
+## CORE RULES
+• Match patient's exact language, dialect, and tone (English, Egyptian Arabic, Emirati Arabic, Italian, Spanish, etc.)
+• Keep ALL medical details unchanged (names, times, appointments, prescriptions)
+• Never use technical terms, system IDs, or tool names
+• 1-2 sentences maximum - be direct and warm
+• When conversation is recent read it for a contextual cntinuuos response
+
+## TONE HANDLING
+• Angry patients: Stay calm, acknowledge briefly without repetition
+• Anxious patients: Be reassuring but realistic
+• Confused patients: Clarify simply
+• NEVER repeat similar responses multiple times
+• NEVER promise any future actions.
+
+## FORBIDDEN PHRASES
+✗ "I understand" (more than once)
+✗ Any technical/system language like system IDs or tool names
+
+## NATURAL RESPONSES
+✓ Speak like a real person would
+✓ Use patient's communication style
+✓ Be empathetic without being redundant
+✓ Sound like Jarvis - intelligent, natural, helpful
+
+## OUTPUT
+Reply as if you're speaking directly to the patient - natural, conversational, matching their language, DIALECT, tone exactly."""
+
+
+def format_time_ago(timestamp: datetime) -> str:
+    """Format timestamp as first unit only: '2m ago', '3h ago', '1d ago'"""
+    if timestamp is None:
+        return ""
+
+    try:
+        now = datetime.now(timestamp.tzinfo) if timestamp.tzinfo else datetime.now()
+        delta = now - timestamp
+
+        if delta.days > 0:
+            return f"{delta.days}d ago"
+
+        hours = delta.seconds // 3600
+        if hours > 0:
+            return f"{hours}h ago"
+
+        mins = delta.seconds // 60
+        if mins > 0:
+            return f"{mins}m ago"
+
+        return "now"
+    except Exception:
+        return ""
 
 
 class CircuitState(Enum):
@@ -1615,14 +1673,30 @@ Output ONLY valid JSON."""
                 
                 if completion.is_complete:
                     logger.info(f"[{self.agent_name}] ✅ Task complete! Generating response.")
-                    # Use RESPOND_COMPLETE decision for unified response
-                    response = await self._generate_response(
-                        session_id,
-                        AgentDecision.RESPOND_COMPLETE,
-                        thinking.response,
-                        exec_context
-                    )
-                    return response, execution_log
+                    
+                    # Extract suggested_response
+                    suggested = (
+                        thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                    ) or exec_context.suggested_response
+                    
+                    if suggested and is_humanizer_enabled(session_id):
+                        # NEW PATH: Use humanizer
+                        response = await self._humanize_response(session_id, suggested)
+                        self._log_execution_summary(exec_context)
+                        return response, execution_log
+                    elif suggested:
+                        # ROLLBACK: Return suggested_response as-is (no humanization)
+                        self._log_execution_summary(exec_context)
+                        return suggested, execution_log
+                    else:
+                        # FALLBACK: Use existing _generate_response
+                        response = await self._generate_response(
+                            session_id,
+                            AgentDecision.RESPOND_COMPLETE,
+                            thinking.response,
+                            exec_context
+                        )
+                        return response, execution_log
                 
                 elif completion.has_blocked:
                     logger.info(f"[{self.agent_name}] ⏸️ Criteria blocked - presenting options")
@@ -1633,39 +1707,90 @@ Output ONLY valid JSON."""
                             thinking.response.options.extend(options)
                     if not thinking.response.options_context:
                         thinking.response.options_context = "alternatives"
-                    response = await self._generate_response(
-                        session_id,
-                        AgentDecision.RESPOND_WITH_OPTIONS,
-                        thinking.response,
-                        exec_context
-                    )
-                    return response, execution_log
+                    
+                    # Extract suggested_response
+                    suggested = (
+                        thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                    ) or exec_context.suggested_response
+                    
+                    if suggested and is_humanizer_enabled(session_id):
+                        # NEW PATH: Use humanizer
+                        response = await self._humanize_response(session_id, suggested)
+                        self._log_execution_summary(exec_context)
+                        return response, execution_log
+                    elif suggested:
+                        # ROLLBACK: Return suggested_response as-is (no humanization)
+                        self._log_execution_summary(exec_context)
+                        return suggested, execution_log
+                    else:
+                        # FALLBACK: Use existing _generate_response
+                        response = await self._generate_response(
+                            session_id,
+                            AgentDecision.RESPOND_WITH_OPTIONS,
+                            thinking.response,
+                            exec_context
+                        )
+                        return response, execution_log
                 
                 elif completion.has_failed:
                     logger.info(f"[{self.agent_name}] ❌ Criteria failed - explaining")
                     # Update response data with failure info
                     if not thinking.response.failure_reason:
                         thinking.response.failure_reason = "Task could not be completed"
-                    response = await self._generate_response(
-                        session_id,
-                        AgentDecision.RESPOND_IMPOSSIBLE,
-                        thinking.response,
-                        exec_context
-                    )
-                    return response, execution_log
+                    
+                    # Extract suggested_response
+                    suggested = (
+                        thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                    ) or exec_context.suggested_response
+                    
+                    if suggested and is_humanizer_enabled(session_id):
+                        # NEW PATH: Use humanizer
+                        response = await self._humanize_response(session_id, suggested)
+                        self._log_execution_summary(exec_context)
+                        return response, execution_log
+                    elif suggested:
+                        # ROLLBACK: Return suggested_response as-is (no humanization)
+                        self._log_execution_summary(exec_context)
+                        return suggested, execution_log
+                    else:
+                        # FALLBACK: Use existing _generate_response
+                        response = await self._generate_response(
+                            session_id,
+                            AgentDecision.RESPOND_IMPOSSIBLE,
+                            thinking.response,
+                            exec_context
+                        )
+                        return response, execution_log
                 
                 else:
                     # Not complete but agent thinks it is
                     if thinking.is_task_complete:
                         # Agent explicitly marked complete - trust it and generate response
                         logger.info(f"[{self.agent_name}] Agent marked complete - generating response")
-                        response = await self._generate_response(
-                            session_id,
-                            AgentDecision.RESPOND_COMPLETE,
-                            thinking.response,
-                            exec_context
-                        )
-                        return response, execution_log
+                        
+                        # Extract suggested_response
+                        suggested = (
+                            thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                        ) or exec_context.suggested_response
+                        
+                        if suggested and is_humanizer_enabled(session_id):
+                            # NEW PATH: Use humanizer
+                            response = await self._humanize_response(session_id, suggested)
+                            self._log_execution_summary(exec_context)
+                            return response, execution_log
+                        elif suggested:
+                            # ROLLBACK: Return suggested_response as-is (no humanization)
+                            self._log_execution_summary(exec_context)
+                            return suggested, execution_log
+                        else:
+                            # FALLBACK: Use existing _generate_response
+                            response = await self._generate_response(
+                                session_id,
+                                AgentDecision.RESPOND_COMPLETE,
+                                thinking.response,
+                                exec_context
+                            )
+                            return response, execution_log
                     else:
                         # Force continue
                         logger.warning(
@@ -1683,35 +1808,86 @@ Output ONLY valid JSON."""
             
             elif thinking.decision == AgentDecision.RESPOND_WITH_OPTIONS:
                 logger.info(f"[{self.agent_name}] Responding with options")
-                response = await self._generate_response(
-                    session_id,
-                    AgentDecision.RESPOND_WITH_OPTIONS,
-                    thinking.response,
-                    exec_context
-                )
-                self._log_execution_summary(exec_context)
-                return response, execution_log
+                
+                # Extract suggested_response
+                suggested = (
+                    thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                ) or exec_context.suggested_response
+                
+                if suggested and is_humanizer_enabled(session_id):
+                    # NEW PATH: Use humanizer
+                    response = await self._humanize_response(session_id, suggested)
+                    self._log_execution_summary(exec_context)
+                    return response, execution_log
+                elif suggested:
+                    # ROLLBACK: Return suggested_response as-is (no humanization)
+                    self._log_execution_summary(exec_context)
+                    return suggested, execution_log
+                else:
+                    # FALLBACK: Use existing _generate_response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_WITH_OPTIONS,
+                        thinking.response,
+                        exec_context
+                    )
+                    self._log_execution_summary(exec_context)
+                    return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_COMPLETE:
                 logger.info(f"[{self.agent_name}] Task complete - generating response")
-                response = await self._generate_response(
-                    session_id,
-                    AgentDecision.RESPOND_COMPLETE,
-                    thinking.response,
-                    exec_context
-                )
-                self._log_execution_summary(exec_context)
-                return response, execution_log
+                
+                # Extract suggested_response
+                suggested = (
+                    thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                ) or exec_context.suggested_response
+                
+                if suggested and is_humanizer_enabled(session_id):
+                    # NEW PATH: Use humanizer
+                    response = await self._humanize_response(session_id, suggested)
+                    self._log_execution_summary(exec_context)
+                    return response, execution_log
+                elif suggested:
+                    # ROLLBACK: Return suggested_response as-is (no humanization)
+                    self._log_execution_summary(exec_context)
+                    return suggested, execution_log
+                else:
+                    # FALLBACK: Use existing _generate_response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_COMPLETE,
+                        thinking.response,
+                        exec_context
+                    )
+                    self._log_execution_summary(exec_context)
+                    return response, execution_log
             
             elif thinking.decision == AgentDecision.RESPOND_IMPOSSIBLE:
                 logger.info(f"[{self.agent_name}] Task impossible")
-                response = await self._generate_response(
-                    session_id,
-                    AgentDecision.RESPOND_IMPOSSIBLE,
-                    thinking.response,
-                    exec_context
-                )
-                return response, execution_log
+                
+                # Extract suggested_response
+                suggested = (
+                    thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                ) or exec_context.suggested_response
+                
+                if suggested and is_humanizer_enabled(session_id):
+                    # NEW PATH: Use humanizer
+                    response = await self._humanize_response(session_id, suggested)
+                    self._log_execution_summary(exec_context)
+                    return response, execution_log
+                elif suggested:
+                    # ROLLBACK: Return suggested_response as-is (no humanization)
+                    self._log_execution_summary(exec_context)
+                    return suggested, execution_log
+                else:
+                    # FALLBACK: Use existing _generate_response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.RESPOND_IMPOSSIBLE,
+                        thinking.response,
+                        exec_context
+                    )
+                    return response, execution_log
             
             elif thinking.decision == AgentDecision.CLARIFY:
                 logger.info(f"[{self.agent_name}] Asking for clarification - saving state")
@@ -1748,14 +1924,27 @@ Output ONLY valid JSON."""
 
                 logger.info(f"[{self.agent_name}] Saved continuation: awaiting={awaiting}")
 
-                # Generate response using unified method
-                response = await self._generate_response(
-                    session_id,
-                    AgentDecision.CLARIFY,
-                    thinking.response,
-                    exec_context
-                )
-                return response, execution_log
+                # Extract suggested_response
+                suggested = (
+                    thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                ) or exec_context.suggested_response
+                
+                if suggested and is_humanizer_enabled(session_id):
+                    # NEW PATH: Use humanizer
+                    response = await self._humanize_response(session_id, suggested)
+                    return response, execution_log
+                elif suggested:
+                    # ROLLBACK: Return suggested_response as-is (no humanization)
+                    return suggested, execution_log
+                else:
+                    # FALLBACK: Use existing _generate_response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.CLARIFY,
+                        thinking.response,
+                        exec_context
+                    )
+                    return response, execution_log
 
             elif thinking.decision == AgentDecision.COLLECT_INFORMATION:
                 logger.info(f"[{self.agent_name}] Collecting information - saving state and generating response")
@@ -1827,14 +2016,27 @@ Output ONLY valid JSON."""
 
                 logger.info(f"[{self.agent_name}] Saved continuation: awaiting=information, information_needed={information_needed}, resolved={list(resolved.keys())}")
 
-                # Generate response using unified method
-                response = await self._generate_response(
-                    session_id,
-                    AgentDecision.COLLECT_INFORMATION,
-                    thinking.response,
-                    exec_context
-                )
-                return response, execution_log
+                # Extract suggested_response
+                suggested = (
+                    thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                ) or exec_context.suggested_response
+                
+                if suggested and is_humanizer_enabled(session_id):
+                    # NEW PATH: Use humanizer
+                    response = await self._humanize_response(session_id, suggested)
+                    return response, execution_log
+                elif suggested:
+                    # ROLLBACK: Return suggested_response as-is (no humanization)
+                    return suggested, execution_log
+                else:
+                    # FALLBACK: Use existing _generate_response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.COLLECT_INFORMATION,
+                        thinking.response,
+                        exec_context
+                    )
+                    return response, execution_log
 
             elif thinking.decision == AgentDecision.REQUEST_CONFIRMATION:
                 logger.info(f"[{self.agent_name}] Requesting confirmation before critical action")
@@ -1842,14 +2044,25 @@ Output ONLY valid JSON."""
                 # Check for confirmation data in response or legacy field
                 if not thinking.response.confirmation_action and not thinking.confirmation_summary:
                     logger.warning(f"[{self.agent_name}] REQUEST_CONFIRMATION but no confirmation data!")
-                    # Fallback to just responding
-                    response = await self._generate_response(
-                        session_id,
-                        AgentDecision.RESPOND,
-                        thinking.response,
-                        exec_context
-                    )
-                    return response, execution_log
+                    # Extract suggested_response for fallback
+                    suggested = (
+                        thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                    ) or exec_context.suggested_response
+                    
+                    if suggested and is_humanizer_enabled(session_id):
+                        response = await self._humanize_response(session_id, suggested)
+                        return response, execution_log
+                    elif suggested:
+                        return suggested, execution_log
+                    else:
+                        # Fallback to just responding
+                        response = await self._generate_response(
+                            session_id,
+                            AgentDecision.RESPOND,
+                            thinking.response,
+                            exec_context
+                        )
+                        return response, execution_log
                 
                 # Build confirmation details from response or legacy summary
                 if thinking.response.confirmation_action:
@@ -1925,14 +2138,27 @@ Output ONLY valid JSON."""
                     options=["yes", "no", "confirm", "cancel"]
                 )
 
-                # Generate confirmation message using unified method
-                response = await self._generate_response(
-                    session_id,
-                    AgentDecision.REQUEST_CONFIRMATION,
-                    thinking.response,
-                    exec_context
-                )
-                return response, execution_log
+                # Extract suggested_response
+                suggested = (
+                    thinking.response.suggested_response if thinking.response and thinking.response.suggested_response else None
+                ) or exec_context.suggested_response
+                
+                if suggested and is_humanizer_enabled(session_id):
+                    # NEW PATH: Use humanizer
+                    response = await self._humanize_response(session_id, suggested)
+                    return response, execution_log
+                elif suggested:
+                    # ROLLBACK: Return suggested_response as-is (no humanization)
+                    return suggested, execution_log
+                else:
+                    # FALLBACK: Use existing _generate_response
+                    response = await self._generate_response(
+                        session_id,
+                        AgentDecision.REQUEST_CONFIRMATION,
+                        thinking.response,
+                        exec_context
+                    )
+                    return response, execution_log
 
             elif thinking.decision == AgentDecision.RETRY:
                 logger.info(f"[{self.agent_name}] Retrying last action")
@@ -3452,23 +3678,15 @@ User's Message: {message}
 Identidfied Intent: {routing_action} | {user_intent}
 
 
-Your short-term memory of relevant collected information NEEDED to fulfill the user's request or WILL BE NEEDED LATER:
+COLLECTED ENTITIES:
 {formatted_entities}
 
-IMPORTANT: These are ONLY entities YOU explicitly manage via entities_to_update.
-- patient_id is auto-injected for you
-- The latest collected entities are at the bottom
-- Update it with any new important information you collected from user message or tool results or Identidfied Intent
-- Update these by including entities_to_update in your response with information.
-- Use tools to get other data (available slots, doctor info, etc.)
 
 ═══════════════════════════════════════════════════════════════════════════════
 EXECUTION STATUS
 ═══════════════════════════════════════════════════════════════════════════════
 
-Plan: {plan_status}
-
-Observations (Iteration {exec_context.iteration}):
+PREVIOUS TOOL RESULTS (Iteration {exec_context.iteration}):
 {observations}
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -4105,6 +4323,12 @@ DECISION RULES:
                     confirmation_details=confirmation_summary.details if confirmation_summary else {},
                     confirmation_question=None  # Will be generated
                 )
+            
+            # Extract suggested_response from top-level JSON
+            suggested_response = data.get("suggested_response")
+            if suggested_response and response_data:
+                response_data.suggested_response = suggested_response
+                logger.info(f"🔍 [{self.agent_name}]   → Suggested response extracted: {suggested_response[:100]}...")
             
             # Build result
             logger.info(f"🔍 [{self.agent_name}] Step 9: Building ThinkingResult object...")
@@ -5623,6 +5847,87 @@ DECISION RULES:
         text = text.strip()
         
         return text
+
+    async def _humanize_response(
+        self,
+        session_id: str,
+        suggested_response: str
+    ) -> str:
+        """
+        Humanize response using conversation context. ~200 tokens input.
+
+        Takes suggested_response from _think and makes it conversational,
+        matching the patient's language and style from recent messages.
+        """
+        logger.info(f"🎨 [{self.agent_name}] Humanizing response...")
+        logger.info(f"🎨 [{self.agent_name}]   Input: {suggested_response[:100]}...")
+
+        # Get recent messages with timestamps
+        from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
+        memory_manager = get_conversation_memory_manager()
+        memory = memory_manager.get_memory(session_id)
+
+        # Build conversation context (last 4 messages)
+        lines = []
+        recent_turns = (memory.recent_turns or [])[-4:] if memory else []
+        for msg in recent_turns:
+            role = "patient" if msg.role == "user" else "you"
+            time_ago = format_time_ago(getattr(msg, 'timestamp', None))
+            time_str = f" • {time_ago}" if time_ago else ""
+            content = msg.content[:150] if msg.content else ""
+            lines.append(f"[{role}{time_str}] {content}")
+
+        conversation_context = "\n".join(lines) if lines else "[No previous messages]"
+        patient_context = PatientContext.from_session(session_id, self.state_manager)
+        patient_name = patient_context.name or "we don't know yet"
+
+        user_prompt = f"""
+Patient name: {patient_name}
+
+CONVERSATION CONTEXT:
+{conversation_context}
+
+SUGGESTED RESPONSE: {suggested_response}
+
+OUTPUT FORMAT:
+Provide ONLY the response text.
+
+Response:"""
+
+        logger.info(f"🎨 [{self.agent_name}] Humanizer prompt:\n{user_prompt}")
+
+        # Call lightweight LLM
+        llm_config = self._get_llm_config_for_function("_humanize_response")
+        llm_client = self._get_llm_client_for_function("_humanize_response")
+
+        try:
+            llm_start_time = time.time()
+
+            if hasattr(llm_client, 'create_message_with_usage'):
+                response, tokens = llm_client.create_message_with_usage(
+                    system=HUMANIZE_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": user_prompt}],
+                    temperature=llm_config.temperature,
+                    max_tokens=100
+                )
+            else:
+                response = llm_client.create_message(
+                    system=HUMANIZE_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": user_prompt}],
+                    temperature=llm_config.temperature,
+                    max_tokens=100
+                )
+                tokens = TokenUsage()
+
+            llm_duration = time.time() - llm_start_time
+            result = response.strip()
+
+            logger.info(f"🎨 [{self.agent_name}] Humanized ({llm_duration:.2f}s): {result}")
+            return result
+
+        except Exception as e:
+            logger.warning(f"🎨 [{self.agent_name}] Humanizer failed, using suggested_response: {e}")
+            return suggested_response  # Fallback to original
 
     def _build_collect_info_prompt(
         self,

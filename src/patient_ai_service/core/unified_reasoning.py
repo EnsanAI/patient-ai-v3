@@ -471,9 +471,7 @@ INFORMATON COLLECTED SO FAR:
 {collected_display}
 {message}
 
-
-IF all INFORMATON COLLECTED SO FAR cover INFORMATION NEEDED: "routing_action": "null" -> NORMAL AGENT ROUTING
-OTHERWISE: "routing_action": "collect_information" -> CONTINUE COLLECTION UNTIL ALL INFORMATION ARE PORIVED
+MANDATORY: If all required information is now collected, set routing_action="none" to proceed with required agent.
 
 INFORMATION COLLECTED RULES:
 Be flexible - accept vague, partial, "I don't care", "anything", etc.

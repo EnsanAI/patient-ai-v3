@@ -53,8 +53,10 @@ class FeatureFlags:
             "entity_caching": settings.v2.enable_entity_caching,
             "script_detection": settings.v2.enable_script_detection,
             "conversational_fast_path": settings.v2.enable_conversational_fast_path,
+            "translation": settings.v2.enable_translation,
             "planning": settings.v2.enable_planning,
             "tool_result_override": settings.v2.enable_tool_result_override,
+            "humanizer": getattr(settings.v2, 'enable_humanizer', False),
         }
         return flag_map.get(feature, False)
     
@@ -110,4 +112,12 @@ def is_planning_enabled(session_id: str = None) -> bool:
 def is_tool_result_override_enabled(session_id: str = None) -> bool:
     """Check if tool result type override is enabled (FATAL/USER_INPUT bypass LLM)."""
     return FeatureFlags.is_enabled("tool_result_override", session_id)
+
+def is_humanizer_enabled(session_id: str = None) -> bool:
+    """Check if humanizer is enabled (suggested_response → _humanize_response)."""
+    return FeatureFlags.is_enabled("humanizer", session_id)
+
+def is_translation_enabled(session_id: str = None) -> bool:
+    """Check if translation is enabled."""
+    return FeatureFlags.is_enabled("translation", session_id)
 
