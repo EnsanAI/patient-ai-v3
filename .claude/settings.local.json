@@ -7,7 +7,9 @@
       "Bash(pip install:*)",
       "Bash(python -m pip:*)",
       "Bash(done)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(ls:*)"
     ],
     "deny": [],
     "ask": []

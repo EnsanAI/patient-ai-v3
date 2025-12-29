@@ -24,6 +24,10 @@ class ExecutionLog(BaseModel):
     """Complete log of agent execution for validation."""
     tools_used: List[ToolExecution] = Field(default_factory=list)
     conversation_turns: int = 0
+    suggested_response: Optional[str] = Field(
+        default=None,
+        description="Pre-humanization suggested response from _think() (in English)"
+    )
 
 
 class ValidationResult(BaseModel):

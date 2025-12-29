@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 # HUMANIZER PROMPT - Natural, human-like clinic receptionist
 # ═══════════════════════════════════════════════════════════════════════════════
-HUMANIZE_SYSTEM_PROMPT = """You are a natural, human-like clinic receptionist. Your goal: patients never realize you're AI. Humanize system's SUGGESTED RESPONSE and make it relevant to conversation. 
+HUMANIZE_SYSTEM_PROMPT = """You are a SUPER PROFESSIONAL, natural, human-like clinic receptionist. Your goal: patients never realize you're AI. Humanize system's SUGGESTED RESPONSE and make it relevant to conversation. 
 
 ## CORE RULES
 • Match patient's exact language, dialect, and tone (English, Egyptian Arabic, Emirati Arabic, Italian, Spanish, etc.)
@@ -1681,7 +1681,10 @@ Output ONLY valid JSON."""
                     
                     if suggested and is_humanizer_enabled(session_id):
                         # NEW PATH: Use humanizer
-                        response = await self._humanize_response(session_id, suggested)
+                        # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                        execution_log.suggested_response = suggested
+                        user_intent = self._get_user_intent(session_id, exec_context)
+                        response = await self._humanize_response(session_id, suggested, user_intent)
                         self._log_execution_summary(exec_context)
                         return response, execution_log
                     elif suggested:
@@ -1715,7 +1718,10 @@ Output ONLY valid JSON."""
                     
                     if suggested and is_humanizer_enabled(session_id):
                         # NEW PATH: Use humanizer
-                        response = await self._humanize_response(session_id, suggested)
+                        # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                        execution_log.suggested_response = suggested
+                        user_intent = self._get_user_intent(session_id, exec_context)
+                        response = await self._humanize_response(session_id, suggested, user_intent)
                         self._log_execution_summary(exec_context)
                         return response, execution_log
                     elif suggested:
@@ -1745,7 +1751,10 @@ Output ONLY valid JSON."""
                     
                     if suggested and is_humanizer_enabled(session_id):
                         # NEW PATH: Use humanizer
-                        response = await self._humanize_response(session_id, suggested)
+                        # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                        execution_log.suggested_response = suggested
+                        user_intent = self._get_user_intent(session_id, exec_context)
+                        response = await self._humanize_response(session_id, suggested, user_intent)
                         self._log_execution_summary(exec_context)
                         return response, execution_log
                     elif suggested:
@@ -1775,7 +1784,8 @@ Output ONLY valid JSON."""
                         
                         if suggested and is_humanizer_enabled(session_id):
                             # NEW PATH: Use humanizer
-                            response = await self._humanize_response(session_id, suggested)
+                            user_intent = self._get_user_intent(session_id, exec_context)
+                            response = await self._humanize_response(session_id, suggested, user_intent)
                             self._log_execution_summary(exec_context)
                             return response, execution_log
                         elif suggested:
@@ -1816,7 +1826,8 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
-                    response = await self._humanize_response(session_id, suggested)
+                    user_intent = self._get_user_intent(session_id, exec_context)
+                    response = await self._humanize_response(session_id, suggested, user_intent)
                     self._log_execution_summary(exec_context)
                     return response, execution_log
                 elif suggested:
@@ -1844,7 +1855,8 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
-                    response = await self._humanize_response(session_id, suggested)
+                    user_intent = self._get_user_intent(session_id, exec_context)
+                    response = await self._humanize_response(session_id, suggested, user_intent)
                     self._log_execution_summary(exec_context)
                     return response, execution_log
                 elif suggested:
@@ -1872,7 +1884,8 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
-                    response = await self._humanize_response(session_id, suggested)
+                    user_intent = self._get_user_intent(session_id, exec_context)
+                    response = await self._humanize_response(session_id, suggested, user_intent)
                     self._log_execution_summary(exec_context)
                     return response, execution_log
                 elif suggested:
@@ -1931,7 +1944,8 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
-                    response = await self._humanize_response(session_id, suggested)
+                    user_intent = self._get_user_intent(session_id, exec_context)
+                    response = await self._humanize_response(session_id, suggested, user_intent)
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
@@ -1945,7 +1959,7 @@ Output ONLY valid JSON."""
                         exec_context
                     )
                     return response, execution_log
-
+            
             elif thinking.decision == AgentDecision.COLLECT_INFORMATION:
                 logger.info(f"[{self.agent_name}] Collecting information - saving state and generating response")
 
@@ -2023,7 +2037,8 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
-                    response = await self._humanize_response(session_id, suggested)
+                    user_intent = self._get_user_intent(session_id, exec_context)
+                    response = await self._humanize_response(session_id, suggested, user_intent)
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
@@ -2050,7 +2065,8 @@ Output ONLY valid JSON."""
                     ) or exec_context.suggested_response
                     
                     if suggested and is_humanizer_enabled(session_id):
-                        response = await self._humanize_response(session_id, suggested)
+                        user_intent = self._get_user_intent(session_id, exec_context)
+                        response = await self._humanize_response(session_id, suggested, user_intent)
                         return response, execution_log
                     elif suggested:
                         return suggested, execution_log
@@ -2145,7 +2161,8 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
-                    response = await self._humanize_response(session_id, suggested)
+                    user_intent = self._get_user_intent(session_id, exec_context)
+                    response = await self._humanize_response(session_id, suggested, user_intent)
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
@@ -5665,25 +5682,27 @@ DECISION RULES:
         # Format resolved entities
         known_info = self._format_entities(response_data.entities)
         
-        # Get recent conversation history from memory manager (same as orchestrator)
-        from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
-        memory_manager = get_conversation_memory_manager()
-        memory = memory_manager.get_memory(session_id)
-        
-        # Get last 3 messages (exclude current user message if it's the last one)
-        recent_turns = memory.recent_turns if memory.recent_turns else []
-        # Exclude the current user message (not yet responded to)
-        if recent_turns and recent_turns[-1].role == "user":
-            recent_turns = recent_turns[:-1]
-        
+        # Get recent conversation history from NativeLanguageMemory
+        # This provides original language context for better tone matching in responses
+        from patient_ai_service.core.native_language_memory import get_native_language_memory_manager
+        native_memory_manager = get_native_language_memory_manager()
+        recent_turns_data = native_memory_manager.get_recent_turns(session_id, limit=4)
+        logger.info(f"🔍 [_generate_response] Retrieved {len(recent_turns_data)} turns from NativeLanguageMemory")
+        if recent_turns_data:
+            logger.info(f"🔍 [_generate_response] Language: {recent_turns_data[0].get('language', 'unknown')}")
+
+        # Exclude current user message if it's the last one
+        if recent_turns_data and recent_turns_data[-1]["role"] == "user":
+            recent_turns_data = recent_turns_data[:-1]
+
         # Get last 3 messages
-        recent_turns = recent_turns[-3:] if len(recent_turns) > 3 else recent_turns
-        
-        # Format recent messages for inclusion in system prompt (same format as unified_reasoning.py)
-        if recent_turns:
+        recent_turns_data = recent_turns_data[-3:] if len(recent_turns_data) > 3 else recent_turns_data
+
+        # Format recent messages for inclusion in system prompt
+        if recent_turns_data:
             recent_context = "\n".join([
-                f"{'User' if turn.role == 'user' else 'Assistant'}: {turn.content[:200]}"
-                for turn in recent_turns
+                f"{'User' if t['role'] == 'user' else 'Assistant'}: {t['content'][:200]}"
+                for t in recent_turns_data
             ])
         else:
             recent_context = "(No previous messages)"
@@ -5753,7 +5772,7 @@ DECISION RULES:
             # Messages array is now just the instruction - conversation history is in system prompt
             messages = [{"role": "user", "content": "Generate the response."}]
             
-            logger.info(f"💬 [{self.agent_name}] Recent conversation context included in system prompt: {len(recent_turns)} messages")
+            logger.info(f"💬 [{self.agent_name}] Recent conversation context included in system prompt: {len(recent_turns_data)} messages")
 
             if hasattr(llm_client, 'create_message_with_usage'):
                 response, tokens = llm_client.create_message_with_usage(
@@ -5848,41 +5867,81 @@ DECISION RULES:
         
         return text
 
+    def _get_user_intent(self, session_id: str, exec_context: Optional[ExecutionContext] = None) -> Optional[str]:
+        """
+        Get user intent from execution context or agent context.
+        
+        Args:
+            session_id: Session identifier
+            exec_context: Optional execution context (preferred source)
+        
+        Returns:
+            User intent string or None
+        """
+        # Try exec_context first (most reliable)
+        if exec_context and exec_context.task_context:
+            user_intent = exec_context.task_context.get("user_intent")
+            if user_intent:
+                return user_intent
+        
+        # Fallback to agent context
+        context = self._context.get(session_id, {})
+        return context.get("what_user_means") or context.get("user_intent")
+
     async def _humanize_response(
         self,
         session_id: str,
-        suggested_response: str
+        suggested_response: str,
+        user_intent: Optional[str] = None
     ) -> str:
         """
         Humanize response using conversation context. ~200 tokens input.
 
         Takes suggested_response from _think and makes it conversational,
         matching the patient's language and style from recent messages.
+        
+        Args:
+            session_id: Session identifier
+            suggested_response: The suggested response to humanize
+            user_intent: Optional user intent from unified reasoning (what_user_means)
         """
         logger.info(f"🎨 [{self.agent_name}] Humanizing response...")
         logger.info(f"🎨 [{self.agent_name}]   Input: {suggested_response[:100]}...")
+        if user_intent:
+            logger.info(f"🎨 [{self.agent_name}]   User intent: {user_intent[:100]}...")
 
-        # Get recent messages with timestamps
-        from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
-        memory_manager = get_conversation_memory_manager()
-        memory = memory_manager.get_memory(session_id)
+        # Get recent messages from NativeLanguageMemory
+        # This provides original language context for better tone/style matching
+        from patient_ai_service.core.native_language_memory import get_native_language_memory_manager
+        native_memory_manager = get_native_language_memory_manager()
+        recent_turns_data = native_memory_manager.get_recent_turns(session_id, limit=4)
+        logger.info(f"🔍 [_humanize_response] Retrieved {len(recent_turns_data)} turns from NativeLanguageMemory")
+        if recent_turns_data:
+            logger.info(f"🔍 [_humanize_response] Language: {recent_turns_data[0].get('language', 'unknown')}")
 
         # Build conversation context (last 4 messages)
         lines = []
-        recent_turns = (memory.recent_turns or [])[-4:] if memory else []
-        for msg in recent_turns:
-            role = "patient" if msg.role == "user" else "you"
-            time_ago = format_time_ago(getattr(msg, 'timestamp', None))
+        for turn_data in recent_turns_data:
+            role = "patient" if turn_data["role"] == "user" else "you"
+            timestamp = turn_data.get("timestamp")
+            time_ago = format_time_ago(timestamp) if timestamp else None
             time_str = f" • {time_ago}" if time_ago else ""
-            content = msg.content[:150] if msg.content else ""
+            content = turn_data["content"][:150] if turn_data.get("content") else ""
             lines.append(f"[{role}{time_str}] {content}")
 
         conversation_context = "\n".join(lines) if lines else "[No previous messages]"
         patient_context = PatientContext.from_session(session_id, self.state_manager)
         patient_name = patient_context.name or "we don't know yet"
 
+        # Build user prompt with optional user intent
+        user_intent_section = ""
+        if user_intent:
+            user_intent_section = f"\nUSER INTENT: {user_intent}\n"
+
         user_prompt = f"""
 Patient name: {patient_name}
+
+{user_intent_section}
 
 CONVERSATION CONTEXT:
 {conversation_context}

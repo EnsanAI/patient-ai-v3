@@ -5,6 +5,7 @@ Handles language detection and translation for multi-language support.
 """
 
 import logging
+import re
 from typing import Dict, Any, Optional, Tuple
 
 from .base_agent import BaseAgent
@@ -14,6 +15,114 @@ from patient_ai_service.core.script_detector import fast_detect_language
 from patient_ai_service.core.llm_config import get_llm_config_manager
 
 logger = logging.getLogger(__name__)
+
+
+class LanguageDetector:
+    """
+    Enhanced language detector with Franco-Arabic support.
+
+    Uses Unicode ranges for Arabic script detection and keyword matching
+    for Franco-Arabic (e.g., "3ayez maw3ed").
+    """
+
+    def __init__(self):
+        # Franco-Arabic number substitutions
+        self.franco_numbers = re.compile(r'[23578]')
+
+        # Common Franco-Arabic words
+        self.franco_keywords = {
+            'ya', 'ya3ni', 'ana', 'enta', 'enti', 'ehna', 'homma',
+            'eh', 'fe', 'mesh', 'msh', 'la2', 'wala', 'bas', 'aw',
+            '3ayez', '3ayz', 'awz', 'awza', 'ayez',
+            'ro7', 'aro7', 'trou7', 'yro7',
+            'geet', 'ga', 'igi', '2olt', 'olt', 'ba2ol',
+            '3amel', '3amlt', 'kont', 'kan', 'tamam', 'tmm', 'aked', 'akid', '5alas', 'khalas', 'inshallah',
+            'bokra', 'embare7', 'delwa2ty', 'dlw2ty', 'nharda',
+            'naharda', 'elyom', 'alyoum', 'wa2t',
+            'maw3ed', 'mwa3eed', 'sa3a', 'sa3t',
+            'momken', 'momkn', 'law sama7t', 'lw sm7t',
+            'min fadlak', 'mn fdlk', 'ynfa3', 'yenfa3',
+            'aiwa', 'aywa', 'ah', 'aah', 'tamam', 'tmm',
+            'mashi', 'mashy', 'khalas', '5alas',
+            'inshallah', 'nshallah', 'wallahi',
+            'mafeesh', 'mafesh', 'mafish',
+            '3afwan', 'shokran',
+            'ezayak', 'ezzayak', 'izzayak', 'zayak',
+            '3andak', '3andek', '3ando', 'm3ak', 'ma3ak',
+            'ta3ban', '3ayyan', 'waga3', 'wg3',
+            '3eyada', 'kashf', 'ta2meen'
+        }
+
+        # Common English short words (whitelist)
+        self.english_short_words = {
+            'yes', 'no', 'ok', 'okay', 'sure', 'hi', 'hello',
+            'bye', 'thanks', 'when', 'where', 'why', 'how',
+            'what', 'who', 'can', 'will', 'would', 'could',
+            'please', 'thank', 'you', 'me', 'my', 'i',
+            'exactly', 'right', 'wrong', 'good', 'bad',
+            'great', 'fine', 'well', 'very', 'much'
+        }
+
+    def is_non_english(self, text: str) -> Tuple[bool, str]:
+        """
+        Detect if text is non-English.
+
+        Returns:
+            Tuple of (is_non_english: bool, detected_language: str)
+        """
+        if not text or len(text.strip()) < 1:
+            return False, 'unknown'
+
+        text_clean = text.strip().lower()
+
+        # 1. Arabic script detection
+        if re.search(r'[\u0600-\u06FF]', text):
+            return True, 'ar'
+
+        # 2. Franco-Arabic detection
+        words = set(re.findall(r'\b\w+\b', text_clean))
+        franco_score = 0
+
+        # Check for number substitutions in words
+        if self.franco_numbers.search(text_clean):
+            franco_score += 2
+
+        # Check for common Franco-Arabic words
+        if words & self.franco_keywords:
+            franco_score += 3
+
+        if franco_score >= 3:
+            return True, 'ar-franco'
+
+        # 3. SHORT TEXT HANDLING - Check whitelist first
+        word_count = len(words)
+        if word_count <= 2:
+            if words.issubset(self.english_short_words):
+                return False, 'en'
+
+        # 4. Standard language detection (only for longer text)
+        # Use langdetect ONLY to identify non-English, not to determine specific language
+        if len(text_clean) >= 10:
+            try:
+                from langdetect import detect, LangDetectException
+                lang = detect(text)
+                if lang != 'en':
+                    # Non-English detected - return 'other' to trigger LLM-based detection
+                    # This ensures we don't try to handle unsupported languages in fast path
+                    return True, 'other'
+                else:
+                    return False, 'en'
+            except (ImportError, Exception):
+                # langdetect not available or failed - default to English
+                return False, 'en'
+
+        # 5. Default to English for very short unrecognized text
+        return False, 'en'
+
+    def should_translate(self, text: str) -> bool:
+        """Simple boolean check for translation need."""
+        is_non_eng, _ = self.is_non_english(text)
+        return is_non_eng
 
 
 class TranslationAgent(BaseAgent):
@@ -41,6 +150,8 @@ class TranslationAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(agent_name="Translation", **kwargs)
         self.llm_config_manager = get_llm_config_manager()
+        # Initialize enhanced language detector with Franco-Arabic support
+        self._language_detector = LanguageDetector()
 
     def _register_tools(self):
         """Translation agent uses LLM directly, no additional tools needed."""
@@ -148,21 +259,20 @@ Language code:"""
         from patient_ai_service.models.observability import TokenUsage
 
         # ═══════════════════════════════════════════════════════════════════
-        # FAST PATH: Script detection for obvious cases
+        # FAST PATH: Enhanced language detection with Franco-Arabic support
         # ═══════════════════════════════════════════════════════════════════
-        lang, dialect, skip_llm = fast_detect_language(text)
-        
-        if skip_llm:
-            if lang == "en":
-                # English - no translation needed
-                logger.info(f"[FAST PATH] Script detection: English, skipping LLM")
-                return text, "en", dialect, True
-            elif lang == "ar":
-                # Arabic - need translation but skip dialect detection
-                logger.info(f"[FAST PATH] Script detection: Arabic (ae), translating without dialect LLM")
-                # Still need to translate Arabic to English, but with known dialect
-                english_text = await self._translate_arabic_to_english(text, session_id)
-                return english_text, "ar", "ae", True
+        is_non_english, detected_lang = self._language_detector.is_non_english(text)
+
+        if not is_non_english:
+            # English - no translation needed
+            logger.info(f"[FAST PATH] LanguageDetector: English, skipping LLM")
+            return text, "en", None, True
+
+        if detected_lang == 'ar' or detected_lang == 'ar-franco':
+            # Arabic (script or Franco) - translate with Emirati dialect
+            logger.info(f"[FAST PATH] LanguageDetector: {detected_lang}, translating to English")
+            english_text = await self._translate_arabic_to_english(text, session_id)
+            return english_text, "ar", "ae", True
         
         # ═══════════════════════════════════════════════════════════════════
         # NORMAL PATH: LLM-based detection and translation

@@ -27,6 +27,7 @@ from patient_ai_service.core.feature_flags import FeatureFlags
 from patient_ai_service.core.llm_config import get_llm_config_manager, LLMConfig
 from patient_ai_service.core.reasoning import get_reasoning_engine, ReasoningEngine, ReasoningOutput
 from patient_ai_service.core.conversation_memory import get_conversation_memory_manager
+from patient_ai_service.core.native_language_memory import get_native_language_memory_manager
 from patient_ai_service.core.observability import get_observability_logger, clear_observability_logger
 from patient_ai_service.core.unified_reasoning import (
     UnifiedReasoning,
@@ -103,6 +104,7 @@ class Orchestrator:
         self.state_manager = get_state_manager()
         self.message_broker = get_message_broker()
         self.memory_manager = get_conversation_memory_manager()
+        self.native_memory_manager = get_native_language_memory_manager()
         self.db_client = db_client or DbOpsClient()
         self.llm_config_manager = get_llm_config_manager()
         
@@ -189,7 +191,7 @@ class Orchestrator:
         Returns:
             Natural response in the user's language/dialect
         """
-        name = patient_name or "thier"
+        name = patient_name or "Unknown"
 
         # Build language instruction
         lang_instruction = ""
@@ -252,7 +254,9 @@ They said: "{message}"
 
 {context}{registration_hint}{conversation_context}
 
-Keep your response to 1-2 sentences maximum. Be warm and natural.{lang_instruction}
+1- RESPOND WARMTH AND NATURALLY 
+2- KEEP IT CONCISE: 1-2 sentences maximum
+3- RESPOND IN SAME USER LANGUAGE AND DIALECT
 
 Your response:"""
 
@@ -831,7 +835,18 @@ Respond in JSON format:
             logger.info("ORCHESTRATOR STEP 3: Add to Memory")
             logger.info("-" * 100)
             with obs_logger.pipeline_step(3, "add_to_memory", "memory_manager", {"message": english_message[:100]}) if obs_logger else nullcontext():
+                # Store in ConversationMemory (English - for Unified Reasoning & _think())
                 self.memory_manager.add_user_turn(session_id, english_message)
+                logger.info(f"📝 [ConversationMemory] Stored user turn (English): {english_message[:80]}...")
+
+                # Also store in NativeLanguageMemory (Original language - for response generators)
+                self.native_memory_manager.add_user_turn(
+                    session_id=session_id,
+                    content=message,  # Original message before translation
+                    language=detected_lang,
+                    dialect=detected_dialect
+                )
+                logger.info(f"📝 [NativeLanguageMemory] Stored user turn ({detected_lang}): {message[:80]}...")
             step3_duration = (time.time() - step3_start) * 1000
             logger.info(f"Step 3 completed in {step3_duration:.2f}ms")
 
@@ -944,15 +959,20 @@ Respond in JSON format:
                 logger.info(f"⚡ [Fast Path] [{fast_path_timestamp}] Situation: {unified_output.situation_type.value}")
 
                 with obs_logger.pipeline_step(5, "fast_path_routing", "orchestrator", {"situation": unified_output.situation_type.value}) if obs_logger else nullcontext():
-                    # Get conversation history for context-aware response
+                    # Get conversation history from NativeLanguageMemory for context-aware response
+                    # This provides original language context for better tone matching
+                    native_turns = self.native_memory_manager.get_recent_turns(session_id, limit=4)
+                    logger.info(f"🔍 [_conversational_response] Retrieved {len(native_turns)} turns from NativeLanguageMemory")
+                    if native_turns:
+                        logger.info(f"🔍 [_conversational_response] Language: {native_turns[0].get('language', 'unknown')}")
                     conversation_history = [
                         {
-                            "role": t["role"], 
+                            "role": t["role"],
                             "content": t["content"],
                             "timestamp": t.get("timestamp")
                         }
-                        for t in recent_turns[-4:]
-                    ] if recent_turns else None
+                        for t in native_turns
+                    ] if native_turns else None
 
                     conv_start = time.time()
                     english_response, conv_tokens = await self._conversational_response(
@@ -990,10 +1010,19 @@ Respond in JSON format:
 
                 # Add assistant message to memory
                 with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
+                    # Store in ConversationMemory (English - for Unified Reasoning & _think())
                     self.memory_manager.add_assistant_turn(
                         session_id=session_id,
                         content=english_response
                     )
+                    logger.info(f"📝 [ConversationMemory] Stored assistant turn: {english_response[:80]}...")
+
+                    # Also store in NativeLanguageMemory (for response generators)
+                    self.native_memory_manager.add_assistant_turn(
+                        session_id=session_id,
+                        content=english_response  # Already in target language
+                    )
+                    logger.info(f"📝 [NativeLanguageMemory] Stored assistant turn ({language_context.current_language}): {english_response[:80]}...")
 
                 total_duration = (time.time() - pipeline_start_time) * 1000
                 
@@ -1057,8 +1086,12 @@ Respond in JSON format:
                     with obs_logger.pipeline_step(5, "information_collection_response", "orchestrator",
                                                   {"information_needed": information_collection.get('information_needed', 'N/A')}) if obs_logger else nullcontext():
 
-                        # Get recent messages (last 8 for context)
-                        recent_messages = self._get_recent_turns(session_id, limit=8)
+                        # Get recent messages from NativeLanguageMemory (last 8 for context)
+                        # This provides original language context for better tone matching
+                        recent_messages = self.native_memory_manager.get_recent_turns(session_id, limit=8)
+                        logger.info(f"🔍 [_information_collection_response] Retrieved {len(recent_messages)} turns from NativeLanguageMemory")
+                        if recent_messages:
+                            logger.info(f"🔍 [_information_collection_response] Language: {recent_messages[0].get('language', 'unknown')}")
 
                         # Get language context
                         global_state = self.state_manager.get_global_state(session_id)
@@ -1241,7 +1274,16 @@ Respond in JSON format:
                                 logger.info(f"⚡ [Information Collection] ✅ information_needed persisted: {information_collection.get('information_needed', 'ERROR')}")
 
                             # Add response to memory
+                            # Store in ConversationMemory (English - for Unified Reasoning & _think())
                             self.memory_manager.add_assistant_turn(session_id, english_response)
+                            logger.info(f"📝 [ConversationMemory] Stored assistant turn: {english_response[:80]}...")
+
+                            # Also store in NativeLanguageMemory (for response generators)
+                            self.native_memory_manager.add_assistant_turn(
+                                session_id=session_id,
+                                content=english_response  # Already in target language
+                            )
+                            logger.info(f"📝 [NativeLanguageMemory] Stored assistant turn ({language_context.current_language}): {english_response[:80]}...")
 
                             step5_duration = (time.time() - step5_start) * 1000
                             logger.info(f"Step 5 completed in {step5_duration:.2f}ms")
@@ -1676,7 +1718,19 @@ Respond in JSON format:
             logger.info("ORCHESTRATOR STEP 12: Add Assistant Response to Memory")
             logger.info("-" * 100)
             with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
-                self.memory_manager.add_assistant_turn(session_id, english_response)
+                # Store in ConversationMemory (English - for Unified Reasoning & _think())
+                # Use suggested_response from execution_log (pre-humanization English)
+                # Fallback to english_response if suggested_response not available
+                response_for_conv_memory = execution_log.suggested_response if execution_log.suggested_response else english_response
+                self.memory_manager.add_assistant_turn(session_id, response_for_conv_memory)
+                logger.info(f"📝 [ConversationMemory] Stored {'suggested' if execution_log.suggested_response else 'final'} response: {response_for_conv_memory[:80]}...")
+
+                # Also store in NativeLanguageMemory (for response generators)
+                self.native_memory_manager.add_assistant_turn(
+                    session_id=session_id,
+                    content=english_response  # Humanized response in target language
+                )
+                logger.info(f"📝 [NativeLanguageMemory] Stored humanized response ({language_context.current_language}): {english_response[:80]}...")
             step12_duration = (time.time() - step12_start) * 1000
             logger.info(f"Step 12 completed in {step12_duration:.2f}ms")
 

@@ -17,6 +17,7 @@ redis==5.0.1  # Optional, for production state management
 python-multipart==0.0.9  # For form data
 pyyaml>=6.0  # For LLM configuration YAML parsing
 rapidfuzz==3.6.1  # For fuzzy name matching in multilingual environment
+langdetect>=1.0.9  # For enhanced language detection with fallback support
 
 # Development
 pytest==7.4.4
