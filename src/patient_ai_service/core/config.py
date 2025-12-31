@@ -34,7 +34,10 @@ class ArchitectureV2Settings(BaseSettings):
     enable_tool_result_override: bool = False  # When enabled, FATAL/USER_INPUT/SYSTEM_ERROR override agentic workflow
     
     # Humanizer
-    enable_humanizer: bool = True  # When enabled, suggested_response passes through _humanize_response for natural, conversational responses
+    enable_humanizer: bool = False  # When enabled, suggested_response passes through _humanize_response for natural, conversational responses
+    
+    # Output Translation
+    enable_output_translation: bool = True  # When enabled, agent responses are translated to user's language via _translate_output
 
     # Situation Assessor
     assessor_confidence_threshold: float = 0.7

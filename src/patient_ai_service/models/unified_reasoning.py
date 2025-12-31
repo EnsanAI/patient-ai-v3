@@ -38,6 +38,12 @@ class UnifiedReasoningOutput(BaseModel):
     route_type: RouteType
     situation_type: SituationType
 
+    # For unclear_request fast_path: why it's unclear/what needs clarity
+    why_unclear: Optional[str] = Field(
+        None,
+        description="For unclear_request situations: explanation of why the request is unclear or what specific information is needed for clarification"
+    )
+
     # Only for agent routing (None for fast_path)
     confidence: Optional[float] = None
     agent: Optional[str] = None
@@ -56,11 +62,12 @@ class UnifiedReasoningOutput(BaseModel):
     #   - None: Route to agent normally
 
     @classmethod
-    def fast_path(cls, situation_type: SituationType) -> "UnifiedReasoningOutput":
+    def fast_path(cls, situation_type: SituationType, why_unclear: Optional[str] = None) -> "UnifiedReasoningOutput":
         """Factory for fast-path responses."""
         return cls(
             route_type=RouteType.FAST_PATH,
-            situation_type=situation_type
+            situation_type=situation_type,
+            why_unclear=why_unclear
         )
 
     def needs_agent(self) -> bool:

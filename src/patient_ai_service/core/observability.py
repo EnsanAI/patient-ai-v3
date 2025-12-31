@@ -353,7 +353,9 @@ class ObservabilityLogger:
         logger.info(f"🔍 [Observability]   - Cache creation: {tokens.cache_creation_input_tokens}")
         logger.info(f"🔍 [Observability]   - Cache read: {tokens.cache_read_input_tokens}")
         logger.info(f"🔍 [Observability]   - Regular (calculated): {tokens.regular_input_tokens}")
-        logger.info(f"🔍 [Observability]   - Output: {tokens.output_tokens}")
+        logger.info(f"🔍 [Observability]   - Total output: {tokens.output_tokens}")
+        logger.info(f"🔍 [Observability]   - Thinking: {tokens.thinking_tokens}")
+        logger.info(f"🔍 [Observability]   - Regular output: {tokens.regular_output_tokens}")
         
         # VALIDATION: Verify token math
         expected_regular = tokens.input_tokens - tokens.cache_creation_input_tokens - tokens.cache_read_input_tokens
@@ -371,6 +373,7 @@ class ObservabilityLogger:
             logger.info(f"🔍 [Observability]   - Cache creation cost: ${cost.cache_creation_cost_usd:.6f}")
             logger.info(f"🔍 [Observability]   - Cache read cost: ${cost.cache_read_cost_usd:.6f}")
             logger.info(f"🔍 [Observability]   - Output cost: ${cost.output_cost_usd:.6f}")
+            logger.info(f"🔍 [Observability]   - Thinking cost: ${cost.thinking_cost_usd:.6f}")
             logger.info(f"🔍 [Observability]   - Total cost: ${cost.total_cost_usd:.6f}")
         
         # Track tokens
@@ -1029,6 +1032,26 @@ class ObservabilityLogger:
             
             if settings.cost_tracking_enabled and total_cache_savings > 0:
                 logger.info(f"Cache Savings: ${total_cache_savings:.6f}")
+
+        # EXTENDED THINKING METRICS
+        total_thinking_tokens = sum(call.tokens.thinking_tokens for call in self._llm_calls)
+        total_thinking_cost = sum(call.cost.thinking_cost_usd for call in self._llm_calls)
+
+        if total_thinking_tokens > 0:
+            logger.info("\n" + "=" * 80)
+            logger.info("🧠 EXTENDED THINKING METRICS:")
+            logger.info("=" * 80)
+            logger.info(f"Thinking Tokens: {total_thinking_tokens}")
+            logger.info(f"  (Billed as output, excluded from future context)")
+
+            if settings.cost_tracking_enabled:
+                logger.info(f"Thinking Cost: ${total_thinking_cost:.6f}")
+
+                # Show percentage of total output
+                total_output = sum(call.tokens.output_tokens for call in self._llm_calls)
+                if total_output > 0:
+                    thinking_pct = (total_thinking_tokens / total_output) * 100
+                    logger.info(f"Thinking as % of output: {thinking_pct:.1f}%")
 
         # PIPELINE COST BREAKDOWN (Per Step)
         logger.info("\n" + "=" * 80)

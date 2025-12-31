@@ -383,8 +383,8 @@ class ExecutionContext:
             
             # Format result (truncate if too long - 1000 chars to preserve important fields)
             result_str = json.dumps(obs.result, indent=2, default=str)
-            if len(result_str) > 1000:
-                result_str = result_str[:1000] + "..."
+            if len(result_str) > 600:
+                result_str = result_str[:600] + "..."
             
             lines.append(
                 f"[Iteration {obs.iteration}] {status} {obs.type}: {obs.name} {result_type_str}\n"
@@ -1034,7 +1034,9 @@ Output ONLY valid JSON."""
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=plan_temperature,
-                max_tokens=plan_max_tokens
+                max_tokens=plan_max_tokens,
+                extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                extended_thinking_budget=llm_config.extended_thinking_budget,
             )
         else:
             response = llm_client.create_message(
@@ -1325,6 +1327,7 @@ Output ONLY valid JSON."""
                 if existing_plan_data:
                     plan = AgentPlan(**existing_plan_data)
                     logger.info(f"📋 [{self.agent_name}] Resuming plan: {plan.get_summary()}")
+                    logger.info(f"📋 [{self.agent_name}] Plan loaded with {len(plan.llm_entities)} LLM entities: {list(plan.llm_entities.keys())}")
 
                     if plan_action_str == "update_resume":
                         # Add new entities from this turn
@@ -1333,10 +1336,10 @@ Output ONLY valid JSON."""
                         logger.info(f"📋 [{self.agent_name}] Updated plan with: {list(new_entities.keys())}")
                         logger.info(f"🧠 [{self.agent_name}] Plan status: {plan.status.value}")
 
-                        # NEW: Restore llm_entities from context if resuming
-                        if context.get("llm_entities"):
-                            plan.update_llm_entities_with_fifo(context["llm_entities"])
-                            logger.info(f"📋 [{self.agent_name}] Restored {len(context['llm_entities'])} LLM entities to plan")
+                        # NOTE: llm_entities are already in the plan from storage.
+                        # Fresh entities will be fetched from GlobalState when building thinking prompt (line ~3641).
+                        # New entities will be added via update_llm_entities_with_fifo(thinking.llm_delta) during execution (line ~1467).
+                        # Removed problematic "restoration" code that was filling FIFO with stale context duplicates.
 
                         self.state_manager.store_agent_plan(session_id, plan)
                 else:
@@ -1383,6 +1386,8 @@ Output ONLY valid JSON."""
             "selected_option": context.get("selected_option"),
             "action": context.get("action", context.get("routing_action", "")),
             "planning_enabled": planning_enabled,  # Track for debugging
+            # NEW: Unified reasoning output fields
+            "situation_type": context.get("situation_type"),  # From unified reasoning
         }
         
         # Load continuation context if resuming
@@ -2501,7 +2506,7 @@ Output ONLY valid JSON."""
         The thinking prompt is now built using a 3-layer approach:
         - Layer 1 (cached): get_universal_system_content()
         - Layer 2 (not cached): _get_thinking_system_prompt(exec_context)
-        - Layer 3 (dynamic): _build_thinking_prompt(message, context, exec_context)
+        - Layer 3 (dynamic): _build_thinking_prompt(session_id, message, context, exec_context)
         
         This method is kept for backward compatibility but should not be called.
         Use _get_thinking_system_prompt() and _build_thinking_prompt() instead.
@@ -3059,7 +3064,9 @@ Respond with JSON:
                     system=system_prompt,
                     messages=[{"role": "user", "content": "Verify task completion."}],
                     temperature=verification_temperature,
-                    max_tokens=llm_config.max_tokens
+                    max_tokens=llm_config.max_tokens,
+                    extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                    extended_thinking_budget=llm_config.extended_thinking_budget,
                 )
             else:
                 response = llm_client.create_message(
@@ -3205,7 +3212,9 @@ FORBIDDEN:
                         "content": user_message
                     }],
                     temperature=response_temperature,
-                    max_tokens=llm_config.max_tokens
+                    max_tokens=llm_config.max_tokens,
+                    extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                    extended_thinking_budget=llm_config.extended_thinking_budget,
                 )
             else:
                 response = llm_client.create_message(
@@ -3615,6 +3624,7 @@ RETRY:
 
     def _build_thinking_prompt(
         self,
+        session_id: str,
         message: str,
         context: Dict[str, Any],
         exec_context: ExecutionContext
@@ -3634,7 +3644,12 @@ RETRY:
         # Extract context fields
         user_intent = context.get('user_intent') or context.get('what_user_means', 'Not specified')
         entities = context.get('entities', {})  # Internal use only (NOT shown in prompt)
-        llm_entities = context.get('llm_entities', {})  # NEW: ISOLATED LLM-only entities
+
+        # FIXED: Fetch fresh llm_entities from GlobalState instead of stale context snapshot
+        # This ensures LLM always sees current entities after FIFO evictions
+        llm_entities = self.state_manager.get_llm_entities(session_id)
+        logger.info(f"🔄 [{self.agent_name}] Fetched fresh llm_entities from GlobalState: {list(llm_entities.keys())} (count: {len(llm_entities)})")
+
         constraints = context.get('constraints', [])
         routing_action = context.get('routing_action', context.get('action', 'Not specified'))
 
@@ -3646,6 +3661,8 @@ RETRY:
 
         # Build continuation section if applicable (unified reasoning v3)
         continuation_section = ""
+        info_section = ""  # Initialize outside to avoid UnboundLocalError
+
         if context.get('is_continuation', False):
             continuation_type = context.get('continuation_type') or context.get('situation_type')
             selected_option = context.get('selected_option')
@@ -3655,7 +3672,6 @@ RETRY:
             information_collection = continuation_ctx.get('information_collection', {})
 
             # Build information collection section if applicable
-            info_section = ""
             if information_collection and information_collection.get('information_needed'):
                 collected = information_collection.get('collected_information', [])
                 info_section = f"""
@@ -3684,21 +3700,33 @@ Collected Information:
         else:
             formatted_entities = "  (empty - start fresh or patient_id will be injected)"
 
+        # Extract patient identifier
+        patient_id = llm_entities.get('patient_id') or entities.get('patient_id', 'unknown not registered yet')
+
+        # Extract unified reasoning output fields
+        situation_type = context.get('situation_type')
+        is_continuation = context.get('is_continuation', False)
+        
         # Assemble complete dynamic prompt with JSON schema
         prompt = f"""
 ═══════════════════════════════════════════════════════════════════════════════
 CURRENT SITUATION
 ═══════════════════════════════════════════════════════════════════════════════
 
-User's Message: {message}
+Patient's Phone Number through they are speaking: {session_id}
+Patient ID: {patient_id}
 
-Identidfied Intent: {routing_action} | {user_intent}
+Patient's Message: {message}
 
+#TRUSTED_SOURCE
+Identified Intent: {routing_action} | {user_intent}
+Situation Type: {situation_type or 'Not specified'}
+Is Continuation: {is_continuation}
 
-COLLECTED ENTITIES:
+ENTITIES:
 {formatted_entities}
 
-
+{info_section}
 ═══════════════════════════════════════════════════════════════════════════════
 EXECUTION STATUS
 ═══════════════════════════════════════════════════════════════════════════════
@@ -4759,8 +4787,8 @@ DECISION RULES:
         # STEP 2: BUILD THINKING PROMPT
         # ═════════════════════════════════════════════════════════════════════
         logger.info(f"🧠 [{self.agent_name}] [STEP 2/5] Building thinking prompt...")
-        
-        prompt = self._build_thinking_prompt(message, context, exec_context)
+
+        prompt = self._build_thinking_prompt(session_id, message, context, exec_context)
                 
         # ═════════════════════════════════════════════════════════════════════
         # STEP 3: PREPARE LLM CALL
@@ -4780,9 +4808,9 @@ DECISION RULES:
         
         # Layer 2: Agent-specific (not cached)
         agent_content = self._get_thinking_system_prompt(exec_context)
-        
+
         # Layer 3: Dynamic (user prompt)
-        dynamic_prompt = self._build_thinking_prompt(message, context, exec_context)
+        dynamic_prompt = self._build_thinking_prompt(session_id, message, context, exec_context)
         
         # Check if caching is enabled and client supports it
         use_caching = (
@@ -4827,7 +4855,9 @@ DECISION RULES:
                     system_dynamic=agent_content,
                     messages=[{"role": "user", "content": dynamic_prompt}],
                     temperature=llm_config.temperature,
-                    max_tokens=llm_config.max_tokens
+                    max_tokens=llm_config.max_tokens,
+                    extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                    extended_thinking_budget=llm_config.extended_thinking_budget,
                 )
                 
                 # Log cache status
@@ -4844,7 +4874,9 @@ DECISION RULES:
                         system=system_prompt,
                         messages=[{"role": "user", "content": dynamic_prompt}],
                         temperature=llm_config.temperature,
-                        max_tokens=llm_config.max_tokens
+                        max_tokens=llm_config.max_tokens,
+                        extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                        extended_thinking_budget=llm_config.extended_thinking_budget,
                     )
                 else:
                     response = llm_client.create_message(
@@ -5779,7 +5811,9 @@ DECISION RULES:
                     system=prompt,
                     messages=messages,
                     temperature=response_temperature,
-                    max_tokens=llm_config.max_tokens
+                    max_tokens=llm_config.max_tokens,
+                    extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                    extended_thinking_budget=llm_config.extended_thinking_budget,
                 )
             else:
                 response = llm_client.create_message(
@@ -5939,6 +5973,8 @@ DECISION RULES:
             user_intent_section = f"\nUSER INTENT: {user_intent}\n"
 
         user_prompt = f"""
+
+YOUR TASK:
 Patient name: {patient_name}
 
 {user_intent_section}
@@ -5967,7 +6003,9 @@ Response:"""
                     system=HUMANIZE_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": user_prompt}],
                     temperature=llm_config.temperature,
-                    max_tokens=100
+                    max_tokens=100,
+                    extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                    extended_thinking_budget=llm_config.extended_thinking_budget,
                 )
             else:
                 response = llm_client.create_message(
@@ -6238,27 +6276,19 @@ Response:"""
         
         lang_instruction = ""
         if language == "ar":
-            # IMPORTANT: Always use Emirati Arabic for Arabic responses
-            dialect = dialect or "ae"  # Force Emirati if dialect is None
-            dialect_map = {"ae": "Emirati Arabic (UAE)", "sa": "Saudi Arabic", "eg": "Egyptian Arabic", "lv": "Levantine Arabic"}
-            dialect_name = dialect_map.get(dialect, "Emirati Arabic (UAE)")  # Default to Emirati
-            lang_instruction = f"Respond in {dialect_name}. Use natural, conversational Arabic."
+            lang_instruction = "- Respond in Emirati Arabic (UAE). Use natural, colloquial Emirati Arabic. authentic but not slangy - professionally warm."
         elif language == "en":
-            lang_instruction = "Respond in English."
+            lang_instruction = "- Respond in English."
         else:
-            lang_instruction = f"Respond in {language}."
+            lang_instruction = f"- Respond in EXACT user Language from RECENT CONVERSATION"
         
         return f"""Generate a {tone} response confirming what was accomplished.
 
 PATIENT CONTEXT:
-{patient_context.get_prompt_context()}
 {address_instruction}
 
 WHAT WAS DONE:
 {response_data.completion_summary or "Task completed"}
-
-DETAILS:
-{details_formatted}
 
 EXECUTION LOG:
 {execution_summary}
@@ -6266,14 +6296,12 @@ EXECUTION LOG:
 RECENT CONVERSATION:
 {recent_context}
 
-RULES:
-- Confirm the action was completed
-- Include key details (confirmation number, date, time, etc.)
-- Be warm but concise
-- No technical details or UUIDs
+RESPONSE RULES:
+- Include key details (NO IDs OR LONG NUMBER STRINGS)
+- Be warm and concise
+- Response in continuation for "RECENT CONVERSATION" so no new greetings needed
 - Be conversational and natural, but avoid redundancy - don't repeat what was already said
-- DO NOT invent patient names
-- 2-3 sentences
+- DO NOT invent any information
 - {lang_instruction}
 
 OUTPUT FORMAT:

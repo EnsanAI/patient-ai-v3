@@ -26,6 +26,11 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "input": 0.25,  # $0.25 per 1M input tokens
         "output": 1.25  # $1.25 per 1M output tokens
     },
+    "claude-haiku-4-5-20251001": {
+        "input": 0.10,    # $0.10 per 1M input tokens
+        "output": 0.50,   # $0.50 per 1M output tokens
+        "thinking": 0.50  # Same as output (thinking billed as output)
+    },
     # OpenAI models
     "gpt-4o-mini": {
         "input": 0.15,  # $0.15 per 1M input tokens
@@ -55,6 +60,10 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "input": 1.10,  # $1.10 per 1M input tokens
         "output": 4.40  # $4.40 per 1M output tokens
     },
+    "gpt-4.1-mini-2025-04-14": {
+        "input": 0.40,  # $0.15 per 1M input tokens
+        "output": 1.60  # $0.60 per 1M output tokens
+    },
     # Default fallback pricing (use Haiku pricing as conservative estimate)
     "default": {
         "input": 0.25,
@@ -73,6 +82,13 @@ ANTHROPIC_PRICING = {
     "claude-3-5-sonnet-20241022": {
         "input_per_million": 3.00,
         "output_per_million": 15.00,
+        "cache_write_multiplier": 1.25,
+        "cache_read_multiplier": 0.10,
+    },
+    "claude-haiku-4-5-20251001": {
+        "input_per_million": 1.0,
+        "output_per_million": 5.0,
+        "thinking_per_million": 5.0,  # Thinking billed as output
         "cache_write_multiplier": 1.25,
         "cache_read_multiplier": 0.10,
     },
@@ -108,6 +124,10 @@ OPENAI_PRICING = {
         "input_per_million": 1.10,
         "output_per_million": 4.40,
     },
+    "gpt-4.1-mini-2025-04-14": {
+        "input_per_million": 0.15,
+        "output_per_million": 0.60,
+    },
 }
 
 
@@ -137,36 +157,43 @@ class CostCalculator:
             return CostInfo(model=model, provider=provider)
     
     def _calculate_anthropic_cost(self, tokens: TokenUsage, model: str) -> CostInfo:
-        """Calculate Anthropic costs with cache pricing."""
+        """Calculate Anthropic costs with cache pricing and thinking tokens."""
         pricing = ANTHROPIC_PRICING.get(model, ANTHROPIC_PRICING.get("claude-sonnet-4-5-20250929"))
-        
+
         input_rate = pricing["input_per_million"] / 1_000_000
         output_rate = pricing["output_per_million"] / 1_000_000
+        thinking_rate = pricing.get("thinking_per_million", output_rate) / 1_000_000  # Thinking defaults to output rate
         cache_write_mult = pricing.get("cache_write_multiplier", 1.25)
         cache_read_mult = pricing.get("cache_read_multiplier", 0.10)
-        
+
         # Calculate each component
         regular_input_tokens = tokens.regular_input_tokens
         regular_input_cost = regular_input_tokens * input_rate
-        
+
         cache_creation_cost = tokens.cache_creation_input_tokens * input_rate * cache_write_mult
         cache_read_cost = tokens.cache_read_input_tokens * input_rate * cache_read_mult
-        
+
+        # Thinking tokens are billed at output token rate
+        thinking_cost = tokens.thinking_tokens * thinking_rate
+
+        # Regular output cost (output_tokens already includes thinking_tokens in the total)
         output_cost = tokens.output_tokens * output_rate
-        
-        # Total input cost is sum of all input components
+
+        # Total costs
         total_input_cost = regular_input_cost + cache_creation_cost + cache_read_cost
-        total_cost = total_input_cost + output_cost
-        
+        total_output_cost = output_cost + thinking_cost  # Include thinking in output cost
+        total_cost = total_input_cost + total_output_cost
+
         return CostInfo(
             input_cost_usd=round(total_input_cost, 6),
-            output_cost_usd=round(output_cost, 6),
+            output_cost_usd=round(total_output_cost, 6),
             total_cost_usd=round(total_cost, 6),
             model=model,
             provider="anthropic",
             cache_creation_cost_usd=round(cache_creation_cost, 6),
             cache_read_cost_usd=round(cache_read_cost, 6),
             regular_input_cost_usd=round(regular_input_cost, 6),
+            thinking_cost_usd=round(thinking_cost, 6),
         )
     
     def _calculate_openai_cost(self, tokens: TokenUsage, model: str) -> CostInfo:

@@ -865,24 +865,34 @@ class StateManager:
         """
         state = self.get_agentic_state(session_id)
 
-        # Check if continuation_context exists and has an awaiting field
-        # IMPORTANT: Don't use falsy check - empty string "" is valid for "no continuation"
-        # but we should explicitly check for None or empty ContinuationContext
-        if state.continuation_context and state.continuation_context.awaiting:
+        # Check if continuation_context exists
+        if state.continuation_context:
+            # Return if awaiting is active (normal case)
+            if state.continuation_context.awaiting:
+                context_dict = state.continuation_context.model_dump()
+
+                # DEFENSIVE: Validate structure for information collection
+                if context_dict.get('awaiting') == 'information':
+                    info_collection = context_dict.get('information_collection', {})
+                    if not info_collection or 'information_needed' not in info_collection:
+                        logger.error("=" * 80)
+                        logger.error("📥 CRITICAL: Retrieved context has awaiting='information' but missing information_needed!")
+                        logger.error(f"📥 Context: {context_dict}")
+                        logger.error(f"📥 This indicates state corruption during save/load")
+                        logger.error("=" * 80)
+                        # Still return it so caller can handle, but log prominently
+
+                return context_dict
+
+            # ALSO return if awaiting is cleared BUT there's completed information collection
+            # This handles the case where collection_complete=True cleared awaiting
+            # but we still need to pass the collected information to the agent
             context_dict = state.continuation_context.model_dump()
-
-            # DEFENSIVE: Validate structure for information collection
-            if context_dict.get('awaiting') == 'information':
-                info_collection = context_dict.get('information_collection', {})
-                if not info_collection or 'information_needed' not in info_collection:
-                    logger.error("=" * 80)
-                    logger.error("📥 CRITICAL: Retrieved context has awaiting='information' but missing information_needed!")
-                    logger.error(f"📥 Context: {context_dict}")
-                    logger.error(f"📥 This indicates state corruption during save/load")
-                    logger.error("=" * 80)
-                    # Still return it so caller can handle, but log prominently
-
-            return context_dict
+            info_collection = context_dict.get('information_collection', {})
+            if info_collection and info_collection.get('collection_status') == 'complete':
+                logger.info("📥 Returning continuation_context with completed information collection")
+                logger.info(f"📥 Collected information: {info_collection.get('collected_information', [])}")
+                return context_dict
 
         logger.debug(f"📥 get_continuation_context: No active continuation for session {session_id}")
         return None
@@ -1273,6 +1283,7 @@ class StateManager:
         logger.info(f"🔍 Status: {plan.status}")
         logger.info(f"🔍 Objective: {plan.objective[:100] if plan.objective else 'None'}")
         logger.info(f"🔍 Entities: {list(plan.entities.keys()) if plan.entities else '[]'}")
+        logger.info(f"🔍 LLM Entities: {list(plan.llm_entities.keys()) if plan.llm_entities else '[]'} (count: {len(plan.llm_entities)})")
 
         if not isinstance(plan, AgentPlan):
             logger.error(f"📋 [StateManager] Invalid plan type: {type(plan)}")

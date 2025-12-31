@@ -12,11 +12,14 @@ class TokenUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    
+
     # Cache tracking (Anthropic-specific)
     cache_creation_input_tokens: int = 0  # Tokens written to cache (1.25x cost)
     cache_read_input_tokens: int = 0       # Tokens read from cache (0.1x cost)
-    
+
+    # Extended Thinking tracking (Anthropic-specific)
+    thinking_tokens: int = 0  # Internal reasoning tokens (billed as output)
+
     @property
     def cache_hit_rate(self) -> float:
         """Calculate cache hit rate (0.0 to 1.0)."""
@@ -24,12 +27,17 @@ class TokenUsage(BaseModel):
         if total_cacheable == 0:
             return 0.0
         return self.cache_read_input_tokens / total_cacheable
-    
+
     @property
     def regular_input_tokens(self) -> int:
         """Input tokens not involved in caching."""
         return self.input_tokens - self.cache_creation_input_tokens - self.cache_read_input_tokens
-    
+
+    @property
+    def regular_output_tokens(self) -> int:
+        """Output tokens excluding thinking tokens."""
+        return self.output_tokens - self.thinking_tokens
+
     def __add__(self, other: "TokenUsage") -> "TokenUsage":
         """Add two TokenUsage instances."""
         return TokenUsage(
@@ -38,6 +46,7 @@ class TokenUsage(BaseModel):
             total_tokens=self.total_tokens + other.total_tokens,
             cache_creation_input_tokens=self.cache_creation_input_tokens + other.cache_creation_input_tokens,
             cache_read_input_tokens=self.cache_read_input_tokens + other.cache_read_input_tokens,
+            thinking_tokens=self.thinking_tokens + other.thinking_tokens,
         )
 
 
@@ -48,12 +57,15 @@ class CostInfo(BaseModel):
     total_cost_usd: float = 0.0
     model: str = ""
     provider: str = ""
-    
+
     # Cache cost breakdown
     cache_creation_cost_usd: float = 0.0  # Cost of writing to cache (1.25x)
     cache_read_cost_usd: float = 0.0       # Cost of reading from cache (0.1x)
     regular_input_cost_usd: float = 0.0    # Cost of non-cached input tokens
-    
+
+    # Extended Thinking cost breakdown
+    thinking_cost_usd: float = 0.0  # Cost of thinking tokens (output rate)
+
     @property
     def cache_savings_usd(self) -> float:
         """Estimated savings from cache hits vs full price."""
@@ -64,7 +76,7 @@ class CostInfo(BaseModel):
             full_price = self.cache_read_cost_usd * 10
             return full_price - self.cache_read_cost_usd
         return 0.0
-    
+
     def __add__(self, other: "CostInfo") -> "CostInfo":
         """Add two CostInfo instances."""
         return CostInfo(
@@ -76,6 +88,7 @@ class CostInfo(BaseModel):
             cache_creation_cost_usd=self.cache_creation_cost_usd + other.cache_creation_cost_usd,
             cache_read_cost_usd=self.cache_read_cost_usd + other.cache_read_cost_usd,
             regular_input_cost_usd=self.regular_input_cost_usd + other.regular_input_cost_usd,
+            thinking_cost_usd=self.thinking_cost_usd + other.thinking_cost_usd,
         )
 
 

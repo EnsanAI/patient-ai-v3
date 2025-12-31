@@ -25,9 +25,10 @@ class GeneralAssistantAgent(BaseAgent):
     - Guide patients to appropriate services
     """
 
-    def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
+    def __init__(self, db_client: Optional[DbOpsClient] = None, appointment_manager=None, **kwargs):
         super().__init__(agent_name="GeneralAssistant", **kwargs)
         self.db_client = db_client or DbOpsClient()
+        self.appointment_manager = appointment_manager  # Will be set by orchestrator if needed
 
     def _register_tools(self):
         """Register general assistant tools."""
@@ -106,6 +107,40 @@ class GeneralAssistantAgent(BaseAgent):
             }
         )
 
+        # Find doctor by name (with fuzzy matching)
+        self.register_tool(
+            name="find_doctor_by_name",
+            function=self.tool_find_doctor_by_name,
+            description="Find a doctor by name using fuzzy matching. Handles variations in spelling, transliterations, and multilingual names (e.g., 'Mohamed' vs 'Mohammed', 'mo7amed')",
+            parameters={
+                "doctor_name": {
+                    "type": "string",
+                    "description": "Doctor's name to search for (e.g., 'Dr. Ahmed', 'Mohammed Atef', 'mo7amed')"
+                }
+            }
+        )
+
+        # Check doctor availability
+        self.register_tool(
+            name="check_doctor_availability",
+            function=self.tool_check_doctor_availability,
+            description="Check if a doctor is available on a specific date and optionally at a specific time. Requires doctor_id (use find_doctor_by_name first to get the ID)",
+            parameters={
+                "doctor_id": {
+                    "type": "string",
+                    "description": "Doctor's UUID (obtained from find_doctor_by_name or get_doctors)"
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Date to check availability in YYYY-MM-DD format (e.g., '2024-03-15')"
+                },
+                "requested_time": {
+                    "type": "string",
+                    "description": "Optional specific time to check. Supports formats like '14:00', '2pm', '14:30' (24-hour or 12-hour with AM/PM)"
+                }
+            }
+        )
+
     def _get_system_prompt(self, session_id: str) -> str:
         """Generate system prompt for general assistant."""
         global_state = self.state_manager.get_global_state(session_id)
@@ -144,6 +179,8 @@ WHAT YOU CAN HELP WITH:
 ✓ Clinic information (location, hours, contact)
 ✓ Services and procedures offered (use get_services tool)
 ✓ Doctor information and specialties (use get_doctors and get_doctor_info tools)
+✓ Finding doctors by name (use find_doctor_by_name tool for fuzzy matching)
+✓ Checking doctor availability (use check_doctor_availability tool)
 ✓ Specific procedure details, prices, and descriptions (use get_procedure_info tool)
 ✓ Insurance and payment options
 ✓ General dental health information
@@ -152,6 +189,8 @@ WHAT YOU CAN HELP WITH:
 
 IMPORTANT: When users ask about:
 - **Doctors**: ALWAYS use get_doctors or get_doctor_info tool to provide accurate information
+- **Finding specific doctors by name**: Use find_doctor_by_name tool - it handles variations in spelling and transliterations (e.g., "Mohamed" vs "Mohammed", "mo7amed")
+- **Doctor availability**: Use check_doctor_availability tool with doctor_id and date. MUST get doctor_id first using find_doctor_by_name
 - **Procedures**: ALWAYS use get_services or get_procedure_info tool to provide accurate details including prices
 - **Services**: ALWAYS use get_services tool to list available procedures
 
@@ -580,7 +619,7 @@ Use your tools to provide accurate, up-to-date information!"""
         """Get detailed information about a specific dental procedure."""
         try:
             procedures = self.db_client.get_all_dental_procedures()
-            
+
             if not procedures:
                 return {
                     "success": False,
@@ -590,16 +629,16 @@ Use your tools to provide accurate, up-to-date information!"""
                     "should_retry": True,
                     "can_proceed": False
                 }
-            
+
             # Search for procedure by name (case-insensitive, partial match)
             procedure_name_lower = procedure_name.lower()
             matching_procedures = []
-            
+
             for proc in procedures:
                 proc_name = proc.get("name", "").lower()
                 if procedure_name_lower in proc_name or proc_name in procedure_name_lower:
                     matching_procedures.append(proc)
-            
+
             if not matching_procedures:
                 all_procedure_names = [p.get("name", "") for p in procedures]
                 return {
@@ -611,9 +650,9 @@ Use your tools to provide accurate, up-to-date information!"""
                     "can_proceed": False,
                     "suggested_response": f"I couldn't find a procedure called '{procedure_name}'. Our available procedures include: {', '.join(all_procedure_names[:5])}. Which one would you like to know about?"
                 }
-            
+
             procedure = matching_procedures[0]
-            
+
             return {
                 "success": True,
                 "result_type": ToolResultType.SUCCESS.value,
@@ -628,7 +667,7 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": True,
                 "next_action": "present_procedure_info_to_user"
             }
-            
+
         except Exception as e:
             logger.error(f"Error getting procedure info: {e}")
             return {
@@ -636,6 +675,94 @@ Use your tools to provide accurate, up-to-date information!"""
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
                 "error_code": "PROCEDURE_INFO_FETCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
+
+    def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
+        """
+        Find a doctor by name using the appointment manager's fuzzy matching.
+
+        Args:
+            session_id: Session identifier
+            doctor_name: Doctor's name to search for
+
+        Returns:
+            Dictionary with doctor information or error
+        """
+        try:
+            # Check if appointment manager is available
+            if not self.appointment_manager:
+                logger.warning("Appointment manager not available, falling back to basic search")
+                # Fallback to basic get_doctor_info if appointment manager not available
+                return self.tool_get_doctor_info(session_id, doctor_name)
+
+            # Use appointment manager's fuzzy matching
+            result = self.appointment_manager.tool_find_doctor_by_name(session_id, doctor_name)
+
+            # Return the result from appointment manager
+            return result
+
+        except Exception as e:
+            logger.error(f"Error finding doctor by name: {e}")
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "DOCTOR_SEARCH_FAILED",
+                "should_retry": True,
+                "can_proceed": False
+            }
+
+    def tool_check_doctor_availability(
+        self,
+        session_id: str,
+        doctor_id: str,
+        date: str,
+        requested_time: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Check doctor availability on a specific date and optionally at a specific time.
+
+        Args:
+            session_id: Session identifier
+            doctor_id: Doctor's UUID (must be obtained from find_doctor_by_name or get_doctors first)
+            date: Date in YYYY-MM-DD format
+            requested_time: Optional time to check (e.g., '14:00', '2pm', '14:30')
+
+        Returns:
+            Dictionary with availability information or error
+        """
+        try:
+            # Check if appointment manager is available
+            if not self.appointment_manager:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "Appointment manager not available",
+                    "error_code": "APPOINTMENT_MANAGER_UNAVAILABLE",
+                    "should_retry": False,
+                    "can_proceed": False,
+                    "suggested_response": "I apologize, but I cannot check doctor availability at the moment. Please try booking an appointment directly."
+                }
+
+            # Use appointment manager's availability check
+            result = self.appointment_manager.tool_check_availability(
+                session_id=session_id,
+                doctor_id=doctor_id,
+                date=date,
+                requested_time=requested_time
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error checking doctor availability: {e}")
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "error_code": "AVAILABILITY_CHECK_FAILED",
                 "should_retry": True,
                 "can_proceed": False
             }

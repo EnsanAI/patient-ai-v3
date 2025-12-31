@@ -60,6 +60,55 @@ class ScriptDetector:
         return char.isascii() and char.isalpha()
     
     @classmethod
+    def _is_numbers_only(cls, text: str) -> bool:
+        """
+        Check if text contains only digits, spaces, and punctuation.
+        
+        Args:
+            text: Input text to analyze
+            
+        Returns:
+            True if text contains only numbers, spaces, and punctuation (no letters)
+        """
+        if not text:
+            return False
+        
+        for char in text:
+            # If we find any letter (Latin or Arabic), it's not numbers-only
+            if cls._is_latin_char(char) or cls._is_arabic_char(char):
+                return False
+        
+        # Check if there's at least one digit
+        has_digit = any(char.isdigit() for char in text)
+        return has_digit
+    
+    @classmethod
+    def _has_latin_letters(cls, text: str) -> bool:
+        """
+        Check if text contains any Latin/ASCII letters.
+        
+        Args:
+            text: Input text to analyze
+            
+        Returns:
+            True if text contains at least one Latin letter
+        """
+        return any(cls._is_latin_char(char) for char in text)
+    
+    @classmethod
+    def _has_arabic_letters(cls, text: str) -> bool:
+        """
+        Check if text contains any Arabic script characters.
+        
+        Args:
+            text: Input text to analyze
+            
+        Returns:
+            True if text contains at least one Arabic letter
+        """
+        return any(cls._is_arabic_char(char) for char in text)
+    
+    @classmethod
     def detect_script(cls, text: str) -> DetectedScript:
         """
         Detect the primary script of the text.
@@ -110,6 +159,12 @@ class ScriptDetector:
         """
         Fast language detection for short, obvious messages.
         
+        Simplified logic:
+        1. Numbers only → Return None (keep previous language)
+        2. Arabic letters present → Return ar-ae
+        3. Latin letters present → Check Franco-Arabic, if not Franco-Arabic return en
+        4. No letters → Return None (keep previous language)
+        
         Args:
             text: Input text to analyze
             
@@ -125,28 +180,41 @@ class ScriptDetector:
             logger.debug(f"[ScriptDetector] Message too long ({len(text)} chars), using LLM")
             return None, None, False
         
-        script = cls.detect_script(text)
+        # 1. Check if only numbers/punctuation
+        if cls._is_numbers_only(text):
+            logger.info(f"[ScriptDetector] Numbers only → null (keeping previous language)")
+            return None, None, False
         
-        if script == DetectedScript.LATIN:
-            # In dental clinic context (UAE), Latin script = English
-            logger.info(f"[ScriptDetector] ⚡ Fast detect: LATIN script → en (no LLM needed)")
-            return "en", None, True
-        
-        elif script == DetectedScript.ARABIC:
-            # Arabic detected - default to Emirati dialect (ae)
-            # Skip dialect detection LLM call
-            logger.info(f"[ScriptDetector] ⚡ Fast detect: ARABIC script → ar-ae (no LLM needed)")
+        # 2. Check for Arabic letters
+        if cls._has_arabic_letters(text):
+            logger.info(f"[ScriptDetector] ⚡ Fast detect: ARABIC script → ar-ae")
             return "ar", "ae", True
         
-        elif script == DetectedScript.MIXED:
-            # Code-switching detected - need LLM for proper handling
-            logger.info(f"[ScriptDetector] Mixed script detected, using LLM for dialect detection")
-            return None, None, False
+        # 3. Check for Latin letters
+        if cls._has_latin_letters(text):
+            # Check for Franco-Arabic using LanguageDetector logic
+            try:
+                from patient_ai_service.agents.translation import LanguageDetector
+                detector = LanguageDetector()
+                is_non_english, detected_lang = detector.is_non_english(text)
+                
+                if detected_lang == 'ar-franco':
+                    # Franco-Arabic detected - let LLM handle it
+                    logger.info(f"[ScriptDetector] Franco-Arabic detected → null (using LLM)")
+                    return None, None, False
+                else:
+                    # Not Franco-Arabic - it's English
+                    logger.info(f"[ScriptDetector] ⚡ Fast detect: LATIN script → en")
+                    return "en", None, True
+            except Exception as e:
+                # If LanguageDetector fails, default to English for Latin script
+                logger.warning(f"[ScriptDetector] Error checking Franco-Arabic: {e}, defaulting to English")
+                logger.info(f"[ScriptDetector] ⚡ Fast detect: LATIN script → en")
+                return "en", None, True
         
-        else:
-            # Unknown script - let LLM figure it out
-            logger.debug(f"[ScriptDetector] Unknown script, using LLM")
-            return None, None, False
+        # 4. No letters found (only punctuation/emojis)
+        logger.info(f"[ScriptDetector] No letters → null (keeping previous language)")
+        return None, None, False
 
 
 # Convenience function

@@ -33,6 +33,7 @@ class SituationType(str, Enum):
     FAREWELL = "farewell"                            # Bye, goodbye
     THANKS = "thanks"                                # Thank you, thanks
     PLEASANTRY = "pleasantry"                       # How are you, etc. - Pure social exchange, NO info request
+    UNCLEAR_REQUEST = "unclear_request"             # Request is unclear or ambiguous, needs clarification
     EMERGENCY = "emergency"                          # Urgent medical situation
     
     # Additional types

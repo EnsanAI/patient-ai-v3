@@ -31,6 +31,10 @@ class LLMConfig:
     timeout: int
     prompt_cache_enabled: bool = False  # Prompt caching (Anthropic only)
 
+    # Extended Thinking (Anthropic only)
+    extended_thinking_enabled: bool = False
+    extended_thinking_budget: int = 2048  # Default budget (min 1024)
+
     def __post_init__(self):
         """Validate config values."""
         if not 0.0 <= self.temperature <= 2.0:
@@ -39,6 +43,12 @@ class LLMConfig:
             raise ValueError(f"max_tokens must be >= 1, got {self.max_tokens}")
         if self.timeout < 1:
             raise ValueError(f"timeout must be >= 1, got {self.timeout}")
+
+        # Validate extended thinking budget
+        if self.extended_thinking_enabled and self.extended_thinking_budget < 1024:
+            raise ValueError(
+                f"extended_thinking_budget must be >= 1024, got {self.extended_thinking_budget}"
+            )
 
 
 class LLMConfigManager:
@@ -224,6 +234,12 @@ class LLMConfigManager:
         # Get prompt cache configuration from global.prompt_cache.enabled
         prompt_cache_config = global_config.get("prompt_cache", {})
         prompt_cache_enabled = prompt_cache_config.get("enabled", False)
+
+        # Get extended thinking configuration from global.extended_thinking
+        extended_thinking_config = global_config.get("extended_thinking", {})
+        extended_thinking_enabled = extended_thinking_config.get("enabled", False)
+        extended_thinking_budget = extended_thinking_config.get("budget_tokens", 2048)
+
         if not model:
             # Use provider default or Settings
             if provider in provider_defaults:
@@ -280,7 +296,15 @@ class LLMConfigManager:
                 
                 if "timeout" in agent_config:
                     timeout = agent_config["timeout"]
-                
+
+                # Agent-level extended thinking override
+                if "extended_thinking" in agent_config:
+                    agent_et_config = agent_config["extended_thinking"]
+                    if "enabled" in agent_et_config:
+                        extended_thinking_enabled = agent_et_config["enabled"]
+                    if "budget_tokens" in agent_et_config:
+                        extended_thinking_budget = agent_et_config["budget_tokens"]
+
                 # Override with function-level config if provided
                 if function_name and "functions" in agent_config:
                     func_config = agent_config["functions"].get(function_name)
@@ -327,14 +351,24 @@ class LLMConfigManager:
                         
                         if "timeout" in func_config:
                             timeout = func_config["timeout"]
-        
+
+                        # Function-level extended thinking override
+                        if "extended_thinking" in func_config:
+                            func_et_config = func_config["extended_thinking"]
+                            if "enabled" in func_et_config:
+                                extended_thinking_enabled = func_et_config["enabled"]
+                            if "budget_tokens" in func_et_config:
+                                extended_thinking_budget = func_et_config["budget_tokens"]
+
         resolved_config = LLMConfig(
             provider=provider,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-            prompt_cache_enabled=prompt_cache_enabled
+            prompt_cache_enabled=prompt_cache_enabled,
+            extended_thinking_enabled=extended_thinking_enabled,
+            extended_thinking_budget=extended_thinking_budget,
         )
         
         # Debug logging for config resolution

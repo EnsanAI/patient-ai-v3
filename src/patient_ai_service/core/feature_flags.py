@@ -57,6 +57,7 @@ class FeatureFlags:
             "planning": settings.v2.enable_planning,
             "tool_result_override": settings.v2.enable_tool_result_override,
             "humanizer": getattr(settings.v2, 'enable_humanizer', False),
+            "output_translation": getattr(settings.v2, 'enable_output_translation', True),
         }
         return flag_map.get(feature, False)
     
@@ -120,4 +121,8 @@ def is_humanizer_enabled(session_id: str = None) -> bool:
 def is_translation_enabled(session_id: str = None) -> bool:
     """Check if translation is enabled."""
     return FeatureFlags.is_enabled("translation", session_id)
+
+def is_output_translation_enabled(session_id: str = None) -> bool:
+    """Check if output translation is enabled (agent response → _translate_output)."""
+    return FeatureFlags.is_enabled("output_translation", session_id)
 

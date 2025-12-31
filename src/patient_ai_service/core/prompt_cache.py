@@ -81,19 +81,25 @@ CLARIFY → Missing or unclear required info (specify: clarification_question, a
 COLLECT_INFORMATION → Need user data before continuing (specify: awaiting_info, entities)
 REQUEST_CONFIRMATION → BEFORE critical actions. Stages tool call (confirmation_action=tool_name, confirmation_details=tool_input) + confirmation_question for user
 RETRY → result_type=SYSTEM_ERROR, within retry limit
+ENTITIES:
 
-
-COLLECTED ENTITIES:
-
-How it works: 
-- Your short-term memory for fulfilling the user's request.
-- Latest entries appear at the bottom
-- Update with new important info from: user messages, tool results, or identified intents to fulfill the user's request or WILL BE NEEDED LATER
+Your short-term memory of:
+- user preferences (e.g., preferred doctor, times)
+- provided information needed to execute tool
+- Tool outputs that update user data (e.g., doctor_id, appointment_id, available_times, etc)
 
 How to update COLLECTED ENTITIES:
 - Only output NEW or CHANGED entities in entities_to_update
 - For CHANGED entities: use same key, new value
+    // for example, to update preferred_time from "morning" to "afternoon":
+    INPUT: ENTITIES: "preferred_time": "morning"
+    OUTPUT: "entities_to_update": {"preferred_time": "afternoon"} NOTE: must use same key
+- For NEW entities: use new key, value
 - Nothing new → return empty: {}
+
+FALLBACK: Complete state format (optional, if you find that that ENTITIES non-relevant to IDENTIFIED INTENT)
+    "entities": {{}},
+
 """
 
 
@@ -101,61 +107,48 @@ UNIVERSAL_OUTPUT_FORMAT = """
 OUTPUT JSON SCHEMA
 
 {
-    
-    "plan_status": {
-        "completed_tasks": [],
-        "pending_tasks": [],
-        "blocked_tasks": []
-    },
-    
+        
     "decision": "<CALL_TOOL|RESPOND_COMPLETE|RESPOND_WITH_OPTIONS|RESPOND_IMPOSSIBLE|CLARIFY|COLLECT_INFORMATION|REQUEST_CONFIRMATION|RETRY>",
-    "reasoning": "<decision rationale>",
-    "is_task_complete": <boolean>,
     
-    
-    // Include fields ONLY for your decision type:
-    // See DECISION_RESPONSE_FIELDS below
     
 }
 ═══════════════════════════════════════════════════════════════
 If CALL_TOOL - specify tool to call
- ═══════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
     "tool_name": "name of tool",
     "tool_input": {{}},
 
 // ═══════════════════════════════════════════════════════════════
-    // RESPONSE DATA - Fill based on decision type
+    // If NOT CALL_TOOL, GENERATE RESPONSE DATA - Fill based on decision type
     // ═══════════════════════════════════════════════════════════════
     "response": {{
 
         "entities_to_update": {{}} // Only new or changed entities here
-        
-        // FALLBACK: Complete state format (optional, if you find that that COLLECTED ENTITIES are too old or not useful ANYMORE for the current task)
-        "entities": {{}},
 
         CLARIFY:
             "clarification_needed": "<what's unclear>",
             "clarification_question": "<specific question>",    
 
-        COLLECT_INFORMATION:
+        IF COLLECT_INFORMATION:
+        // When you need to collect information from the user, you need to specify all the information needed in the information_needed field. These will be used to call tools.
+        // Example: "information_needed": "first_name, last_name, date_of_birth, symptoms, etc."
             "response": {
-            "information_needed": "<all pieces needed>",
-            "awaiting_info": "<what you need>",
+            "information_needed": "",
             }
 
-        RESPOND_WITH_OPTIONS:
+        IF RESPOND_WITH_OPTIONS:
 
             "options": [],
             "options_context": "<available_times|doctors|dates>",
 
 
-        RESPOND_IMPOSSIBLE:
+        IF RESPOND_IMPOSSIBLE:
 
             "failure_reason": "<why>",
             "failure_suggestion": "<alternative>"
 
 
-        RESPOND_COMPLETE:
+        IF RESPOND_COMPLETE:
             "completion_summary": "<what was done>",
             "completion_details": {
                 "appointment_id": "",
@@ -164,25 +157,21 @@ If CALL_TOOL - specify tool to call
                 "time": ""
             }
 
-        REQUEST_CONFIRMATION (staged tool call awaiting user approval):
+        IF REQUEST_CONFIRMATION (staged tool call awaiting user approval):
             "confirmation_action": "<tool_name to execute after confirmation>",
-            "confirmation_details": {<tool_input to execute after confirmation>},
+            "confirmation_details": {<tool_inputs to execute after confirmation>},
             "confirmation_question": "<human-readable summary for user>"
     }
 
     // ═══════════════════════════════════════════════════════════════
     // SUGGESTED_RESPONSE (REQUIRED for all decisions)
     // ═══════════════════════════════════════════════════════════════
-    // Generate a real, informed user-facing response. Write the EXACT
-    // message content for the patient. Include all details (names, dates,
-    // times, confirmation IDs). Write in English.
-    //
-    // Examples:
-    // - CALL_TOOL: "Looking up Dr. Mohammed's availability for tomorrow..."
-    // - RESPOND_COMPLETE: "Your appointment is confirmed with Dr. Mohammed on Dec 30 at 5pm. Confirmation: abc123"
-    // - RESPOND_WITH_OPTIONS: "The 2pm slot is taken. Available: 10am, 3pm, 5pm"
-    // - COLLECT_INFORMATION: "I need your phone number to complete registration"
-    // - CLARIFY: "Did you mean Dr. Mohammed Atef or Dr. Mohammed Ali?"
+    // 1- Generate a real, informed user-facing response. 
+    // 2- Include all details needed (names, dates, times).
+    // 3- Keep it simple and concise.
+    // 4- Keep it conversational and natural.
+    // 5- Do not include any techincal details or IDs.
+    // 6- Write in English.
 
     "suggested_response": "<complete user-facing message in English>"
 }

@@ -135,6 +135,7 @@ class AnthropicModel(str, Enum):
     """Anthropic Claude models."""
     CLAUDE_SONNET_4_5 = "claude-sonnet-4-5-20250929"
     CLAUDE_SONNET_4 = "claude-sonnet-4-20250514"
+    CLAUDE_HAIKU_4_5 = "claude-haiku-4-5-20251001"
     CLAUDE_HAIKU = "claude-3-5-haiku-20241022"
 
 
@@ -145,6 +146,7 @@ class OpenAIModel(str, Enum):
     GPT_5_MINI_2025_08_07 = "gpt-5-mini-2025-08-07"
     GPT_5_NANO_2025_08_07 = "gpt-5-nano-2025-08-07"
     O4_MINI_2025_04_16 = "o4-mini-2025-04-16"
+    GPT_41_MINI_2025_04_14 = "gpt-4.1-mini-2025-04-14"
     GPT_4O = "gpt-4o"
     GPT_4O_MINI = "gpt-4o-mini"
     GPT_4_TURBO = "gpt-4-turbo"

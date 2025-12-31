@@ -6,7 +6,7 @@ pydantic-settings==2.1.0
 python-dotenv==1.0.0
 
 # LLM providers
-anthropic>=0.21.0  # Updated for tools support
+anthropic>=0.40.0  # Updated for Extended Thinking support
 openai==1.12.0
 
 # Database and caching

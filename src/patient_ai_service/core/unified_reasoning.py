@@ -8,6 +8,7 @@ for message classification, routing, and plan lifecycle decisions.
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from patient_ai_service.core.llm import LLMClient, get_llm_client
@@ -27,13 +28,66 @@ from patient_ai_service.models.observability import TokenUsage
 logger = logging.getLogger(__name__)
 
 
+def _format_time_ago(timestamp_str: Optional[str]) -> str:
+    """
+    Format timestamp as 'x ago' with only the first/largest unit.
+
+    Examples:
+    - "1 sec ago"
+    - "2 min ago"
+    - "3 hr ago"
+    - "1 day ago"
+    - "2 week ago"
+    - "1 month ago"
+    """
+    if not timestamp_str:
+        return "unknown time"
+
+    try:
+        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        now = datetime.now(timestamp.tzinfo) if timestamp.tzinfo else datetime.now()
+        delta = now - timestamp
+
+        seconds = int(delta.total_seconds())
+
+        if seconds < 0:
+            return "just now"
+
+        # Define units (largest to smallest)
+        if seconds < 60:
+            return f"{seconds} sec ago" if seconds != 1 else "1 sec ago"
+
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes} min ago" if minutes != 1 else "1 min ago"
+
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours} hr ago" if hours != 1 else "1 hr ago"
+
+        days = hours // 24
+        if days < 7:
+            return f"{days} day ago" if days != 1 else "1 day ago"
+
+        weeks = days // 7
+        if weeks < 4:
+            return f"{weeks} week ago" if weeks != 1 else "1 week ago"
+
+        months = days // 30
+        return f"{months} month ago" if months != 1 else "1 month ago"
+
+    except Exception as e:
+        logger.warning(f"Failed to parse timestamp '{timestamp_str}': {e}")
+        return "unknown time"
+
+
 # Agent capabilities for plan context
 AGENT_CAPABILITIES = {
     "registration": "Registers new patients (name, phone, DOB, gender). Cannot book appointments.",
-    "appointment_manager": "Books, reschedules, cancels appointments. Checks doctor availability.",
-    "emergency_response": "Handles urgent medical situations requiring immediate attention.",
-    "general_assistant": "Answers general questions about the clinic, hours, location, services.",
-    "medical_inquiry": "Answers medical and dental health questions.",
+    "appointment_manager": "Hanldes anything related to appointments and booking. Can Book, reschedule, cancel, fetch appointments. Can check doctor availability.",
+    "emergency_response": "Handles urgent medical situations requiring immediate attention. Like sever intolerable pain, severe bleeding, difficulty breathing, severe facial swelling, knocked out tooth, etc.",
+    "general_assistant": "Can ONLY answer any question about clinic, doctors, hours, location, and services.",
+    "medical_inquiry": "Can log patients' medical inquiries for medical team reviewal: CAN ONLY LOG QUESIONS NEVER GENERATES ANSWERS.",
 }
 
 
@@ -136,7 +190,15 @@ class UnifiedReasoning:
         )
 
         # Log the built prompt
-        system_prompt = self._get_system_prompt(planning_enabled=planning_enabled_for_session)
+        # Check if we're in a routing action scenario (confirmation or information collection)
+        has_routing_action = (
+            (awaiting == "confirmation" and pending_action) or
+            (awaiting == "information" and information_collection)
+        )
+        system_prompt = self._get_system_prompt(
+            planning_enabled=planning_enabled_for_session,
+            include_routing_action=has_routing_action
+        )
         logger.info("=" * 80)
         logger.info("☘️ [UnifiedReasoning] BUILT PROMPT:")
         logger.info("=" * 80)
@@ -174,13 +236,15 @@ class UnifiedReasoning:
             
             # Make LLM call with token tracking
             llm_start_time = time.time()
-            
+
             if hasattr(llm_client, 'create_message_with_usage'):
                 response_text, tokens = llm_client.create_message_with_usage(
                     system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=llm_config.temperature,
-                    max_tokens=llm_config.max_tokens
+                    max_tokens=llm_config.max_tokens,
+                    extended_thinking_enabled=llm_config.extended_thinking_enabled,
+                    extended_thinking_budget=llm_config.extended_thinking_budget,
                 )
             else:
                 # Fallback if method doesn't exist - use create_message
@@ -230,6 +294,8 @@ class UnifiedReasoning:
             logger.info(f"[UnifiedReasoning] Tokens: {tokens.input_tokens}/{tokens.output_tokens} (total: {tokens.total_tokens})")
             logger.info(f"[UnifiedReasoning] Route: {output.route_type.value}")
             logger.info(f"[UnifiedReasoning] Situation: {output.situation_type.value}")
+            if output.why_unclear:
+                logger.info(f"[UnifiedReasoning] Why unclear: {output.why_unclear}")
             if output.agent:
                 logger.info(f"[UnifiedReasoning] Agent: {output.agent}")
                 logger.info(f"[UnifiedReasoning] Plan decision: {output.plan_decision.value if output.plan_decision else 'N/A'}")
@@ -251,36 +317,51 @@ class UnifiedReasoning:
                 objective=""
             )
 
-    def _get_system_prompt(self, planning_enabled: bool = True) -> str:
+    def _get_system_prompt(self, planning_enabled: bool = True, include_routing_action: bool = False) -> str:
         """Get system prompt for unified reasoning.
 
         Args:
             planning_enabled: When False, plan decision sections are excluded from prompt
+            include_routing_action: When True, include routing_action field in output schema
         """
+        # Identity section - establishes role as dental clinic receptionist
+        identity_section = """═══════════════════════════════════════════════════════════════════════════════
+YOUR IDENTITY
+═══════════════════════════════════════════════════════════════════════════════
+
+You are an AI-powered dental clinic receptionist assistant operating in the UAE (United Arab Emirates).
+
+YOUR ROLE:
+- You work for a dental clinic in the UAE
+- You are the first point of contact for patients calling or messaging the dental clinic
+- You ask questions to clarify the patient's request/intent if it is unclear or not suitable.
+- You coordinate with different specialized agents to fulfill patient requests
+
+"""
+        
         # Base situation types - always included
         situation_types_section = """═══════════════════════════════════════════════════════════════════════════════
-SITUATION TYPES
+SITUATION TYPE
 ═══════════════════════════════════════════════════════════════════════════════
 
 (route_type="fast_path"):
-- greeting, farewell, thanks, pleasantry
+- greeting, farewell, thanks, pleasantry: Simple conversational exchanges
+- unclear_request: User's request is ambiguous or missing key information. MUST include "why_unclear" field explaining what's unclear or what information is needed
 
 (route_type="agent", is_continuation=true):
-- direct_continuation: User responds to our previous message
-- direct_answer: Answers what we're awaiting
-- selection: Picks from presented options
-- confirmation: Confirms proposed action
-- rejection: Declines/cancels
-- modification: Changes something already set
+- direct_continuation: User responds to our previous message.
+- direct_answer: Answers what we're awaiting.
+- selection: Picks from presented options.
+- confirmation: Confirms proposed action.
+- cancellation: Declines/cancels proposed action.
+- modification: Changes something already set.
 
 (route_type="agent", is_continuation=false):
-- new_intent: New request OR confirmation of something active agent CANNOT do
-- topic_shift: Changing subject or request entirely
+- new_request: New conversation with new request
+- topic_shift: Same conversation but changed request
 
-SPECIAL:
-- emergency: Route to emergency_response immediately
-- ambiguous: Route to general_assistant for clarification"""
-
+"""
+    
         # Plan decisions section - ONLY included when planning is enabled
         plan_decisions_section = ""
         if planning_enabled:
@@ -318,6 +399,18 @@ Then determine:
 
 Consider: What the user wants may differ from what the active agent can provide."""
 
+        # Agent roles section - explain what each agent does
+        agent_roles_section = """
+═══════════════════════════════════════════════════════════════════════════════
+AGENT ROLES
+═══════════════════════════════════════════════════════════════════════════════
+"""
+        for agent_name, capability in AGENT_CAPABILITIES.items():
+            agent_roles_section += f"- {agent_name}: {capability}\n"
+        
+        agent_roles_section += """
+"""
+
         # Output section - conditionally include plan_decision fields
         output_section = """
 
@@ -325,20 +418,9 @@ Consider: What the user wants may differ from what the active agent can provide.
 OUTPUT
 ═══════════════════════════════════════════════════════════════════════════════
 
-FOR FAST-PATH (greeting, farewell, thanks, pleasantry):
-{"route_type": "fast_path", "situation_type": "..."}
-
-
-FOR ROUTING ACTION (confirmation or information collection in progress):"""
-
-        if planning_enabled:
-            output_section += """
-{"routing_action": "execute_confirmed_action|collect_information", "agent": "...", "plan_decision": "resume"}"""
-        else:
-            output_section += """
-{"routing_action": "execute_confirmed_action|collect_information", "agent": "..."}"""
-
-        output_section += """
+FOR FAST-PATH (greeting, farewell, thanks, pleasantry, unclear_request):
+- For greeting, farewell, thanks, pleasantry: {"route_type": "fast_path", "situation_type": "..."}
+- For unclear_request: {"route_type": "fast_path", "situation_type": "unclear_request", "why_unclear": "Explanation of why the request is unclear or what specific information is needed for clarification"}
 
 
 FOR AGENT ROUTING (all other cases):
@@ -346,26 +428,30 @@ FOR AGENT ROUTING (all other cases):
   "route_type": "agent",
   "is_continuation": true|false,
   "situation_type": "...",
-  "confidence": 0.0-1.0,
   "agent": "registration|appointment_manager|emergency_response|general_assistant|medical_inquiry","""
 
         if planning_enabled:
             output_section += """
   "plan_decision": "no_plan|create_new|resume|abandon_create|complete",
-  "plan_reasoning": "Why this plan decision","""
+  "plan_reasoning": "Why this plan decision",
+  "objective": "New goal for the agent (empty if resume)","""
 
         output_section += """
-  "what_user_means": "Plain English explanation of what user actually wants + what do we need to do to help them + what's bloking us (if anything)",
-  "objective": "Goal for the agent (empty if resume)",
-  "routing_action": null
-}
+  "what_user_means": "Plain English explanation of what user actually wants NOW + what do we need to do to help them + what's bloking us (if anything)"""
+
+        if include_routing_action:
+            output_section += """,
+  "routing_action": ""
+"""
+        
+        output_section += """}
 
 Respond strictly in
 JSON only. No explanation outside JSON."""
 
         return f"""You are the unified reasoning engine for a clinic AI.
 
-{situation_types_section}{plan_decisions_section}{task_section}{output_section}"""
+{identity_section}{situation_types_section}{plan_decisions_section}{task_section}{agent_roles_section}{output_section}"""
 
 
     def _build_prompt(
@@ -388,11 +474,11 @@ JSON only. No explanation outside JSON."""
         patient_name = f"{patient_info.get('first_name', 'Unknown')} {patient_info.get('last_name', '')}".strip()
         is_registered = bool(patient_info.get("patient_id"))
 
-        # Format recent turns with timestamps
+        # Format recent turns with timestamps (last 8 messages)
         if recent_turns:
             turns_formatted = "\n".join([
-                f"[{t.get('timestamp', 'unknown time')}] {'User' if t['role'] == 'user' else 'Assistant'}: {t['content'][:200]}"
-                for t in recent_turns[-6:]
+                f"[{_format_time_ago(t.get('timestamp'))}] {'User' if t['role'] == 'user' else 'Assistant'}: {t['content'][:200]}"
+                for t in recent_turns[-8:]
             ])
         else:
             turns_formatted = "(No previous messages)"
@@ -457,7 +543,7 @@ UNRELATED (other questions/requests):
             if collected_info:
                 collected_display = "\n".join([f"  ✓ {item}" for item in collected_info])
             else:
-                collected_display = "  (Nothing collected yet)"
+                collected_display = "{}"
 
             information_collection_section = f"""
 ═══════════════════════════════════════════════════════════════════════════════
@@ -471,11 +557,13 @@ INFORMATON COLLECTED SO FAR:
 {collected_display}
 {message}
 
-MANDATORY: If all required information is now collected, set routing_action="none" to proceed with required agent.
+IF still missing information: "routing_action": "collect_information"
+IF all information is collected: "routing_action": "null"
 
-INFORMATION COLLECTED RULES:
-Be flexible - accept vague, partial, "I don't care", "anything", etc.
-If user provides MORE information than needed → incorporate it into what_user_means
+INFORMATION COLLECTION RULES:
+- Be flexible - accept vague, partial, "I don't care", "anything", etc.
+- If user provides MORE information than needed → incorporate it into what_user_means.
+- If user changes their mind about what they need → treat as new_intent/topic_shift.
 """
 
         return f"""═══════════════════════════════════════════════════════════════════════════════
@@ -605,7 +693,8 @@ ACTIVE AGENT CAPABILITY
         if data.get("route_type") == "fast_path":
             return UnifiedReasoningOutput(
                 route_type=RouteType.FAST_PATH,
-                situation_type=SituationType(data.get("situation_type", "greeting"))
+                situation_type=SituationType(data.get("situation_type", "greeting")),
+                why_unclear=data.get("why_unclear")  # Only present for unclear_request
             )
 
         # Handle full agent routing output

@@ -210,6 +210,7 @@ class Orchestrator:
             SituationType.FAREWELL: "They are saying goodbye. Wish them well.",
             SituationType.THANKS: "They are thanking you. Acknowledge graciously.",
             SituationType.PLEASANTRY: "They are making a social/polite exchange. Respond naturally and warmly.",
+            SituationType.UNCLEAR_REQUEST: "Their recent message is unclear. Ask them to clarify.",
         }
         
         context = situation_context.get(situation, "Respond naturally and helpfully.")

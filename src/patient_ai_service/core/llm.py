@@ -16,6 +16,19 @@ from patient_ai_service.models.observability import TokenUsage
 logger = logging.getLogger(__name__)
 
 
+# Extended Thinking support (Anthropic only)
+EXTENDED_THINKING_MODELS = [
+    "claude-opus-4-5",
+    "claude-sonnet-3-7",
+    "claude-haiku-4-5-20251001",
+]
+
+
+def _supports_extended_thinking(model: str) -> bool:
+    """Check if model supports Extended Thinking mode."""
+    return any(model.startswith(prefix) for prefix in EXTENDED_THINKING_MODELS)
+
+
 class LLMClient(ABC):
     """Abstract base class for LLM clients."""
 
@@ -75,19 +88,13 @@ class AnthropicClient(LLMClient):
                     messages=messages,
                 )
 
-                # Extract text from response
+                # Extract text from response (skip ThinkingBlock when Extended Thinking is enabled)
                 if response.content and len(response.content) > 0:
-                    return response.content[0].text
+                    for block in response.content:
+                        if hasattr(block, 'text'):
+                            return block.text
                 return ""
 
-            except anthropic.OverloadedError as e:
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"Anthropic API overloaded (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    logger.error(f"Anthropic API overloaded after {max_retries + 1} attempts: {e}")
-                    raise
             except anthropic.RateLimitError as e:
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
@@ -109,47 +116,153 @@ class AnthropicClient(LLMClient):
         messages: List[Dict[str, str]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        extended_thinking_enabled: bool = False,
+        extended_thinking_budget: int = 2048,
     ) -> Tuple[str, TokenUsage]:
         """Create a message using Claude and return text with token usage."""
         start_time = time.time()
-        
+
         # Retry configuration for transient errors
         max_retries = 3
         base_delay = 1.0  # seconds
-        
+
         for attempt in range(max_retries + 1):
             try:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens or settings.llm_max_tokens,
-                    temperature=temperature or settings.llm_temperature,
-                    system=system,
-                    messages=messages,
+                # DEBUG: Log Extended Thinking parameters
+                logger.info(
+                    f"[DEBUG] create_message_with_usage called with: "
+                    f"model={self.model}, extended_thinking_enabled={extended_thinking_enabled}, "
+                    f"extended_thinking_budget={extended_thinking_budget}"
                 )
+
+                # Build API params
+                api_params = {
+                    "model": self.model,
+                    "max_tokens": max_tokens or settings.llm_max_tokens,
+                    "temperature": temperature or settings.llm_temperature,
+                    "system": system,
+                    "messages": messages,
+                }
+
+                # Add extended thinking if enabled and supported
+                if extended_thinking_enabled:
+                    supports_thinking = _supports_extended_thinking(self.model)
+                    logger.info(f"[DEBUG] Extended Thinking check: supports_thinking={supports_thinking}")
+
+                    if not supports_thinking:
+                        logger.warning(
+                            f"Extended Thinking requested but not supported by model {self.model}. Skipping."
+                        )
+                    else:
+                        api_params["thinking"] = {
+                            "type": "enabled",
+                            "budget_tokens": extended_thinking_budget
+                        }
+                        # CRITICAL: Anthropic requires temperature=1.0 when Extended Thinking is enabled
+                        api_params["temperature"] = 1.0
+                        logger.info(f"✓ Extended Thinking enabled: forcing temperature=1.0 (API requirement)")
+                        logger.info(f"✓ Extended Thinking budget: {extended_thinking_budget} tokens")
+
+                        # CRITICAL: Ensure max_tokens > thinking.budget_tokens
+                        current_max_tokens = api_params["max_tokens"]
+                        if current_max_tokens <= extended_thinking_budget:
+                            # Auto-adjust to be at least budget + 200 tokens for output
+                            adjusted_max_tokens = extended_thinking_budget + 200
+                            logger.warning(
+                                f"⚠️  max_tokens ({current_max_tokens}) must be > thinking.budget_tokens ({extended_thinking_budget}). "
+                                f"Auto-adjusting to {adjusted_max_tokens}"
+                            )
+                            api_params["max_tokens"] = adjusted_max_tokens
+
+                        logger.info(f"[DEBUG] api_params['thinking'] = {api_params.get('thinking')}")
+
+                # Use streaming when Extended Thinking is enabled to show thinking in real-time
+                if extended_thinking_enabled and _supports_extended_thinking(self.model):
+                    print("\n🧠 [EXTENDED THINKING - STREAMING]", flush=True)
+                    print("=" * 80, flush=True)
+
+                    thinking_content = []
+                    text_content = []
+
+                    with self.client.messages.stream(**api_params) as stream:
+                        for event in stream:
+                            # Handle thinking content blocks
+                            if hasattr(event, 'type'):
+                                if event.type == 'content_block_start':
+                                    if hasattr(event, 'content_block') and hasattr(event.content_block, 'type'):
+                                        if event.content_block.type == 'thinking':
+                                            print("\n🤔 Thinking:", flush=True)
+
+                                elif event.type == 'content_block_delta':
+                                    if hasattr(event, 'delta'):
+                                        if hasattr(event.delta, 'type'):
+                                            if event.delta.type == 'thinking_delta':
+                                                # Stream thinking content to terminal
+                                                thinking_text = getattr(event.delta, 'thinking', '')
+                                                if thinking_text:
+                                                    print(thinking_text, end='', flush=True)
+                                                    thinking_content.append(thinking_text)
+                                            elif event.delta.type == 'text_delta':
+                                                # Collect text content (actual response)
+                                                text_delta = getattr(event.delta, 'text', '')
+                                                if text_delta:
+                                                    text_content.append(text_delta)
+
+                    print("\n" + "=" * 80, flush=True)
+                    print("✓ Thinking complete\n", flush=True)
+
+                    # Get the final message for usage stats
+                    response = stream.get_final_message()
+                    text = ''.join(text_content)
+                else:
+                    # Non-streaming mode
+                    response = self.client.messages.create(**api_params)
+                    text = ""
+                    if response.content and len(response.content) > 0:
+                        for block in response.content:
+                            if hasattr(block, 'text'):
+                                text = block.text
+                                break
+
+                # DEBUG: Log raw usage object
+                usage = response.usage
+                logger.info(f"[DEBUG] Raw API response.usage object: {usage}")
+                if usage and hasattr(usage, 'model_dump'):
+                    logger.info(f"[DEBUG] usage.model_dump(): {usage.model_dump()}")
+
+                # Extract thinking tokens
+                thinking_tokens = 0
+                if usage:
+                    # Check for thinking_tokens attribute
+                    has_thinking_attr = hasattr(usage, 'thinking_tokens')
+                    logger.info(f"[DEBUG] hasattr(usage, 'thinking_tokens') = {has_thinking_attr}")
+
+                    if has_thinking_attr:
+                        thinking_tokens = getattr(usage, 'thinking_tokens', 0)
+                        logger.info(f"[DEBUG] Extracted thinking_tokens from attribute: {thinking_tokens}")
+                    elif hasattr(usage, 'model_dump'):
+                        usage_dict = usage.model_dump()
+                        thinking_tokens = usage_dict.get('thinking_tokens', 0)
+                        logger.info(f"[DEBUG] Extracted thinking_tokens from model_dump: {thinking_tokens}")
 
                 # Extract token usage
                 tokens = TokenUsage(
-                    input_tokens=response.usage.input_tokens if response.usage else 0,
-                    output_tokens=response.usage.output_tokens if response.usage else 0,
-                    total_tokens=response.usage.input_tokens + response.usage.output_tokens if response.usage else 0
+                    input_tokens=usage.input_tokens if usage else 0,
+                    output_tokens=usage.output_tokens if usage else 0,
+                    total_tokens=(usage.input_tokens + usage.output_tokens) if usage else 0,
+                    thinking_tokens=thinking_tokens,
                 )
 
-                # Extract text from response
-                text = ""
-                if response.content and len(response.content) > 0:
-                    text = response.content[0].text
+                logger.info(f"[DEBUG] Final TokenUsage object: {tokens}")
+
+                if thinking_tokens > 0:
+                    logger.info(
+                        f"✓ Extended Thinking used: {thinking_tokens} tokens "
+                        f"(billed as output, excluded from future context)"
+                    )
 
                 return text, tokens
 
-            except anthropic.OverloadedError as e:
-                if attempt < max_retries:
-                    # Exponential backoff: 1s, 2s, 4s
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"Anthropic API overloaded (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    logger.error(f"Anthropic API overloaded after {max_retries + 1} attempts: {e}")
-                    raise
             except anthropic.RateLimitError as e:
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
@@ -214,18 +327,15 @@ class AnthropicClient(LLMClient):
                     system=system_content,
                     messages=messages,
                 )
-                
+
+                # Extract text from response (skip ThinkingBlock when Extended Thinking is enabled)
                 if response.content and len(response.content) > 0:
-                    return response.content[0].text
+                    for block in response.content:
+                        if hasattr(block, 'text'):
+                            return block.text
                 return ""
-                
-            except anthropic.OverloadedError as e:
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"Anthropic API overloaded (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    raise
+
+
             except anthropic.RateLimitError as e:
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
@@ -244,16 +354,18 @@ class AnthropicClient(LLMClient):
         messages: List[Dict[str, str]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        extended_thinking_enabled: bool = False,
+        extended_thinking_budget: int = 2048,
     ) -> Tuple[str, TokenUsage]:
         """
         Create a message with prompt caching and return token usage details.
-        
+
         Returns:
             Tuple of (response_text, TokenUsage with cache breakdown)
         """
         max_retries = 3
         base_delay = 1.0
-        
+
         # Build system content with cache control
         system_content = [
             {
@@ -262,23 +374,111 @@ class AnthropicClient(LLMClient):
                 "cache_control": {"type": "ephemeral"}
             }
         ]
-        
+
         if system_dynamic and system_dynamic.strip():
             system_content.append({
                 "type": "text",
                 "text": system_dynamic
             })
-        
+
         for attempt in range(max_retries + 1):
             try:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens or settings.llm_max_tokens,
-                    temperature=temperature or settings.llm_temperature,
-                    system=system_content,
-                    messages=messages,
+                # DEBUG: Log Extended Thinking parameters
+                logger.info(
+                    f"[DEBUG] create_message_with_cache_and_usage called with: "
+                    f"model={self.model}, extended_thinking_enabled={extended_thinking_enabled}, "
+                    f"extended_thinking_budget={extended_thinking_budget}"
                 )
-                
+
+                # Build API params
+                api_params = {
+                    "model": self.model,
+                    "max_tokens": max_tokens or settings.llm_max_tokens,
+                    "temperature": temperature or settings.llm_temperature,
+                    "system": system_content,
+                    "messages": messages,
+                }
+
+                # Add extended thinking if enabled and supported
+                if extended_thinking_enabled:
+                    supports_thinking = _supports_extended_thinking(self.model)
+                    logger.info(f"[DEBUG] Extended Thinking check: supports_thinking={supports_thinking}")
+
+                    if not supports_thinking:
+                        logger.warning(
+                            f"Extended Thinking requested but not supported by model {self.model}. Skipping."
+                        )
+                    else:
+                        api_params["thinking"] = {
+                            "type": "enabled",
+                            "budget_tokens": extended_thinking_budget
+                        }
+                        # CRITICAL: Anthropic requires temperature=1.0 when Extended Thinking is enabled
+                        api_params["temperature"] = 1.0
+                        logger.info(f"✓ Extended Thinking enabled: forcing temperature=1.0 (API requirement)")
+                        logger.info(f"✓ Extended Thinking budget: {extended_thinking_budget} tokens")
+
+                        # CRITICAL: Ensure max_tokens > thinking.budget_tokens
+                        current_max_tokens = api_params["max_tokens"]
+                        if current_max_tokens <= extended_thinking_budget:
+                            # Auto-adjust to be at least budget + 200 tokens for output
+                            adjusted_max_tokens = extended_thinking_budget + 200
+                            logger.warning(
+                                f"⚠️  max_tokens ({current_max_tokens}) must be > thinking.budget_tokens ({extended_thinking_budget}). "
+                                f"Auto-adjusting to {adjusted_max_tokens}"
+                            )
+                            api_params["max_tokens"] = adjusted_max_tokens
+
+                        logger.info(f"[DEBUG] api_params['thinking'] = {api_params.get('thinking')}")
+
+                # Use streaming when Extended Thinking is enabled to show thinking in real-time
+                if extended_thinking_enabled and _supports_extended_thinking(self.model):
+                    print("\n🧠 [EXTENDED THINKING - STREAMING]", flush=True)
+                    print("=" * 80, flush=True)
+
+                    thinking_content = []
+                    text_content = []
+
+                    with self.client.messages.stream(**api_params) as stream:
+                        for event in stream:
+                            # Handle thinking content blocks
+                            if hasattr(event, 'type'):
+                                if event.type == 'content_block_start':
+                                    if hasattr(event, 'content_block') and hasattr(event.content_block, 'type'):
+                                        if event.content_block.type == 'thinking':
+                                            print("\n🤔 Thinking:", flush=True)
+
+                                elif event.type == 'content_block_delta':
+                                    if hasattr(event, 'delta'):
+                                        if hasattr(event.delta, 'type'):
+                                            if event.delta.type == 'thinking_delta':
+                                                # Stream thinking content to terminal
+                                                thinking_text = getattr(event.delta, 'thinking', '')
+                                                if thinking_text:
+                                                    print(thinking_text, end='', flush=True)
+                                                    thinking_content.append(thinking_text)
+                                            elif event.delta.type == 'text_delta':
+                                                # Collect text content (actual response)
+                                                text_delta = getattr(event.delta, 'text', '')
+                                                if text_delta:
+                                                    text_content.append(text_delta)
+
+                    print("\n" + "=" * 80, flush=True)
+                    print("✓ Thinking complete\n", flush=True)
+
+                    # Get the final message for usage stats
+                    response = stream.get_final_message()
+                    text = ''.join(text_content)
+                else:
+                    # Non-streaming mode
+                    response = self.client.messages.create(**api_params)
+                    text = ""
+                    if response.content and len(response.content) > 0:
+                        for block in response.content:
+                            if hasattr(block, 'text'):
+                                text = block.text
+                                break
+
                 # Extract token usage with cache details
                 usage = response.usage
                 if not usage:
@@ -326,14 +526,38 @@ class AnthropicClient(LLMClient):
                     # Convert None to 0, but preserve actual 0 values
                     cache_creation_tokens = cache_creation if cache_creation is not None else 0
                     cache_read_tokens = cache_read if cache_read is not None else 0
-                    
+
+                    # Extract thinking tokens
+                    thinking_tokens = 0
+                    has_thinking_attr = hasattr(usage, 'thinking_tokens')
+                    has_thinking_dict = 'thinking_tokens' in usage_dict
+
+                    logger.info(f"[DEBUG] hasattr(usage, 'thinking_tokens') = {has_thinking_attr}")
+                    logger.info(f"[DEBUG] 'thinking_tokens' in usage_dict = {has_thinking_dict}")
+
+                    if has_thinking_attr:
+                        thinking_tokens = getattr(usage, 'thinking_tokens', 0)
+                        logger.info(f"[DEBUG] Extracted thinking_tokens from attribute: {thinking_tokens}")
+                    elif has_thinking_dict:
+                        thinking_tokens = usage_dict.get('thinking_tokens', 0)
+                        logger.info(f"[DEBUG] Extracted thinking_tokens from dict: {thinking_tokens}")
+
                     tokens = TokenUsage(
                         input_tokens=usage.input_tokens,
                         output_tokens=usage.output_tokens,
                         total_tokens=usage.input_tokens + usage.output_tokens,
                         cache_creation_input_tokens=cache_creation_tokens,
                         cache_read_input_tokens=cache_read_tokens,
+                        thinking_tokens=thinking_tokens,
                     )
+
+                    logger.info(f"[DEBUG] Final TokenUsage object: {tokens}")
+
+                    if thinking_tokens > 0:
+                        logger.info(
+                            f"✓ Extended Thinking used: {thinking_tokens} tokens "
+                            f"(billed as output, excluded from future context)"
+                        )
                     
                     # Log cache token extraction for debugging
                     logger.info(f"📊 [Cache Validation] Token extraction - Input: {usage.input_tokens}, Output: {usage.output_tokens}")
@@ -352,11 +576,7 @@ class AnthropicClient(LLMClient):
                         logger.warning(f"⚠️ [Cache Validation]   2. This is the first request (cache not created yet)")
                         logger.warning(f"⚠️ [Cache Validation]   3. Cache tokens are not being returned by the API")
                         logger.warning(f"⚠️ [Cache Validation]   4. Cache token extraction is failing")
-                
-                text = ""
-                if response.content and len(response.content) > 0:
-                    text = response.content[0].text
-                
+
                 # Log cache status
                 if tokens.cache_read_input_tokens > 0:
                     logger.info(f"🎯 Cache HIT: {tokens.cache_read_input_tokens} tokens read from cache")
@@ -365,13 +585,6 @@ class AnthropicClient(LLMClient):
                 
                 return text, tokens
                 
-            except anthropic.OverloadedError as e:
-                if attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"Anthropic API overloaded (attempt {attempt + 1}/{max_retries + 1}). Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    raise
             except anthropic.RateLimitError as e:
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)

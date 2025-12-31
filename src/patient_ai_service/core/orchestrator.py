@@ -126,10 +126,13 @@ class Orchestrator:
 
     def _init_agents(self):
         """Initialize all specialized agents."""
+        # Create appointment manager first so we can pass it to general assistant
+        appointment_manager = AppointmentManagerAgent(
+            db_client=self.db_client
+        )
+
         self.agents: Dict[str, Any] = {
-            "appointment_manager": AppointmentManagerAgent(
-                db_client=self.db_client
-            ),
+            "appointment_manager": appointment_manager,
             "medical_inquiry": MedicalInquiryAgent(
                 db_client=self.db_client
             ),
@@ -141,7 +144,8 @@ class Orchestrator:
             ),
             "translation": TranslationAgent(),
             "general_assistant": GeneralAssistantAgent(
-                db_client=self.db_client
+                db_client=self.db_client,
+                appointment_manager=appointment_manager  # Pass appointment manager for doctor search and availability
             ),
         }
 
@@ -166,7 +170,8 @@ class Orchestrator:
         language: str,
         dialect: Optional[str],
         conversation_history: Optional[List[Dict[str, str]]] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        why_unclear: Optional[str] = None
     ) -> Tuple[str, TokenUsage]:
         """
         Handle all conversational fast-path responses in a single LLM call.
@@ -201,11 +206,11 @@ class Orchestrator:
                 "sa": "Saudi Arabic (Gulf dialect)", 
                 "eg": "Egyptian Arabic",
                 "lv": "Levantine Arabic",
-                None: "Modern Standard Arabic"
+                None: "Emirati Arabic (UAE dialect)"
             }
             dialect_name = dialect_map.get(dialect, dialect_map[None])
             lang_instruction = f"\n\nIMPORTANT: Respond in {dialect_name}. Use natural, conversational Arabic appropriate for the UAE."
-        elif language != "en":
+        elif language == "en":
             lang_instruction = f"\n\nIMPORTANT: Respond in {language}."
         
         # Situation-specific context
@@ -214,9 +219,14 @@ class Orchestrator:
             SituationType.FAREWELL: "They are saying goodbye. Wish them well.",
             SituationType.THANKS: "They are thanking you. Acknowledge graciously.",
             SituationType.PLEASANTRY: "They are making a social/polite exchange. Respond naturally and warmly.",
+            SituationType.UNCLEAR_REQUEST: "They are making a request that is unclear. Ask them to clarify.",
         }
         
         context = situation_context.get(situation, "Respond naturally and helpfully.")
+        
+        # For unclear_request, use the why_unclear explanation if provided
+        if situation == SituationType.UNCLEAR_REQUEST and why_unclear:
+            context = f"They are making a request that is unclear. {why_unclear} Ask them to clarify based on this understanding."
         
         # Registration hint for greetings only
         registration_hint = ""
@@ -247,16 +257,17 @@ class Orchestrator:
                 conversation_context += f"{role_label}{timestamp_str}: {turn.get('content', '')}\n"
             conversation_context += "\nUse this context to make your response more natural and relevant."
         
-        prompt = f"""You are a friendly dental clinic receptionist in the UAE.
+        prompt = f"""You are a friendly clinic receptionist.
 
 Patient: {name} ({'returning patient' if is_registered else 'new visitor'})
-They said: "{message}"
+User: "{message}"
 
 {context}{registration_hint}{conversation_context}
 
 1- RESPOND WARMTH AND NATURALLY 
 2- KEEP IT CONCISE: 1-2 sentences maximum
-3- RESPOND IN SAME USER LANGUAGE AND DIALECT
+
+MANDATORY: {lang_instruction}
 
 Your response:"""
 
@@ -444,33 +455,31 @@ Your response:"""
         logger.info(f"⚡ [Info Collection] Inputs JSON:\n{json.dumps(inputs, indent=2, default=str)}")
         logger.info("=" * 80)
 
-        name = patient_name or "there"
+        if patient_name:
+            address_instruction = f"You may address the patient as '{patient_name}'"
+        else:
+            address_instruction = "DO NOT use any name - patient name is not available"
 
         # Build language instruction (reuse pattern from _conversational_response)
         lang_instruction = ""
         if language == "ar":
-            dialect_map = {
-                "ae": "Emirati Arabic (UAE dialect)",
-                "sa": "Saudi Arabic (Gulf dialect)",
-                "eg": "Egyptian Arabic",
-                "lv": "Levantine Arabic",
-                None: "Modern Standard Arabic"
-            }
-            dialect_name = dialect_map.get(dialect, dialect_map[None])
-            lang_instruction = f"\n\nIMPORTANT: Respond in {dialect_name}. Use natural, conversational Arabic appropriate for the UAE."
-        elif language != "en":
-            lang_instruction = f"\n\nIMPORTANT: Respond in {language}."
+            lang_instruction = "Respond in Emirati Arabic (UAE). Use natural, colloquial Emirati Arabic. authentic but not slangy - professionally warm."
+        elif language == "en":
+            lang_instruction = "Respond in English."
+        else:
+            lang_instruction = f"Respond in EXACT user Language from RECENT CONVERSATION."
 
         # Build conversation context from last 8 messages
         conversation_context = ""
         if recent_messages:
-            conversation_context = "\n\nRecent conversation (last 8 turns):\n"
-            for turn in recent_messages[-8:]:
-                role_label = "User" if turn.get("role") == "user" else "Assistant"
+            conversation_context = "RECENT CONVERSATION:\n"
+            for turn in recent_messages[-6:]:
+                role_label = "User" if turn.get("role") == "user" else "You"
                 conversation_context += f"{role_label}: {turn.get('content', '')}\n"
 
         # Extract information collection details
         information_needed = information_collection.get('information_needed', 'user information')
+        awaiting_info = information_collection.get('awaiting_info', 'user information')
         information_question = information_collection.get('information_question', '')
         collected_so_far = information_collection.get('collected_information', [])
         context = information_collection.get('context', 'general inquiry')
@@ -480,42 +489,43 @@ Your response:"""
 
         # Build JSON example separately to avoid f-string brace escaping issues
         json_example = '''{
-  "extracted_info": "concise description of what the user provided" OR null,
+  "extracted_info": "concise description of what the user provided ALWAYS IN ENGLISH" OR null,
   "collection_complete": true OR false,
-  "response": "Your response (ONLY if collection_complete is false)" OR null
+  "response": "(ONLY if collection_complete is false)" OR null
 }'''
 
-        prompt = f"""You are a friendly clinic receptionist in the UAE helping collect information.
+        prompt = f"""You are a friendly clinic receptionist in the UAE helping collect information. 
 
-Patient: {name}
-Context: {context}
+{address_instruction}
 
 INFORMATION NEEDED (overall):
 {information_needed}
+{awaiting_info}
 
 INFORMATION COLLECTED SO FAR:
 {collected_display}
 
-LATEST QUESTION WE ASKED:
-"{information_question}"
-
-PREVIOUS CONVERSATION:
-{conversation_context}
-
 USER'S LATEST RESPONSE:
 "{message}"
+
+{conversation_context}
+
 
 YOUR TASK:
 1. Extract what information the user provided (if any)
 2. Determine if all required information is now collected
-3. If NOT complete, generate a natural follow-up question
+3. If NOT complete, generate a follow-up question continuing "RECENT CONVERSATION".
 
-BEHAVIOUR INSTRUCTIONS:
+BEHAVIOUR RULES:
+1. If the user ask any questions, politely inform them that you will get back to them after collecting ALL the needed information.
+2. Be FLEXIBLE with what counts as information: Vague answers like "I don't know", "I don't care", "anything" -> count as answers → Extract what you can
+
+"response" RULES:
 1. Speak warmly professional
-2. You are part of a CONTINOUS CONVERSATION. ALWAYS take "PREVIOUS CONVERSATION" in consideration, so keep it natural, and understand prior context whenever.
-3. If the user ask any questions, politely inform them that you will get back to them after collecting the needed information.
-4. Be FLEXIBLE with what counts as information: Vague answers like "I don't know", "I don't care", "anything" -> count as answers → Extract what you can
-5. AVOID REDUNDANCY, KEEP CONVERSATION NATURAL
+2. Be conversational and natural, but avoid redundancy - don't repeat what was already said
+3. AVOID repeating yourself. If user doesnt understand your question, ask again in a different way.
+4. {lang_instruction}
+
 COMPLETION CHECK:
 Assess if ALL required information from "{information_needed}" is now collected (INFORMATION COLLECTED SO FAR + USER'S LATEST RESPONSE).
 
@@ -530,8 +540,6 @@ If STILL MISSING INFO:
   → response: Warm, natural follow-up question for missing pieces
     - Example: "Got it! And what time of day works best for you?"
     - Example: "I understand, but to help you I need to know what type of visit you need."
-
-{lang_instruction}
 
 Respond in JSON format:
 {json_example}
@@ -905,7 +913,7 @@ Respond in JSON format:
                     logger.info(f"🔍   Continuation entities: {list(continuation_context.get('entities', {}).keys())}")
             logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
 
-            # Get recent conversation turns
+            # Get recent conversation turns (last 8 messages)
             recent_turns = self._get_recent_turns(session_id, limit=6)
 
             # Check if planning is enabled for this session (A/B testing)
@@ -956,7 +964,10 @@ Respond in JSON format:
             # === FAST PATH ===
             if unified_output.is_fast_path():
                 fast_path_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                logger.info(f"⚡ [Fast Path] [{fast_path_timestamp}] Situation: {unified_output.situation_type.value}")
+                log_msg = f"⚡ [Fast Path] [{fast_path_timestamp}] Situation: {unified_output.situation_type.value}"
+                if unified_output.situation_type == SituationType.UNCLEAR_REQUEST and unified_output.why_unclear:
+                    log_msg += f" | Why unclear: {unified_output.why_unclear}"
+                logger.info(log_msg)
 
                 with obs_logger.pipeline_step(5, "fast_path_routing", "orchestrator", {"situation": unified_output.situation_type.value}) if obs_logger else nullcontext():
                     # Get conversation history from NativeLanguageMemory for context-aware response
@@ -983,7 +994,8 @@ Respond in JSON format:
                     language=language_context.current_language,
                     dialect=language_context.current_dialect,
                     conversation_history=conversation_history,
-                    session_id=session_id
+                    session_id=session_id,
+                    why_unclear=unified_output.why_unclear
                 )
                     conv_duration = (time.time() - conv_start) * 1000
                     conv_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1734,23 +1746,30 @@ Respond in JSON format:
             step12_duration = (time.time() - step12_start) * 1000
             logger.info(f"Step 12 completed in {step12_duration:.2f}ms")
 
-            # Step 13: Translation (output) - DISABLED
-            # TRANSLATION OUTPUT IS DISABLED - Agents generate responses directly in target language
-            # The agent's _generate_focused_response already generates responses in the target language
-            # based on context.get("current_language"). No additional translation needed.
+            # Step 13: Translation (output) - Configurable via feature flag
             step13_start = time.time()
             logger.info("-" * 100)
-            logger.info("ORCHESTRATOR STEP 13: Translation (Output) - DISABLED")
+            logger.info("ORCHESTRATOR STEP 13: Translation (Output)")
             logger.info("-" * 100)
-            with obs_logger.pipeline_step(13, "translation_output", "translation", {"status": "disabled", "language": language_context.current_language}) if obs_logger else nullcontext():
-                logger.info("TRANSLATION OUTPUT DISABLED - Using agent response as-is (already in target language)")
-                
-                # Use agent response as-is (already in target language)
-                translated_response = english_response
-                logger.info(f"Response already in target language ({language_context.current_language}): {translated_response[:200]}...")
+            from patient_ai_service.core.feature_flags import is_output_translation_enabled
+            if is_output_translation_enabled(session_id):
+                with obs_logger.pipeline_step(13, "translation_output", "translation", {"status": "enabled", "language": language_context.current_language}) if obs_logger else nullcontext():
+                    logger.info(f"TRANSLATION OUTPUT ENABLED - Translating response to {language_context.current_language}")
+                    translated_response = await self._translate_output(
+                        session_id,
+                        english_response,
+                        language_context.current_language
+                    )
+                    logger.info(f"Translated response ({language_context.current_language}): {translated_response[:200]}...")
+            else:
+                with obs_logger.pipeline_step(13, "translation_output", "translation", {"status": "disabled", "language": language_context.current_language}) if obs_logger else nullcontext():
+                    logger.info("TRANSLATION OUTPUT DISABLED - Using agent response as-is")
+                    # Use agent response as-is (already in target language)
+                    translated_response = english_response
+                    logger.info(f"Response used as-is ({language_context.current_language}): {translated_response[:200]}...")
             
             step13_duration = (time.time() - step13_start) * 1000
-            logger.info(f"Step 13 completed in {step13_duration:.2f}ms (skipped translation)")
+            logger.info(f"Step 13 completed in {step13_duration:.2f}ms")
 
             # Step 14: Build response
             with obs_logger.pipeline_step(14, "build_response", "orchestrator", {}) if obs_logger else nullcontext():
@@ -2038,6 +2057,11 @@ Respond in JSON format:
         # Get from reasoning
         if hasattr(reasoning.response_guidance, 'task_context'):
             tc = reasoning.response_guidance.task_context
+            # Extract situation_type from minimal_context
+            situation_type = None
+            if hasattr(reasoning.response_guidance, 'minimal_context'):
+                situation_type = reasoning.response_guidance.minimal_context.get("situation_type")
+            
             task_context = {
                 "user_intent": tc.user_intent if hasattr(tc, 'user_intent') else reasoning.understanding.what_user_means,
                 "objective": tc.objective if hasattr(tc, 'objective') else "",  # NEW: Extract objective
@@ -2048,6 +2072,7 @@ Respond in JSON format:
                 "is_continuation": tc.is_continuation if hasattr(tc, 'is_continuation') else False,
                 "continuation_type": tc.continuation_type if hasattr(tc, 'continuation_type') else None,
                 "selected_option": tc.selected_option if hasattr(tc, 'selected_option') else None,
+                "situation_type": situation_type,  # NEW: Add situation_type from unified reasoning
             }
             logger.info(f"{task_context}")
 
@@ -2068,6 +2093,7 @@ Respond in JSON format:
                 "constraints": [],
                 "prior_context": mc.get("prior_context"),
                 "is_continuation": mc.get("is_continuation", False),
+                "situation_type": mc.get("situation_type"),  # NEW: Add situation_type from minimal_context
             }
             logger.info("📊 Using minimal_context (no task_context available)")
 
@@ -2181,7 +2207,10 @@ Respond in JSON format:
 
         response_guidance = ResponseGuidance(
             tone="helpful",
-            task_context=task_context
+            task_context=task_context,
+            minimal_context={
+                "situation_type": unified_output.situation_type.value if unified_output.situation_type else None
+            }
         )
 
         return ReasoningOutput(
@@ -2347,6 +2376,9 @@ Respond in JSON format:
             "continuation_type": task_context.get("continuation_type"),
             "selected_option": task_context.get("selected_option"),
             "continuation_context": continuation_context or {},
+            
+            # NEW: Unified reasoning output fields
+            "situation_type": task_context.get("situation_type"),  # From unified reasoning
 
             # Routing info
             "routing_action": reasoning.routing.action,

@@ -73,6 +73,24 @@ DEFAULT_FIRST_AID_INSTRUCTIONS = [
     "Contact emergency services or dentist immediately"
 ]
 
+# Validation constants
+VALID_SEVERITIES = ['critical', 'high', 'moderate']
+
+VALID_EMERGENCY_TYPES = [
+    'bleeding',
+    'knocked_out_tooth',
+    'broken_tooth',
+    'severe_pain',
+    'swelling',
+    'facial_trauma',
+    'broken_jaw',
+    'lost_filling',
+    'abscess',
+    'difficulty_breathing',
+    'unconsciousness',
+    'severe_facial_swelling'
+]
+
 
 class EmergencyResponseAgent(BaseAgent):
     """
@@ -347,6 +365,103 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             for name, number in self.EMERGENCY_CONTACTS.items()
         ])
 
+    # ==================== VALIDATION HELPERS ====================
+
+    def _validate_severity(self, severity: str) -> Dict[str, Any]:
+        """
+        Validate severity level is one of the allowed values.
+
+        Args:
+            severity: Severity level to validate.
+
+        Returns:
+            Validation result dictionary with:
+            - valid: bool (True if valid, False otherwise)
+            - error: str (error message if invalid)
+            - suggested_response: str (response to user if invalid)
+            - alternatives: List[str] (valid severity options)
+        """
+        if severity.lower() in VALID_SEVERITIES:
+            return {"valid": True}
+
+        return {
+            "valid": False,
+            "error": f"Invalid severity '{severity}'. Must be one of: {', '.join(VALID_SEVERITIES)}",
+            "alternatives": VALID_SEVERITIES,
+            "suggested_response": f"I need to classify the severity correctly. Based on your description, would you say this is:\n- Critical (life-threatening, needs 911)\n- High (urgent, needs immediate clinic care)\n- Moderate (serious but stable)\n\nPlease help me understand the severity so I can provide the right guidance."
+        }
+
+    def _validate_emergency_type(self, emergency_type: str) -> Dict[str, Any]:
+        """
+        Validate emergency type is one of the known types.
+
+        Args:
+            emergency_type: Emergency type to validate.
+
+        Returns:
+            Validation result dictionary with:
+            - valid: bool (True if valid, False otherwise)
+            - normalized_type: str (normalized emergency type)
+            - is_known: bool (True if type has specific instructions)
+            - warning: str (warning message if using default instructions)
+        """
+        normalized_type = self._normalize_emergency_type(emergency_type)
+
+        # Check if type is in valid list
+        if normalized_type in VALID_EMERGENCY_TYPES:
+            # Check if we have specific instructions for this type
+            has_instructions = normalized_type in FIRST_AID_INSTRUCTIONS
+
+            return {
+                "valid": True,
+                "normalized_type": normalized_type,
+                "is_known": has_instructions,
+                "warning": None if has_instructions else f"No specific first aid instructions for '{emergency_type}', will use general guidance"
+            }
+
+        # Unknown emergency type - log warning but allow
+        logger.warning(f"Unknown emergency type received: {emergency_type}")
+
+        return {
+            "valid": True,  # Allow unknown types but with warning
+            "normalized_type": normalized_type,
+            "is_known": False,
+            "warning": f"Emergency type '{emergency_type}' is not recognized. Using general emergency guidance."
+        }
+
+    def _validate_patient_id(self, patient_id: str, session_id: str) -> Dict[str, Any]:
+        """
+        Validate patient_id is not empty, fallback to session_id if needed.
+
+        Args:
+            patient_id: Patient ID to validate.
+            session_id: Session ID to use as fallback.
+
+        Returns:
+            Validation result dictionary with:
+            - valid: bool (always True after fallback)
+            - patient_id: str (validated or fallback patient ID)
+            - used_fallback: bool (True if session_id was used)
+            - warning: str (warning message if fallback used)
+        """
+        if patient_id and patient_id.strip():
+            return {
+                "valid": True,
+                "patient_id": patient_id,
+                "used_fallback": False,
+                "warning": None
+            }
+
+        # Use session_id as fallback
+        logger.warning(f"Empty patient_id provided, using session_id as fallback: {session_id}")
+
+        return {
+            "valid": True,
+            "patient_id": session_id,
+            "used_fallback": True,
+            "warning": "Patient not registered, using temporary ID for emergency tracking"
+        }
+
     # ==================== TOOL IMPLEMENTATIONS ====================
 
     def tool_report_emergency(
@@ -371,39 +486,90 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             Dictionary with success status, emergency_id (if successful), and message.
         """
         try:
+            # ===== Phase 1: Input Validation =====
+
+            # Validate severity
+            severity_validation = self._validate_severity(severity)
+            if not severity_validation["valid"]:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": severity_validation["error"],
+                    "alternatives": severity_validation["alternatives"],
+                    "blocks_criteria": ["emergency_reported"],
+                    "suggested_response": severity_validation["suggested_response"]
+                }
+
+            # Validate emergency_type
+            type_validation = self._validate_emergency_type(emergency_type)
+            if type_validation["warning"]:
+                logger.warning(f"Emergency type validation warning: {type_validation['warning']}")
+
+            # Validate patient_id (with fallback to session_id)
+            patient_validation = self._validate_patient_id(patient_id, session_id)
+            validated_patient_id = patient_validation["patient_id"]
+
+            if patient_validation["used_fallback"]:
+                logger.info(f"Using session_id as fallback for patient_id: {session_id}")
+
+            # ===== Phase 2: Process Emergency Report =====
+
             clinic_id = self._get_clinic_id()
             emergency_data = self._build_emergency_data(
-                clinic_id, patient_id, emergency_type, description, severity
+                clinic_id, validated_patient_id, type_validation["normalized_type"], description, severity.lower()
             )
 
             result = self.db_client.report_emergency(emergency_data)
-            self._update_emergency_state(session_id, emergency_type, severity)
 
             if result:
+                # Update state after successful logging
+                self._update_emergency_state(session_id, emergency_type, severity)
+
+                # Phase 2: Return SUCCESS with rich metadata
                 return {
                     "success": True,
                     "result_type": ToolResultType.SUCCESS.value,
                     "emergency_id": result.get("id"),
+                    "emergency_type": type_validation["normalized_type"],
+                    "severity": severity.lower(),
+                    "satisfies_criteria": [
+                        "emergency_reported",
+                        "staff_notified",
+                        "emergency_logged"
+                    ],
+                    "next_action": "provide_emergency_contacts_if_not_already_provided",
+                    "can_proceed": True,
                     "message": "Emergency reported and logged",
-                    "suggested_response": f"I've reported your {emergency_type} emergency to our clinic. Emergency ID: {result.get('id')}. Please follow the first aid instructions I provided."
+                    "suggested_response": f"I've reported your {emergency_type} emergency to our clinic. Emergency ID: {result.get('id')[:8]}. Staff have been notified. Please continue following the first aid instructions I provided."
                 }
 
+            # Phase 2: Return RECOVERABLE when DB write fails (can retry)
             return {
                 "success": False,
-                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "result_type": ToolResultType.RECOVERABLE.value,
                 "error": "Failed to log emergency",
+                "error_code": "WRITE_FAILED",
+                "recovery_action": "retry_report_emergency",
+                "recovery_message": "Database write failed, but can retry with same data",
                 "should_retry": True,
-                "suggested_response": "I'm having trouble logging the emergency. Let me try again while you follow the first aid instructions..."
+                "blocks_criteria": ["emergency_logged"],
+                "can_proceed": True,  # Can still provide guidance even if logging fails
+                "suggested_response": "I'm having trouble logging the emergency right now, but let me try again. In the meantime, please continue following the first aid instructions - your safety is the priority."
             }
 
         except Exception as e:
-            logger.error(f"Error reporting emergency for patient {patient_id}: {e}", exc_info=True)
+            logger.error(f"Error reporting emergency for patient {validated_patient_id}: {e}", exc_info=True)
+
+            # Phase 2: Return SYSTEM_ERROR for exceptions
             return {
                 "success": False,
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": f"Failed to report emergency: {str(e)}",
+                "error_code": "WORKFLOW_EXCEPTION",
                 "should_retry": True,
-                "suggested_response": "I'm having trouble logging the emergency, but please follow the first aid instructions I provided. Your safety is the priority."
+                "blocks_criteria": ["emergency_logged"],
+                "can_proceed": True,  # Emergency guidance can still continue
+                "suggested_response": "I'm having trouble logging the emergency, but please follow the first aid instructions I provided. Your safety is the absolute priority. I'll keep trying to log this."
             }
 
     def _get_clinic_id(self) -> str:
@@ -482,7 +648,15 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             Dictionary with success status, emergency_type, and instructions list.
         """
         try:
-            normalized_type = self._normalize_emergency_type(emergency_type)
+            # ===== Phase 1: Validate Emergency Type =====
+
+            type_validation = self._validate_emergency_type(emergency_type)
+
+            # Log warning if unknown type or no specific instructions
+            if type_validation["warning"]:
+                logger.warning(f"First aid validation warning: {type_validation['warning']}")
+
+            normalized_type = type_validation["normalized_type"]
             instructions = self._get_first_aid_instructions(normalized_type)
 
             self._update_first_aid_state(session_id, instructions)
@@ -490,12 +664,20 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             # Format instructions as numbered list for suggested response
             formatted_instructions = "\n".join([f"{i+1}. {instr}" for i, instr in enumerate(instructions)])
 
+            # Add disclaimer if using default/general instructions
+            disclaimer = ""
+            if not type_validation["is_known"]:
+                disclaimer = "\n\n⚠️ Note: These are general emergency guidelines. For specific guidance, please call 911 or the clinic emergency line."
+
             return {
                 "success": True,
-                "result_type": ToolResultType.SUCCESS.value,
+                "result_type": ToolResultType.SUCCESS.value if type_validation["is_known"] else ToolResultType.PARTIAL.value,
                 "emergency_type": emergency_type,
+                "normalized_type": normalized_type,
                 "instructions": instructions,
-                "suggested_response": f"Here's what to do right now:\n\n{formatted_instructions}\n\nPlease follow these steps carefully. Are you able to do this?"
+                "has_specific_instructions": type_validation["is_known"],
+                "next_action": "report_emergency_and_provide_contacts",
+                "suggested_response": f"Here's what to do right now:\n\n{formatted_instructions}{disclaimer}\n\nPlease follow these steps carefully. Are you able to do this?"
             }
 
         except Exception as e:
@@ -573,20 +755,33 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
                 for name, number in self.EMERGENCY_CONTACTS.items()
             ])
 
+            # Phase 2: Return SUCCESS with rich metadata
             return {
                 "success": True,
                 "result_type": ToolResultType.SUCCESS.value,
                 "contacts": self.EMERGENCY_CONTACTS,
+                "count": len(self.EMERGENCY_CONTACTS),
+                "satisfies_criteria": [
+                    "emergency_contacts_provided"
+                ],
+                "next_action": "ensure_all_emergency_tasks_complete",
+                "can_proceed": True,
                 "message": "For life-threatening emergencies, call 911 immediately",
-                "suggested_response": f"Here are the emergency contacts:\n\n{contacts_formatted}\n\n⚠️ For life-threatening emergencies, call 911 immediately."
+                "suggested_response": f"Here are the emergency contacts:\n\n{contacts_formatted}\n\n⚠️ For life-threatening emergencies (severe bleeding, difficulty breathing, unconsciousness), call 911 immediately."
             }
 
         except Exception as e:
             logger.error(f"Error getting emergency contacts: {e}", exc_info=True)
+
+            # Phase 2: Return SYSTEM_ERROR with fallback guidance
             return {
                 "success": False,
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": f"Failed to retrieve emergency contacts: {str(e)}",
+                "error_code": "CONTACTS_RETRIEVAL_FAILED",
                 "should_retry": True,
-                "suggested_response": "I'm having trouble retrieving emergency contacts. For life-threatening emergencies, please call 911 immediately."
+                "blocks_criteria": ["emergency_contacts_provided"],
+                "can_proceed": True,  # Patient can still call 911
+                "fallback_contact": "911",
+                "suggested_response": "I'm having trouble retrieving emergency contacts. For life-threatening emergencies, please call 911 immediately. For urgent dental issues, you can call the clinic at the number you have on file."
             }
