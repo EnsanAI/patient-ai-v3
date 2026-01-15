@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # MCP Server (CareBot integration)
+  # mcp_server:
+  #   image: carebot-mcp:latest
+  #   container_name: patient_ai_mcp_server
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - PORT=8000
+  #     - LOG_LEVEL=INFO
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 40s
+  #   networks:
+  #     - patient_ai_network
+
+  # Patient AI Service v3
+  patient_ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: patient_ai_service
+    ports:
+      - "8002:8002"
+    environment:
+      # MCP Server Configuration
+      - MCP_SERVER_URL=http://host.docker.internal:8000/sse
+      
+      # LLM Configuration (Claude)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      
+      # LLM Model defaults (override in config/llm_config.yaml)
+      - LLM_MODEL_PRIMARY=claude-haiku-4-5-20250514
+      - LLM_TEMPERATURE=0.1
+      
+      # Application Configuration
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=development
+      
+      # Feature Flags
+      - ENABLE_EXTENDED_THINKING=true
+      - ENABLE_PROMPT_CACHING=true
+      - ENABLE_UNIFIED_REASONING=true
+      
+    # depends_on:
+    #   mcp_server:
+    #     condition: service_healthy
+    
+    volumes:
+      # Mount source code for development
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./tests:/app/tests
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    networks:
+      - patient_ai_network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  patient_ai_network:
+    driver: bridge

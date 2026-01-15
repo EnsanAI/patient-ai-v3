@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize orchestrator
     db_client = DbOpsClient()
+    await db_client.initialize()
     orchestrator = Orchestrator(db_client=db_client)
     await orchestrator.start()
 
@@ -171,6 +172,12 @@ async def api_message(request: Request):
             "emergency_flag": False,
             "error": str(e) if settings.debug else None
         }
+
+
+@app.post("/message", response_model=ChatResponse)
+async def message_endpoint(request: ChatRequest):
+    """Alias for /chat to support legacy clients/scripts."""
+    return await chat(request)
 
 
 @app.post("/chat", response_model=ChatResponse)

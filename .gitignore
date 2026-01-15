@@ -30,14 +30,7 @@ ENV/
 .env
 .env.local
 
-# Test files and directories
-test*.py
-*_test.py
-tests/
-test_*.sh
-test_*.html
-test_results*/
-reschedule_test_results/
+
 
 # Markdown files (excluding ARCHITECTURE_OVERVIEW.md)
 *.md

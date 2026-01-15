@@ -464,7 +464,7 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
 
     # ==================== TOOL IMPLEMENTATIONS ====================
 
-    def tool_report_emergency(
+    async def tool_report_emergency(
         self,
         session_id: str,
         patient_id: str,
@@ -519,7 +519,7 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
                 clinic_id, validated_patient_id, type_validation["normalized_type"], description, severity.lower()
             )
 
-            result = self.db_client.report_emergency(emergency_data)
+            result = await self.db_client.report_emergency(emergency_data)
 
             if result:
                 # Update state after successful logging
@@ -572,14 +572,14 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
                 "suggested_response": "I'm having trouble logging the emergency, but please follow the first aid instructions I provided. Your safety is the absolute priority. I'll keep trying to log this."
             }
 
-    def _get_clinic_id(self) -> str:
+    async def _get_clinic_id(self) -> str:
         """
         Get clinic ID from database or return default.
 
         Returns:
             Clinic ID string.
         """
-        clinic_info = self.db_client.get_clinic_info()
+        clinic_info = await self.db_client.get_clinic_info()
         return clinic_info.get("id") if clinic_info else "clinic_001"
 
     def _build_emergency_data(
@@ -632,7 +632,7 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             severity=severity
         )
 
-    def tool_first_aid(
+    async def tool_first_aid(
         self,
         session_id: str,
         emergency_type: str
@@ -738,7 +738,7 @@ Your goal is to ensure patient safety and direct them to appropriate care immedi
             first_aid_provided=True
         )
 
-    def tool_emergency_contacts(self, session_id: str) -> Dict[str, Any]:
+    async def tool_emergency_contacts(self, session_id: str) -> Dict[str, Any]:
         """
         Get emergency contact information.
 

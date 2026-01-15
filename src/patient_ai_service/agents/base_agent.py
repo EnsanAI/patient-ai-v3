@@ -518,7 +518,7 @@ class ExecutionContext:
                 logger.info(f"✓ [ExecutionContext]   ○ PENDING: {criterion.description}")
         
         # Phase 6: If no criteria, check plan tasks instead
-        if not self.plan:
+        if self.plan is not None and hasattr(self.plan, 'tasks'):
             logger.info(f"✓ [ExecutionContext] Using plan-based completion check (no criteria)")
             from patient_ai_service.models.agent_plan import TaskStatus
             

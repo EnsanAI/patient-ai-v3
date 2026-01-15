@@ -1905,7 +1905,7 @@ Respond in JSON format:
             # This is a simple heuristic - adjust based on your session ID strategy
             if session_id.startswith("+") or session_id.isdigit():
                 phone_number = session_id
-                patient = self.db_client.get_patient_by_phone_number(phone_number)
+                patient = await self.db_client.get_patient_by_phone_number(phone_number)
 
                 if patient:
                     # Load patient data into state
@@ -2171,7 +2171,7 @@ Respond in JSON format:
         # Build routing - USE routing_action IF PROVIDED (takes precedence)
         routing = RoutingResult(
             agent=unified_output.agent or "general_assistant",
-            action=unified_output.routing_action or unified_output.continuation_type or "new_request",  # CHANGED
+            action=unified_output.routing_action or unified_output.continuation_type or "new_intent",  # CHANGED
             urgency="emergency" if unified_output.situation_type == SituationType.EMERGENCY else "routine"
         )
 

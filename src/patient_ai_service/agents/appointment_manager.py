@@ -1765,7 +1765,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             
             # Step 1.5: Check for existing appointment at same time
             try:
-                existing_appointments = self.db_client.get_patient_appointments(patient_id)
+                existing_appointments = await self.db_client.get_patient_appointments(patient_id)
                 if existing_appointments:
                     normalized_time = self._normalize_time(time)
                     for existing in existing_appointments:
@@ -1776,7 +1776,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                             if existing_date == date and existing_time_normalized == normalized_time:
                                 # Time conflict found
                                 try:
-                                    available_slots = self.db_client.get_available_time_slots(
+                                    available_slots = await self.db_client.get_available_time_slots(
                                         doctor_id=doctor_id,
                                         date=date,
                                         slot_duration_minutes=30
@@ -1823,9 +1823,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
             logger.info(f"🔑 Idempotency key: {idempotency_key} - correlation_id={correlation_id}")
             
             # Step 3: Get clinic ID
-            clinic_info = self.db_client.get_clinic_info()
+            clinic_info = await self.db_client.get_clinic_info()
             if not clinic_info:
-                all_clinics = self.db_client.get_all_clinics()
+                all_clinics = await self.db_client.get_all_clinics()
                 if all_clinics and len(all_clinics) > 0:
                     clinic_id = all_clinics[0].get("id")
                     logger.info(f"Using first available clinic: {clinic_id} - correlation_id={correlation_id}")
@@ -1837,7 +1837,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 logger.info(f"Using clinic: {clinic_id} - correlation_id={correlation_id}")
             
             # Step 4: Get appointment type
-            appointment_types = self.db_client.get_appointment_types()
+            appointment_types = await self.db_client.get_appointment_types()
             appointment_type_id = appointment_types[0].get("id") if appointment_types else None
             
             if not appointment_type_id:

@@ -266,10 +266,10 @@ Use your tools to provide accurate, up-to-date information!"""
 
     # Tool implementations
 
-    def tool_get_clinic_info(self, session_id: str) -> Dict[str, Any]:
+    async def tool_get_clinic_info(self, session_id: str) -> Dict[str, Any]:
         """Get general clinic information."""
         try:
-            clinic = self.db_client.get_clinic_info()
+            clinic = await self.db_client.get_clinic_info()
             
             if not clinic:
                 # Return default info - still a success
@@ -311,10 +311,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_all_clinics(self, session_id: str) -> Dict[str, Any]:
+    async def tool_get_all_clinics(self, session_id: str) -> Dict[str, Any]:
         """Get all clinic branches."""
         try:
-            clinics = self.db_client.get_all_clinics()
+            clinics = await self.db_client.get_all_clinics()
             
             if not clinics:
                 return {
@@ -358,10 +358,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_services(self, session_id: str) -> Dict[str, Any]:
+    async def tool_get_services(self, session_id: str) -> Dict[str, Any]:
         """Get available dental services."""
         try:
-            procedures = self.db_client.get_all_dental_procedures()
+            procedures = await self.db_client.get_all_dental_procedures()
             
             if not procedures:
                 return {
@@ -403,10 +403,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_insurance_info(self, session_id: str) -> Dict[str, Any]:
+    async def tool_get_insurance_info(self, session_id: str) -> Dict[str, Any]:
         """Get insurance provider information."""
         try:
-            insurance_providers = self.db_client.get_insurance_providers()
+            insurance_providers = await self.db_client.get_insurance_providers()
             
             if not insurance_providers:
                 return {
@@ -448,10 +448,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_payment_methods(self, session_id: str) -> Dict[str, Any]:
+    async def tool_get_payment_methods(self, session_id: str) -> Dict[str, Any]:
         """Get available payment methods."""
         try:
-            payment_methods = self.db_client.get_payment_methods()
+            payment_methods = await self.db_client.get_payment_methods()
             
             if not payment_methods:
                 return {
@@ -492,10 +492,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_doctors(self, session_id: str) -> Dict[str, Any]:
+    async def tool_get_doctors(self, session_id: str) -> Dict[str, Any]:
         """Get list of available doctors."""
         try:
-            doctors = self.db_client.get_doctors()
+            doctors = await self.db_client.get_doctors()
             
             if not doctors:
                 return {
@@ -539,10 +539,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_doctor_info(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
+    async def tool_get_doctor_info(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
         """Get detailed information about a specific doctor."""
         try:
-            doctors = self.db_client.get_doctors()
+            doctors = await self.db_client.get_doctors()
             
             if not doctors:
                 return {
@@ -615,10 +615,10 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_get_procedure_info(self, session_id: str, procedure_name: str) -> Dict[str, Any]:
+    async def tool_get_procedure_info(self, session_id: str, procedure_name: str) -> Dict[str, Any]:
         """Get detailed information about a specific dental procedure."""
         try:
-            procedures = self.db_client.get_all_dental_procedures()
+            procedures = await self.db_client.get_all_dental_procedures()
 
             if not procedures:
                 return {
@@ -679,7 +679,7 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
+    async def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
         """
         Find a doctor by name using the appointment manager's fuzzy matching.
 
@@ -695,7 +695,7 @@ Use your tools to provide accurate, up-to-date information!"""
             if not self.appointment_manager:
                 logger.warning("Appointment manager not available, falling back to basic search")
                 # Fallback to basic get_doctor_info if appointment manager not available
-                return self.tool_get_doctor_info(session_id, doctor_name)
+                return await self.tool_get_doctor_info(session_id, doctor_name)
 
             # Use appointment manager's fuzzy matching
             result = self.appointment_manager.tool_find_doctor_by_name(session_id, doctor_name)
@@ -714,7 +714,7 @@ Use your tools to provide accurate, up-to-date information!"""
                 "can_proceed": False
             }
 
-    def tool_check_doctor_availability(
+    async def tool_check_doctor_availability(
         self,
         session_id: str,
         doctor_id: str,

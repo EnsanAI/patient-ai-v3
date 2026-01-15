@@ -171,7 +171,7 @@ TOOL: register_patient(first_name, last_name, phone, date_of_birth, gender)
 
 PRIVACY: Your information is securely stored and used only for providing dental care."""
 
-    def tool_register_patient(
+    async def tool_register_patient(
         self,
         session_id: str,
         first_name: str,
@@ -262,14 +262,14 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                 }
 
             # === STEP 5: Create user & patient in DB ===
-            existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
+            existing_user = await self.db_client.get_user_by_phone_number(fields["phone"])
 
             if existing_user:
                 user_id = existing_user.get("id")
                 logger.info(f"Found existing user: {user_id}")
             else:
                 # Create user
-                user_data = self.db_client.register_user(
+                user_data = await self.db_client.register_user(
                     email=f"{fields['phone']}@temp.clinic",
                     full_name=f"{fields['first_name']} {fields['last_name']}",
                     phone_number=fields["phone"],
@@ -277,7 +277,7 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                 )
                 if not user_data:
                     # Try to fetch user again (might have been created by race condition)
-                    existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
+                    existing_user = await self.db_client.get_user_by_phone_number(fields["phone"])
                     if existing_user:
                         user_id = existing_user.get("id")
                     else:
@@ -292,7 +292,7 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                     user_id = user_data.get("userId") or user_data.get("id")
                     if not user_id:
                         # Fallback: try to get user by phone
-                        existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
+                        existing_user = await self.db_client.get_user_by_phone_number(fields["phone"])
                         if existing_user:
                             user_id = existing_user.get("id")
                         else:
@@ -305,7 +305,7 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                             }
 
             # Create patient record
-            patient_data = self.db_client.create_patient(
+            patient_data = await self.db_client.create_patient(
                 user_id=user_id,
                 first_name=fields["first_name"],
                 last_name=fields["last_name"],
