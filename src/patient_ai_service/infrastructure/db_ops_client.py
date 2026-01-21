@@ -3,7 +3,10 @@ import os
 import logging
 import time
 import json
-from typing import Optional, Dict, Any, List # Added for type hinting
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from patient_ai_service.models.clinic_context import ClinicContext
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -11,6 +14,8 @@ logger = logging.getLogger(__name__)
 class DbOpsClient:
     def __init__(self, base_url: Optional[str] = None, user_email: Optional[str] = None, user_password: Optional[str] = None):
         self.base_url = base_url or os.environ.get("DB_OPS_URL")
+        # Clinic context for multi-tenant RLS header propagation
+        self._clinic_context: Optional["ClinicContext"] = None
         if not self.base_url:
             # For Docker: use db-ops service name on port 3000 (internal), for local: use localhost:8001
             if os.environ.get("DOCKER_HOST") or os.environ.get("HOSTNAME", "").startswith("carebot"):
@@ -204,6 +209,24 @@ class DbOpsClient:
         # Refresh if token expires within 60 seconds
         return time.time() > (self.token_expiry - 60)
 
+    def set_clinic_context(self, clinic_context: "ClinicContext") -> None:
+        """
+        Set clinic context for all subsequent requests.
+
+        This enables multi-tenant RLS (Row Level Security) by adding
+        X-Clinic-Id header to all db-ops API calls.
+
+        Args:
+            clinic_context: ClinicContext object with clinic_id and session_id
+        """
+        self._clinic_context = clinic_context
+        logger.info(f"DbOpsClient: Clinic context set - clinic_id={clinic_context.clinic_id}")
+
+    def clear_clinic_context(self) -> None:
+        """Clear the clinic context (useful between requests in tests)."""
+        self._clinic_context = None
+        logger.debug("DbOpsClient: Clinic context cleared")
+
     def _make_request(
         self,
         method: str,
@@ -235,7 +258,12 @@ class DbOpsClient:
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
 
-        logger.debug(f"📤 {method} {endpoint}")
+        # Add clinic context headers for multi-tenant RLS enforcement
+        if self._clinic_context:
+            headers.update(self._clinic_context.to_headers())
+            logger.debug(f"📤 {method} {endpoint} [clinic={self._clinic_context.clinic_id}]")
+        else:
+            logger.debug(f"📤 {method} {endpoint}")
 
         for attempt in range(attempts):
             try:

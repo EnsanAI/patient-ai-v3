@@ -112,15 +112,16 @@ async def health_check():
 async def api_message(request: Request):
     """
     Legacy endpoint for WhatsApp service compatibility.
-    
-    Accepts the same format as patient-ai-service v1:
+
+    Accepts the same format as patient-ai-service v1, with added clinic_id for multi-tenancy:
     {
         "message": "Hello",
         "phone_number": "+971501234567",
+        "clinic_id": "uuid-of-clinic",  # Required for multi-clinic support
         "production": false,
         "source": "whatsapp"
     }
-    
+
     Returns:
     {
         "response": "Hello! How can I help?",
@@ -134,22 +135,40 @@ async def api_message(request: Request):
         data = await request.json()
         message = data.get("message") or data.get("text", "")
         phone_number = data.get("phone_number") or data.get("phoneNumber")
+        clinic_id = data.get("clinic_id")  # Extract clinic_id for multi-tenant support
         session_id = phone_number or data.get("session_id") or f"session_{hash(str(data))}"
-        
-        logger.info(f"API message request: phone={phone_number}, session={session_id}")
-        
-        # Process message through orchestrator
+
+        # FAIL SECURELY: Require clinic_id for multi-clinic isolation
+        if not clinic_id:
+            logger.error(f"Request missing clinic_id for session {session_id}")
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error": "clinic_id is required",
+                    "response": "Unable to process message: clinic context missing",
+                    "intent": "error",
+                    "patient_identified": False,
+                    "patient_id": None,
+                    "emergency_flag": False
+                }
+            )
+
+        logger.info(f"API message request: phone={phone_number}, session={session_id}, clinic={clinic_id}")
+
+        # Process message through orchestrator with clinic context
         response = await orchestrator.process_message(
             session_id=session_id,
             message=message,
-            language=None
+            language=None,
+            clinic_id=clinic_id  # Pass clinic_id to orchestrator
         )
-        
-        # Get patient info from state
-        state = orchestrator.get_session_state(session_id)
+
+        # Get patient info from state (using composite key for clinic-scoped lookup)
+        composite_key = f"clinic:{clinic_id}:session:{session_id}"
+        state = orchestrator.get_session_state(composite_key)
         patient_id = state.get("patient_profile", {}).get("patient_id")
         patient_identified = patient_id is not None
-        
+
         # Return v1-compatible format
         return {
             "response": response.response,
@@ -158,9 +177,10 @@ async def api_message(request: Request):
             "patient_id": patient_id,
             "emergency_flag": response.urgency == "critical",
             "session_id": session_id,
+            "clinic_id": clinic_id,  # Include clinic_id in response
             "metadata": response.metadata
         }
-        
+
     except Exception as e:
         logger.error(f"Error in /api/message endpoint: {e}", exc_info=True)
         return {
@@ -179,22 +199,33 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Process a chat message.
 
     Args:
-        request: ChatRequest with message and session_id
+        request: ChatRequest with message, session_id, and clinic_id
 
     Returns:
         ChatResponse with agent's reply
     """
     try:
-        logger.info(f"Chat request from session: {request.session_id}")
+        # FAIL SECURELY: Require clinic_id for multi-clinic isolation
+        if not request.clinic_id:
+            logger.error(f"Chat request missing clinic_id for session {request.session_id}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="clinic_id is required for multi-clinic support"
+            )
+
+        logger.info(f"Chat request from session: {request.session_id}, clinic: {request.clinic_id}")
 
         response = await orchestrator.process_message(
             session_id=request.session_id,
             message=request.message,
-            language=request.language
+            language=request.language,
+            clinic_id=request.clinic_id  # Pass clinic_id to orchestrator
         )
 
         return response
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in chat endpoint: {e}", exc_info=True)
         raise HTTPException(

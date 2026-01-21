@@ -39,6 +39,7 @@ class ChatRequest(BaseModel):
     """HTTP request for chat endpoint."""
     message: str = Field(..., min_length=1, max_length=5000)
     session_id: str = Field(..., min_length=1, max_length=100)  # Allow phone numbers and other formats
+    clinic_id: Optional[str] = Field(None, description="Clinic identifier for multi-tenant support")
     language: Optional[str] = None
 
     @validator('message')
@@ -51,6 +52,7 @@ class ChatRequest(BaseModel):
             "example": {
                 "message": "I need to book an appointment",
                 "session_id": "user_12345",
+                "clinic_id": "550e8400-e29b-41d4-a716-446655440000",
                 "language": "en"
             }
         }

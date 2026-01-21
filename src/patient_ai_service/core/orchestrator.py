@@ -706,28 +706,46 @@ Respond in JSON format:
         self,
         session_id: str,
         message: str,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        clinic_id: Optional[str] = None
     ) -> ChatResponse:
         """
         Process a user message through the complete pipeline.
 
         Args:
-            session_id: Unique session identifier
+            session_id: Unique session identifier (typically phone number)
             message: User's message
             language: Optional language hint
+            clinic_id: Clinic identifier for multi-tenant support
 
         Returns:
             ChatResponse with agent's reply
         """
+        # Create clinic context and composite session key for multi-tenant isolation
+        from patient_ai_service.models.clinic_context import ClinicContext
+
+        if clinic_id:
+            clinic_context = ClinicContext(clinic_id=clinic_id, session_id=session_id)
+            composite_session_key = clinic_context.composite_key
+            # Set clinic context on db_client for RLS header propagation
+            self.db_client.set_clinic_context(clinic_context)
+        else:
+            # Fallback for backward compatibility (should not happen in production)
+            composite_session_key = session_id
+            clinic_context = None
+            logger.warning(f"No clinic_id provided for session {session_id} - using non-namespaced key")
+
         pipeline_start_time = time.time()
         # Import settings at function level to avoid UnboundLocalError
         from patient_ai_service.core.config import settings as config_settings
-        obs_logger = get_observability_logger(session_id) if config_settings.enable_observability else None
-        
+        obs_logger = get_observability_logger(composite_session_key) if config_settings.enable_observability else None
+
         logger.info("=" * 100)
         logger.info("ORCHESTRATOR: process_message() CALLED")
         logger.info("=" * 100)
         logger.info(f"Session ID: {session_id}")
+        logger.info(f"Clinic ID: {clinic_id}")
+        logger.info(f"Composite Session Key: {composite_session_key}")
         logger.info(f"Input Message: {message}")
         logger.info(f"Language Hint: {language}")
         logger.info(f"Pipeline Start Time: {pipeline_start_time}")
@@ -740,8 +758,8 @@ Respond in JSON format:
             logger.info("-" * 100)
             logger.info("ORCHESTRATOR STEP 1: Load Patient")
             logger.info("-" * 100)
-            with obs_logger.pipeline_step(1, "load_patient", "orchestrator", {"session_id": session_id}) if obs_logger else nullcontext():
-                await self._ensure_patient_loaded(session_id)
+            with obs_logger.pipeline_step(1, "load_patient", "orchestrator", {"session_id": composite_session_key}) if obs_logger else nullcontext():
+                await self._ensure_patient_loaded(composite_session_key)
             step1_duration = (time.time() - step1_start) * 1000
             logger.info(f"Step 1 completed in {step1_duration:.2f}ms")
 
@@ -753,12 +771,12 @@ Respond in JSON format:
             logger.info(f"Original message: {message[:200]}")
             with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
                 from patient_ai_service.core.feature_flags import is_translation_enabled
-                if is_translation_enabled(session_id):
+                if is_translation_enabled(composite_session_key):
                     translation_agent = self.agents["translation"]
 
                     # OPTIMIZED: Single LLM call for detection AND translation
                     translate_start = time.time()
-                    english_message, detected_lang, detected_dialect, translation_succeeded = await translation_agent.detect_and_translate(message, session_id)
+                    english_message, detected_lang, detected_dialect, translation_succeeded = await translation_agent.detect_and_translate(message, composite_session_key)
                     translate_duration = (time.time() - translate_start) * 1000
 
                     logger.info(
@@ -774,7 +792,7 @@ Respond in JSON format:
                     translation_succeeded = True
 
                 # Get current language context
-                global_state = self.state_manager.get_global_state(session_id)
+                global_state = self.state_manager.get_global_state(composite_session_key)
                 language_context = global_state.language_context
 
                 # Check if language switched
@@ -812,7 +830,7 @@ Respond in JSON format:
 
                 # Update global state with new language context
                 self.state_manager.update_global_state(
-                    session_id,
+                    composite_session_key,
                     language_context=language_context
                 )
 
@@ -844,12 +862,12 @@ Respond in JSON format:
             logger.info("-" * 100)
             with obs_logger.pipeline_step(3, "add_to_memory", "memory_manager", {"message": english_message[:100]}) if obs_logger else nullcontext():
                 # Store in ConversationMemory (English - for Unified Reasoning & _think())
-                self.memory_manager.add_user_turn(session_id, english_message)
+                self.memory_manager.add_user_turn(composite_session_key, english_message)
                 logger.info(f"📝 [ConversationMemory] Stored user turn (English): {english_message[:80]}...")
 
                 # Also store in NativeLanguageMemory (Original language - for response generators)
                 self.native_memory_manager.add_user_turn(
-                    session_id=session_id,
+                    session_id=composite_session_key,
                     content=message,  # Original message before translation
                     language=detected_lang,
                     dialect=detected_dialect
@@ -866,7 +884,12 @@ Respond in JSON format:
             logger.info("ORCHESTRATOR STEP 4: Unified Reasoning")
             logger.info("-" * 100)
 
-            global_state = self.state_manager.get_global_state(session_id)
+            global_state = self.state_manager.get_global_state(composite_session_key)
+
+            # Store clinic_id in global state if not already set
+            if clinic_id and not global_state.clinic_id:
+                global_state.clinic_id = clinic_id
+                self.state_manager.update_global_state(composite_session_key, clinic_id=clinic_id)
 
             patient_info = {
                 "patient_id": global_state.patient_profile.patient_id,
@@ -876,7 +899,7 @@ Respond in JSON format:
             }
 
             # Get continuation context
-            continuation_context = self.state_manager.get_continuation_context(session_id)
+            continuation_context = self.state_manager.get_continuation_context(composite_session_key)
             awaiting = continuation_context.get("awaiting") if continuation_context else None
             awaiting_context = continuation_context.get("awaiting_context") if continuation_context else None  # NEW
             pending_action = continuation_context.get("pending_action") if continuation_context else None      # NEW
@@ -892,7 +915,7 @@ Respond in JSON format:
                 logger.info("=" * 80)
 
             # Get existing plan
-            existing_plan = self.state_manager.get_any_active_plan(session_id)
+            existing_plan = self.state_manager.get_any_active_plan(composite_session_key)
 
             # 🔍 ADD LOGGING HERE
             logger.info(f"🔍🔍🔍 [ORCHESTRATOR] PLAN RETRIEVAL ══════════════════")
@@ -914,17 +937,17 @@ Respond in JSON format:
             logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
 
             # Get recent conversation turns (last 8 messages)
-            recent_turns = self._get_recent_turns(session_id, limit=6)
+            recent_turns = self._get_recent_turns(composite_session_key, limit=6)
 
             # Check if planning is enabled for this session (A/B testing)
-            planning_enabled = FeatureFlags.is_enabled("planning", session_id)
+            planning_enabled = FeatureFlags.is_enabled("planning", composite_session_key)
             if not planning_enabled:
                 logger.info(f"📋 [Orchestrator] Planning DISABLED for session {session_id}")
 
             # Single unified reasoning call
             with obs_logger.pipeline_step(4, "unified_reasoning", "unified_reasoning", {"message": english_message[:100]}) if obs_logger else nullcontext():
                 unified_output = await self.unified_reasoning.reason(
-                    session_id=session_id,
+                    session_id=composite_session_key,
                     message=english_message,
                     patient_info=patient_info,
                     active_agent=global_state.active_agent,
@@ -972,7 +995,7 @@ Respond in JSON format:
                 with obs_logger.pipeline_step(5, "fast_path_routing", "orchestrator", {"situation": unified_output.situation_type.value}) if obs_logger else nullcontext():
                     # Get conversation history from NativeLanguageMemory for context-aware response
                     # This provides original language context for better tone matching
-                    native_turns = self.native_memory_manager.get_recent_turns(session_id, limit=4)
+                    native_turns = self.native_memory_manager.get_recent_turns(composite_session_key, limit=4)
                     logger.info(f"🔍 [_conversational_response] Retrieved {len(native_turns)} turns from NativeLanguageMemory")
                     if native_turns:
                         logger.info(f"🔍 [_conversational_response] Language: {native_turns[0].get('language', 'unknown')}")

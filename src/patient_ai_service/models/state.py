@@ -142,6 +142,7 @@ class AppointmentContext(BaseModel):
 class GlobalState(BaseModel):
     """Global state shared across all agents."""
     session_id: str
+    clinic_id: Optional[str] = None  # Clinic identifier for multi-tenant support
     patient_profile: PatientProfile = Field(default_factory=PatientProfile)
     current_appointment: Optional[AppointmentContext] = None
     conversation_stage: ConversationStage = ConversationStage.INITIAL
@@ -198,6 +199,7 @@ class GlobalState(BaseModel):
         json_schema_extra = {
             "example": {
                 "session_id": "user_12345",
+                "clinic_id": "550e8400-e29b-41d4-a716-446655440000",
                 "conversation_stage": "initial",
                 "language_context": {
                     "current_language": "en",
