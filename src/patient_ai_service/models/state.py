@@ -2,11 +2,16 @@
 State management models for the multi-agent system.
 """
 
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
 from pydantic import BaseModel, Field, field_validator
 
 from .enums import ConversationStage, TriageLevel
+
+if TYPE_CHECKING:
+    from patient_ai_service.models.clinic_metadata import ClinicMetadata
 
 
 class PatientProfile(BaseModel):
@@ -77,6 +82,10 @@ class LanguageContext(BaseModel):
     last_detected_at: Optional[datetime] = None
     turn_count: int = 0
 
+    # Language selection tracking
+    language_selected: bool = False  # True if user explicitly chose a language
+    language_selection_timestamp: Optional[datetime] = None
+
     # Translation quality tracking
     translation_failures: int = 0
     last_translation_error: Optional[str] = None
@@ -102,6 +111,15 @@ class LanguageContext(BaseModel):
         self.current_dialect = new_dialect
         self.last_detected_at = datetime.utcnow()
 
+    def mark_language_selected(self, language: str, dialect: Optional[str] = None):
+        """Mark that user has explicitly selected a language."""
+        self.language_selected = True
+        self.language_selection_timestamp = datetime.utcnow()
+        self.preferred_language = language
+        self.preferred_dialect = dialect
+        self.current_language = language
+        self.current_dialect = dialect
+
     def to_agent_context(self) -> Dict[str, Any]:
         """
         Format language context for passing to agents.
@@ -112,7 +130,8 @@ class LanguageContext(BaseModel):
             "current_language": self.current_language,
             "current_dialect": self.current_dialect,
             "full_code": self.get_full_language_code(),
-            "recently_switched": len(self.language_history) > 0
+            "recently_switched": len(self.language_history) > 0,
+            "language_selected": self.language_selected
         }
 
     class Config:
@@ -143,6 +162,7 @@ class GlobalState(BaseModel):
     """Global state shared across all agents."""
     session_id: str
     clinic_id: Optional[str] = None  # Clinic identifier for multi-tenant support
+    clinic_metadata: Optional[ClinicMetadata] = None  # Clinic metadata for AI reasoning context
     patient_profile: PatientProfile = Field(default_factory=PatientProfile)
     current_appointment: Optional[AppointmentContext] = None
     conversation_stage: ConversationStage = ConversationStage.INITIAL
@@ -331,3 +351,17 @@ class TranslationState(BaseModel):
                 "auto_detect": True
             }
         }
+
+
+# Rebuild GlobalState model after ClinicMetadata is imported
+# This resolves forward reference issues with TYPE_CHECKING
+def _rebuild_models():
+    """Rebuild models that use forward references from TYPE_CHECKING."""
+    try:
+        from patient_ai_service.models.clinic_metadata import ClinicMetadata
+        GlobalState.model_rebuild()
+    except Exception:
+        # If ClinicMetadata doesn't exist yet, that's okay
+        pass
+
+_rebuild_models()

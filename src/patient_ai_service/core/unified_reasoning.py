@@ -9,7 +9,10 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from patient_ai_service.models.clinic_metadata import ClinicMetadata
 
 from patient_ai_service.core.llm import LLMClient, get_llm_client
 from patient_ai_service.core.llm_config import get_llm_config_manager
@@ -83,6 +86,7 @@ def _format_time_ago(timestamp_str: Optional[str]) -> str:
 
 # Agent capabilities for plan context
 AGENT_CAPABILITIES = {
+    "language_selection": "Collects patient's language preference and welcomes them",
     "registration": "Registers new patients (name, phone, DOB, gender). Cannot book appointments.",
     "appointment_manager": "Hanldes anything related to appointments and booking. Can Book, reschedule, cancel, fetch appointments. Can check doctor availability.",
     "emergency_response": "Handles urgent medical situations requiring immediate attention. Like sever intolerable pain, severe bleeding, difficulty breathing, severe facial swelling, knocked out tooth, etc.",
@@ -116,7 +120,8 @@ class UnifiedReasoning:
         information_collection: Optional[Dict[str, Any]],  # NEW
         recent_turns: List[Dict[str, str]],
         existing_plan: Optional[AgentPlan],
-        planning_enabled: bool = True  # A/B testing: when False, plan sections removed from prompt
+        planning_enabled: bool = True,  # A/B testing: when False, plan sections removed from prompt
+        clinic_metadata: Optional["ClinicMetadata"] = None  # NEW
     ) -> UnifiedReasoningOutput:
         """
         Perform unified reasoning in a single LLM call.
@@ -167,6 +172,24 @@ class UnifiedReasoning:
             logger.info(f"🔍 active_agent: {active_agent}")
             logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
 
+        # Check if language needs to be selected
+        from patient_ai_service.core.state_manager import get_state_manager
+        state_manager = get_state_manager()
+        global_state = state_manager.get_global_state(session_id)
+        language_context = global_state.language_context
+
+        if not language_context.language_selected:
+            logger.info("[Unified Reasoning] Language not selected - routing to language_selection agent")
+            return UnifiedReasoningOutput(
+                route_type=RouteType.AGENT,
+                situation_type=SituationType.NEW_INTENT,
+                agent="language_selection",
+                is_continuation=False,
+                what_user_means="User needs to select language preference",
+                objective="Collect language preference and welcome patient",
+                plan_decision=PlanDecision.NO_PLAN if planning_enabled else None
+            )
+
         # Get observability logger
         obs_logger = get_observability_logger(session_id) if settings.enable_observability else None
 
@@ -186,7 +209,8 @@ class UnifiedReasoning:
             information_collection=information_collection,  # NEW
             recent_turns=recent_turns,
             existing_plan=existing_plan if planning_enabled_for_session else None,
-            planning_enabled=planning_enabled_for_session
+            planning_enabled=planning_enabled_for_session,
+            clinic_metadata=clinic_metadata  # NEW
         )
 
         # Log the built prompt
@@ -197,7 +221,8 @@ class UnifiedReasoning:
         )
         system_prompt = self._get_system_prompt(
             planning_enabled=planning_enabled_for_session,
-            include_routing_action=has_routing_action
+            include_routing_action=has_routing_action,
+            clinic_metadata=clinic_metadata
         )
         logger.info("=" * 80)
         logger.info("☘️ [UnifiedReasoning] BUILT PROMPT:")
@@ -317,24 +342,39 @@ class UnifiedReasoning:
                 objective=""
             )
 
-    def _get_system_prompt(self, planning_enabled: bool = True, include_routing_action: bool = False) -> str:
+    def _get_system_prompt(self, planning_enabled: bool = True, include_routing_action: bool = False, clinic_metadata: Optional["ClinicMetadata"] = None) -> str:
         """Get system prompt for unified reasoning.
 
         Args:
             planning_enabled: When False, plan decision sections are excluded from prompt
             include_routing_action: When True, include routing_action field in output schema
+            clinic_metadata: Optional clinic metadata for contextualization
         """
+        # Build date/time section
+        datetime_section = ""
+        if clinic_metadata:
+            datetime_section = f"""═══════════════════════════════════════════════════════════════════════════════
+CURRENT DATE & TIME
+═══════════════════════════════════════════════════════════════════════════════
+
+{clinic_metadata.get_current_datetime_str()}
+
+"""
+        
         # Identity section - establishes role as dental clinic receptionist
-        identity_section = """═══════════════════════════════════════════════════════════════════════════════
+        clinic_name = clinic_metadata.name if clinic_metadata else "a dental clinic"
+        clinic_location = clinic_metadata.address if clinic_metadata and clinic_metadata.address else "the UAE (United Arab Emirates)"
+        
+        identity_section = f"""═══════════════════════════════════════════════════════════════════════════════
 YOUR IDENTITY
 ═══════════════════════════════════════════════════════════════════════════════
 
-You are an AI-powered dental clinic receptionist assistant operating in the UAE (United Arab Emirates).
+You are an AI-powered receptionist assistant for {clinic_name} located in {clinic_location}.
 
 YOUR ROLE:
-- You work for a dental clinic in the UAE
-- You are the first point of contact for patients calling or messaging the dental clinic
-- You ask questions to clarify the patient's request/intent if it is unclear or not suitable.
+- You work for {clinic_name}
+- You are the first point of contact for patients calling or messaging the clinic
+- You ask questions to clarify the patient's request/intent if it is unclear or not suitable
 - You coordinate with different specialized agents to fulfill patient requests
 
 """
@@ -357,7 +397,7 @@ SITUATION TYPE
 - modification: Changes something already set.
 
 (route_type="agent", is_continuation=false):
-- new_request: New conversation with new request
+- new_intent: New conversation with new request
 - topic_shift: Same conversation but changed request
 
 """
@@ -437,7 +477,7 @@ FOR AGENT ROUTING (all other cases):
   "objective": "New goal for the agent (empty if resume)","""
 
         output_section += """
-  "what_user_means": "Plain English explanation of what user actually wants NOW + what do we need to do to help them + what's bloking us (if anything)"""
+  "what_user_means": "Plain English explanation of what user actually wants NOW + what do we need to do to help them + what's bloking us (if anything)" """
 
         if include_routing_action:
             output_section += """,
@@ -446,10 +486,9 @@ FOR AGENT ROUTING (all other cases):
         
         output_section += """}
 
-Respond strictly in
-JSON only. No explanation outside JSON."""
+Respond strictly in JSON only. No explanation outside JSON."""
 
-        return f"""You are the unified reasoning engine for a clinic AI.
+        return f"""{datetime_section}You are the unified reasoning engine for a clinic AI.
 
 {identity_section}{situation_types_section}{plan_decisions_section}{task_section}{agent_roles_section}{output_section}"""
 
@@ -465,7 +504,8 @@ JSON only. No explanation outside JSON."""
         information_collection: Optional[Dict[str, Any]],  # NEW
         recent_turns: List[Dict[str, str]],
         existing_plan: Optional[AgentPlan],
-        planning_enabled: bool = True  # A/B testing: when False, plan context excluded
+        planning_enabled: bool = True,  # A/B testing: when False, plan context excluded
+        clinic_metadata: Optional["ClinicMetadata"] = None  # NEW
     ) -> str:
         """Build the unified reasoning prompt."""
 
@@ -566,6 +606,17 @@ INFORMATION COLLECTION RULES:
 - If user changes their mind about what they need → treat as new_intent/topic_shift.
 """
 
+        # Build clinic context section
+        clinic_context_section = ""
+        if clinic_metadata:
+            clinic_context_section = f"""
+═══════════════════════════════════════════════════════════════════════════════
+CLINIC INFORMATION
+═══════════════════════════════════════════════════════════════════════════════
+
+{clinic_metadata.to_prompt_context()}
+"""
+
         return f"""═══════════════════════════════════════════════════════════════════════════════
 CONTEXT
 ═══════════════════════════════════════════════════════════════════════════════
@@ -580,6 +631,7 @@ AWAITING CONTEXT: {awaiting_context or "N/A"}
 
 RECENT CONVERSATION:
 {turns_formatted}
+{clinic_context_section}
 {registration_status_section}
 {pending_action_section}
 {information_collection_section}
@@ -683,7 +735,8 @@ ACTIVE AGENT CAPABILITY
             response = "\n".join(json_lines)
 
         try:
-            data = json.loads(response)
+            from patient_ai_service.core.json_utils import safe_json_loads
+            data = safe_json_loads(response, "UnifiedReasoning")
         except json.JSONDecodeError as e:
             logger.error(f"[UnifiedReasoning] JSON parse error: {e}")
             logger.error(f"[UnifiedReasoning] Response was: {response[:500]}")

@@ -30,6 +30,7 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from patient_ai_service.models.task_plan import TaskPlan, Task
+    from patient_ai_service.models.clinic_metadata import ClinicMetadata
 
 from patient_ai_service.models.agent_plan import AgentPlan, PlanAction, PlanStatus, TaskStatus, PlanTask
 
@@ -104,6 +105,31 @@ HUMANIZE_SYSTEM_PROMPT = """You are a SUPER PROFESSIONAL, natural, human-like cl
 
 ## OUTPUT
 Reply as if you're speaking directly to the patient - natural, conversational, matching their language, DIALECT, tone exactly."""
+
+
+def extract_phone_from_session_id(session_id: str) -> str:
+    """
+    Extract phone number from session_id.
+
+    Handles two formats:
+    1. Composite key: "clinic:{clinic_id}:session:{phone_number}"
+    2. Legacy format: plain phone number
+
+    Args:
+        session_id: Session identifier (composite key or plain phone)
+
+    Returns:
+        Phone number extracted from session_id, or original session_id if extraction fails
+    """
+    if session_id.startswith("clinic:") and ":session:" in session_id:
+        # Extract phone number from composite key: clinic:xxx:session:{phone}
+        return session_id.split(":session:")[-1]
+    elif session_id.startswith("+") or session_id.isdigit():
+        # Legacy format: plain phone number
+        return session_id
+    else:
+        # Fallback: return as-is
+        return session_id
 
 
 def format_time_ago(timestamp: datetime) -> str:
@@ -1694,6 +1720,9 @@ Output ONLY valid JSON."""
                         return response, execution_log
                     elif suggested:
                         # ROLLBACK: Return suggested_response as-is (no humanization)
+                        # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                        # This ensures orchestrator can store English version, not translated/humanized
+                        execution_log.suggested_response = suggested
                         self._log_execution_summary(exec_context)
                         return suggested, execution_log
                     else:
@@ -1731,6 +1760,9 @@ Output ONLY valid JSON."""
                         return response, execution_log
                     elif suggested:
                         # ROLLBACK: Return suggested_response as-is (no humanization)
+                        # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                        # This ensures orchestrator can store English version, not translated/humanized
+                        execution_log.suggested_response = suggested
                         self._log_execution_summary(exec_context)
                         return suggested, execution_log
                     else:
@@ -1764,6 +1796,9 @@ Output ONLY valid JSON."""
                         return response, execution_log
                     elif suggested:
                         # ROLLBACK: Return suggested_response as-is (no humanization)
+                        # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                        # This ensures orchestrator can store English version, not translated/humanized
+                        execution_log.suggested_response = suggested
                         self._log_execution_summary(exec_context)
                         return suggested, execution_log
                     else:
@@ -1789,12 +1824,16 @@ Output ONLY valid JSON."""
                         
                         if suggested and is_humanizer_enabled(session_id):
                             # NEW PATH: Use humanizer
+                            # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                            execution_log.suggested_response = suggested
                             user_intent = self._get_user_intent(session_id, exec_context)
                             response = await self._humanize_response(session_id, suggested, user_intent)
                             self._log_execution_summary(exec_context)
                             return response, execution_log
                         elif suggested:
                             # ROLLBACK: Return suggested_response as-is (no humanization)
+                            # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                            execution_log.suggested_response = suggested
                             self._log_execution_summary(exec_context)
                             return suggested, execution_log
                         else:
@@ -1831,12 +1870,16 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
+                    # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     user_intent = self._get_user_intent(session_id, exec_context)
                     response = await self._humanize_response(session_id, suggested, user_intent)
                     self._log_execution_summary(exec_context)
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
+                    # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     self._log_execution_summary(exec_context)
                     return suggested, execution_log
                 else:
@@ -1860,12 +1903,16 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
+                    # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     user_intent = self._get_user_intent(session_id, exec_context)
                     response = await self._humanize_response(session_id, suggested, user_intent)
                     self._log_execution_summary(exec_context)
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
+                    # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     self._log_execution_summary(exec_context)
                     return suggested, execution_log
                 else:
@@ -1889,12 +1936,16 @@ Output ONLY valid JSON."""
                 
                 if suggested and is_humanizer_enabled(session_id):
                     # NEW PATH: Use humanizer
+                    # Store suggested_response (pre-humanization) in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     user_intent = self._get_user_intent(session_id, exec_context)
                     response = await self._humanize_response(session_id, suggested, user_intent)
                     self._log_execution_summary(exec_context)
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
+                    # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     self._log_execution_summary(exec_context)
                     return suggested, execution_log
                 else:
@@ -1954,6 +2005,8 @@ Output ONLY valid JSON."""
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
+                    # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     return suggested, execution_log
                 else:
                     # FALLBACK: Use existing _generate_response
@@ -2047,6 +2100,8 @@ Output ONLY valid JSON."""
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
+                    # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     return suggested, execution_log
                 else:
                     # FALLBACK: Use existing _generate_response
@@ -2171,6 +2226,8 @@ Output ONLY valid JSON."""
                     return response, execution_log
                 elif suggested:
                     # ROLLBACK: Return suggested_response as-is (no humanization)
+                    # CRITICAL: Always store suggested_response in execution_log for ConversationMemory
+                    execution_log.suggested_response = suggested
                     return suggested, execution_log
                 else:
                     # FALLBACK: Use existing _generate_response
@@ -2714,12 +2771,34 @@ CRITICAL RULES:
             # Also need doctor_info for full result
             doctor_info = self.state_manager.get_valid_derived_entity(session_id, "doctor_info")
             if doctor_info:
-                return {
-                    "success": True,
-                    "result_type": "success",
-                    "doctor": doctor_info,
-                    "from_cache": True
-                }
+                # CRITICAL: Validate that cached doctor matches the search criteria
+                requested_name = tool_input.get("doctor_name", "").strip().lower()
+                cached_name = doctor_info.get("name", "").strip().lower()
+                cached_first = doctor_info.get("first_name", "").strip().lower()
+                cached_last = doctor_info.get("last_name", "").strip().lower()
+                cached_full = f"{cached_first} {cached_last}".strip()
+                
+                # Check if requested name matches any form of cached doctor's name
+                name_matches = (
+                    requested_name in cached_name or
+                    cached_name in requested_name or
+                    requested_name in cached_full or
+                    cached_full in requested_name or
+                    requested_name == cached_first or
+                    requested_name == cached_last
+                )
+                
+                if name_matches:
+                    logger.info(f"[{self.agent_name}] Cache hit: '{requested_name}' matches cached doctor '{cached_name}'")
+                    return {
+                        "success": True,
+                        "result_type": "success",
+                        "doctor": doctor_info,
+                        "from_cache": True
+                    }
+                else:
+                    logger.info(f"[{self.agent_name}] Cache miss: '{requested_name}' does not match cached doctor '{cached_name}'")
+                    return None  # Force fresh tool call for different doctor
         
         elif tool_name == "list_doctors":
             # Don't use cache if it's an empty list - allow tool to be called to check for new doctors
@@ -3627,7 +3706,8 @@ RETRY:
         session_id: str,
         message: str,
         context: Dict[str, Any],
-        exec_context: ExecutionContext
+        exec_context: ExecutionContext,
+        clinic_metadata: Optional["ClinicMetadata"] = None  # NEW
     ) -> str:
         """
         Build the DYNAMIC thinking prompt (Layer 3 - NOT cached).
@@ -3675,7 +3755,7 @@ RETRY:
             if information_collection and information_collection.get('information_needed'):
                 collected = information_collection.get('collected_information', [])
                 info_section = f"""
-Collected Information:
+information JUST collected from user:
 {collected}
 """
 
@@ -3703,30 +3783,50 @@ Collected Information:
         # Extract patient identifier
         patient_id = llm_entities.get('patient_id') or entities.get('patient_id', 'unknown not registered yet')
 
+        # Extract phone number from session_id (removing composite key prefix)
+        phone_number = extract_phone_from_session_id(session_id)
+
         # Extract unified reasoning output fields
         situation_type = context.get('situation_type')
         is_continuation = context.get('is_continuation', False)
-        
+
+        # Build clinic context
+        clinic_context_str = ""
+        if clinic_metadata:
+            clinic_context_str = f"""
+
+{clinic_metadata.to_prompt_context()}
+"""
+
         # Assemble complete dynamic prompt with JSON schema
         prompt = f"""
 ═══════════════════════════════════════════════════════════════════════════════
-CURRENT SITUATION
+WHEN & WHERE ARE YOU
 ═══════════════════════════════════════════════════════════════════════════════
 
-Patient's Phone Number through they are speaking: {session_id}
+{clinic_context_str}
+
+═══════════════════════════════════════════════════════════════════════════════
+YOUR SHORT TERM MEMORY (RESOLVED ENTITIES)
+═══════════════════════════════════════════════════════════════════════════════
+
+Previoulsy collected information from user and tools:
+{formatted_entities}
+
+═══════════════════════════════════════════════════════════════════════════════
+CURRENT SITUATION
+═══════════════════════════════════════════════════════════════════════════════
+Patient's Phone Number through which are speaking: {phone_number}
 Patient ID: {patient_id}
 
 Patient's Message: {message}
+{info_section}
 
 #TRUSTED_SOURCE
 Identified Intent: {routing_action} | {user_intent}
 Situation Type: {situation_type or 'Not specified'}
 Is Continuation: {is_continuation}
 
-ENTITIES:
-{formatted_entities}
-
-{info_section}
 ═══════════════════════════════════════════════════════════════════════════════
 EXECUTION STATUS
 ═══════════════════════════════════════════════════════════════════════════════
@@ -4199,20 +4299,64 @@ DECISION RULES:
             logger.info(f"🔍 [{self.agent_name}] Step 1: Extracting JSON from response...")
             logger.info(f"🔍 [{self.agent_name}]   → Response preview: {response[:300]}...")
             
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
+            # Try multiple extraction strategies
+            json_str = None
+            
+            # Strategy 1: Extract from markdown code block (```json ... ```)
+            json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1).strip()
+                logger.info(f"🔍 [{self.agent_name}]   → Found JSON in markdown code block")
+            
+            # Strategy 2: Find balanced braces (handles nested objects properly)
+            if not json_str:
+                # Find first opening brace
+                start = response.find('{')
+                if start != -1:
+                    # Count braces to find matching closing brace
+                    brace_count = 0
+                    end = start
+                    for i, char in enumerate(response[start:], start=start):
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end = i + 1
+                                break
+                    
+                    if brace_count == 0:
+                        json_str = response[start:end]
+                        logger.info(f"🔍 [{self.agent_name}]   → Found JSON with balanced braces")
+            
+            if not json_str:
                 logger.error(f"🔍 [{self.agent_name}]   ❌ No JSON found in response!")
                 logger.error(f"🔍 [{self.agent_name}]   → Full response: {response}")
                 raise ValueError("No JSON found in response")
             
-            json_str = json_match.group()
             logger.info(f"🔍 [{self.agent_name}]   ✅ JSON extracted successfully")
             logger.info(f"🔍 [{self.agent_name}]   → JSON length: {len(json_str)} chars")
             logger.debug(f"🔍 [{self.agent_name}]   → Extracted JSON:\n{json_str}")
             
-            # Parse JSON
+            # Parse JSON with better error handling
             logger.info(f"🔍 [{self.agent_name}] Step 2: Parsing JSON...")
-            data = json.loads(json_str)
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                # Try to fix common JSON issues
+                logger.warning(f"🔍 [{self.agent_name}]   ⚠️ Initial parse failed, attempting fixes...")
+                
+                # Remove trailing commas (common LLM mistake)
+                fixed_json = re.sub(r',(\s*[}\]])', r'\1', json_str)
+                
+                # Try parsing again
+                try:
+                    data = json.loads(fixed_json)
+                    logger.info(f"🔍 [{self.agent_name}]   ✅ JSON parsed after fixing trailing commas")
+                except json.JSONDecodeError:
+                    # If still fails, re-raise original error
+                    raise e
+            
             logger.info(f"🔍 [{self.agent_name}]   ✅ JSON parsed successfully")
             logger.info(f"🔍 [{self.agent_name}]   → Top-level keys: {list(data.keys())}")
             
@@ -4470,8 +4614,18 @@ DECISION RULES:
             logger.error(f"🔍 [{self.agent_name}]   ❌ JSON parsing failed!")
             logger.error(f"🔍 [{self.agent_name}]   → Error: {str(e)}")
             logger.error(f"🔍 [{self.agent_name}]   → Error location: line {e.lineno}, col {e.colno}")
-            logger.error(f"🔍 [{self.agent_name}]   → Response preview: {response[:500]}")
-            logger.debug(f"🔍 [{self.agent_name}]   → Full response: {response}")
+            
+            # Show the problematic JSON area
+            if 'json_str' in locals():
+                error_pos = e.pos if hasattr(e, 'pos') else 0
+                error_start = max(0, error_pos - 100)
+                error_end = min(len(json_str), error_pos + 100)
+                logger.error(f"🔍 [{self.agent_name}]   → Extracted JSON around error:")
+                logger.error(f"🔍 [{self.agent_name}]      {json_str[error_start:error_end]}")
+                logger.debug(f"🔍 [{self.agent_name}]   → Full extracted JSON:\n{json_str}")
+            
+            logger.error(f"🔍 [{self.agent_name}]   → Original response preview: {response[:500]}")
+            logger.debug(f"🔍 [{self.agent_name}]   → Full original response: {response}")
             
             # Default to asking for clarification on parse error
             logger.info(f"🔍 [{self.agent_name}]   → Returning fallback CLARIFY decision")
@@ -4788,7 +4942,11 @@ DECISION RULES:
         # ═════════════════════════════════════════════════════════════════════
         logger.info(f"🧠 [{self.agent_name}] [STEP 2/5] Building thinking prompt...")
 
-        prompt = self._build_thinking_prompt(session_id, message, context, exec_context)
+        # Get clinic metadata from session
+        global_state = self.state_manager.get_global_state(session_id)
+        clinic_metadata = global_state.clinic_metadata if global_state else None
+
+        prompt = self._build_thinking_prompt(session_id, message, context, exec_context, clinic_metadata=clinic_metadata)
                 
         # ═════════════════════════════════════════════════════════════════════
         # STEP 3: PREPARE LLM CALL
@@ -4810,7 +4968,10 @@ DECISION RULES:
         agent_content = self._get_thinking_system_prompt(exec_context)
 
         # Layer 3: Dynamic (user prompt)
-        dynamic_prompt = self._build_thinking_prompt(session_id, message, context, exec_context)
+        # Get clinic metadata from session (already fetched above, reuse)
+        global_state = self.state_manager.get_global_state(session_id)
+        clinic_metadata = global_state.clinic_metadata if global_state else None
+        dynamic_prompt = self._build_thinking_prompt(session_id, message, context, exec_context, clinic_metadata=clinic_metadata)
         
         # Check if caching is enabled and client supports it
         use_caching = (

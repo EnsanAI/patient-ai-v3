@@ -4,10 +4,10 @@ FastAPI server with HTTP and WebSocket endpoints.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -106,6 +106,12 @@ async def health_check():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service unhealthy"
         )
+
+
+@app.get("/api/health")
+async def api_health_check():
+    """Alternative health check endpoint for compatibility."""
+    return await health_check()
 
 
 @app.post("/api/message")
@@ -235,20 +241,44 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 
 @app.get("/session/{session_id}")
-async def get_session(session_id: str):
+async def get_session(session_id: str, clinic_id: Optional[str] = Query(None)):
     """
     Get session state.
 
     Args:
         session_id: Session identifier
+        clinic_id: Clinic ID (REQUIRED for security)
 
     Returns:
         Complete session state
+
+    Security:
+        - Requires clinic_id query parameter
+        - Validates session belongs to specified clinic
+        - Prevents cross-clinic data access
     """
+    # SECURITY: Require clinic_id for multi-clinic isolation
+    if not clinic_id:
+        logger.error(f"GET /session request missing clinic_id for {session_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="clinic_id query parameter is required"
+        )
+
+    # SECURITY: Validate session belongs to clinic
+    # Session ID should contain clinic context (clinic:{clinic_id}:session:{phone})
+    if not session_id.startswith(f"clinic:{clinic_id}:"):
+        logger.error(f"Session {session_id} does not belong to clinic {clinic_id}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Session does not belong to specified clinic"
+        )
+
     try:
         state = orchestrator.get_session_state(session_id)
         return {
             "session_id": session_id,
+            "clinic_id": clinic_id,
             "state": state
         }
 
@@ -261,21 +291,47 @@ async def get_session(session_id: str):
 
 
 @app.delete("/session/{session_id}")
-async def clear_session(session_id: str):
+async def clear_session(session_id: str, clinic_id: Optional[str] = Query(None)):
     """
     Clear session state.
 
     Args:
         session_id: Session identifier
+        clinic_id: Clinic ID (REQUIRED for security)
 
     Returns:
         Success message
+
+    Security:
+        - Requires clinic_id query parameter
+        - Validates session belongs to specified clinic
+        - Prevents cross-clinic session deletion
     """
+    # SECURITY: Require clinic_id for multi-clinic isolation
+    if not clinic_id:
+        logger.error(f"DELETE /session request missing clinic_id for {session_id}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="clinic_id query parameter is required"
+        )
+
+    # SECURITY: Validate session belongs to clinic
+    # Session ID should contain clinic context (clinic:{clinic_id}:session:{phone})
+    if not session_id.startswith(f"clinic:{clinic_id}:"):
+        logger.error(f"Cannot delete session {session_id}: does not belong to clinic {clinic_id}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Session does not belong to specified clinic"
+        )
+
     try:
         orchestrator.clear_session(session_id)
+        logger.info(f"Session {session_id} cleared by clinic {clinic_id}")
         return {
             "success": True,
-            "message": f"Session {session_id} cleared"
+            "message": "Session cleared",
+            "session_id": session_id,
+            "clinic_id": clinic_id
         }
 
     except Exception as e:
@@ -302,18 +358,19 @@ async def get_config():
 async def push_notification(request: Request):
     """
     Push a notification to an active WebSocket connection.
-    
+
     This endpoint is called by the notification service to send notifications
     to patients who have active web chat sessions.
-    
+
     Request body:
     {
         "session_id": "phone_number_or_session_id",
+        "clinic_id": "uuid-of-clinic",  # REQUIRED for security
         "message": "Notification message",
         "notification_type": "appointment_reminder",
         "metadata": {}
     }
-    
+
     Returns:
     {
         "success": true/false,
@@ -321,18 +378,41 @@ async def push_notification(request: Request):
         "session_id": "...",
         "message": "..."
     }
+
+    Security:
+        - Requires clinic_id in request body
+        - Validates session belongs to specified clinic
+        - Prevents cross-clinic notification injection
     """
     try:
         data = await request.json()
         session_id = data.get("session_id")
         message = data.get("message")
+        clinic_id = data.get("clinic_id")
         notification_type = data.get("notification_type", "general")
         metadata = data.get("metadata", {})
-        
+
+        # SECURITY: Require clinic_id for multi-clinic isolation
+        if not clinic_id:
+            logger.error(f"Notification request missing clinic_id for session {session_id}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="clinic_id is required"
+            )
+
         if not session_id or not message:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="session_id and message are required"
+            )
+
+        # SECURITY: Validate session belongs to clinic
+        # Session ID should contain clinic context (clinic:{clinic_id}:session:{phone})
+        if not session_id.startswith(f"clinic:{clinic_id}:"):
+            logger.error(f"Cannot send notification to session {session_id}: does not belong to clinic {clinic_id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to specified clinic"
             )
         
         # Check if there's an active WebSocket connection for this session
@@ -493,12 +573,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     try:
                         # Process message with extended timeout
                         response = await asyncio.wait_for(
-                            orchestrator.process_message(
-                                session_id=session_id,
-                                message=content,
-                                language=data.get("language")
-                            ),
-                            timeout=90.0  # 90 second timeout for processing
+                        orchestrator.process_message(
+                            session_id=session_id,
+                            message=content,
+                            language=data.get("language"),
+                            clinic_id=data.get("clinic_id")  # ← ADD THIS LINE
+                        ),
+                        timeout=90.0  # 90 second timeout for processing
                         )
 
                         # Send response

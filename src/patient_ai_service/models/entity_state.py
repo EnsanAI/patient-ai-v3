@@ -52,6 +52,9 @@ class EntityState(BaseModel):
     # Derived entities (system resolutions)
     derived: DerivedEntitiesManager
     
+    # Clinic services cache (from list_services tool)
+    services: Dict[str, Any] = Field(default_factory=dict)
+    
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_updated_at: datetime = Field(default_factory=datetime.utcnow)

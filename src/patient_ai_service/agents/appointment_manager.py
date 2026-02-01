@@ -107,7 +107,12 @@ class AppointmentManagerAgent(BaseAgent):
 
     def _get_agent_instructions(self) -> str:
         """Appointment-specific behavioral instructions."""
-        return """MANDATORY: Confirm with user before scheduling, rescheduling, cancelling or updating appointment in anyway. ONCE confirmed, call the appropriate tool immediately."""
+        return """
+        MANDATORY: 
+        1- Confirm with user before scheduling, rescheduling, cancelling or updating appointment in anyway. ONCE confirmed, call the appropriate tool immediately.
+        2- YOU must ollect reason for visit, if patient is not sure after asking them then -> general consultation.
+        3- ALWAYS try to fullfill user's request. Recommend alternatives if original request is not possible. Provide options. HOWEVER, don't be pushy!
+        """
 
     @staticmethod
     def _normalize_name_for_matching(name: str) -> str:
@@ -213,6 +218,28 @@ class AppointmentManagerAgent(BaseAgent):
             }
         )
 
+        # List clinic services
+        self.register_tool(
+            name="list_services",
+            function=self.tool_list_services,
+            description="List all available clinic services (e.g. consultations, procedures). Use when user asks what services are offered.",
+            parameters={}
+        )
+
+        # List doctors for a specific service
+        self.register_tool(
+            name="list_doctors_for_service",
+            function=self.tool_list_doctors_for_service,
+            description="List doctors who can perform a specific clinic service. Call list_services first to get service IDs.",
+            parameters={
+                "clinic_service_id": {
+                    "type": "string",
+                    "description": "Clinic service ID from list_services",
+                    "required": True
+                }
+            }
+        )
+
         # Find doctor by name (with fuzzy matching)
         self.register_tool(
             name="find_doctor_by_name",
@@ -264,7 +291,7 @@ class AppointmentManagerAgent(BaseAgent):
         self.register_tool(
             name="book_appointment",
             function=self.tool_book_appointment,
-            description="Book a new appointment. MANDATORY: When check_availability returns 'MANDATORY_ACTION': 'CALL book_appointment TOOL IMMEDIATELY', you MUST call this tool immediately. Do NOT generate text - make the tool call. Extract the reason from user's message (their exact wording). Only use 'general consultation' if user did not mention any reason.",
+            description="Book a new appointment. MANDATORY: When check_availability returns 'MANDATORY_ACTION': 'CALL book_appointment TOOL IMMEDIATELY', you MUST call this tool immediately. Do NOT generate text - make the tool call. A clinic_service_id is required and must be selected from list_services.",
             parameters={
                 "patient_id": {
                     "type": "string",
@@ -288,7 +315,12 @@ class AppointmentManagerAgent(BaseAgent):
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Extract the EXACT reason/procedure/symptom from user's message. Use user's own words. ONLY use 'general consultation' if user did not mention any specific reason.",
+                    "description": "Optional. If omitted, it will default to the selected clinic service name.",
+                    "required": False
+                },
+                "clinic_service_id": {
+                    "type": "string",
+                    "description": "REQUIRED: Clinic service ID from list_services",
                     "required": True
                 }
             }
@@ -835,6 +867,101 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 "result_type": ToolResultType.SYSTEM_ERROR.value,
                 "error": str(e),
                 "should_retry": True
+            }
+
+    def tool_list_services(self, session_id: str) -> Dict[str, Any]:
+        """List all available clinic services."""
+        try:
+            clinic_context = getattr(self.db_client, "_clinic_context", None)
+            if not clinic_context:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "No clinic context available",
+                    "should_retry": False,
+                }
+            entity_state = self.state_manager.get_entity_state(session_id)
+            doctor_entity = entity_state.derived.get_valid_entity(
+                "doctor_uuid", entity_state.patient
+            ) or entity_state.derived.get_entity("doctor_uuid")
+            doctor_id = doctor_entity.value if doctor_entity else None
+
+            services = self.db_client.get_clinic_services(
+                clinic_context.clinic_id,
+                doctor_id=doctor_id,
+            )
+            service_list = [
+                {
+                    "name": svc.get("name"),
+                    "description": svc.get("description"),
+                    "category": svc.get("category"),
+                    "price": svc.get("effective", {}).get("price") if svc.get("effective") else svc.get("price"),
+                    "currency": svc.get("effective", {}).get("currency") if svc.get("effective") else svc.get("currency"),
+                    "id": svc.get("id"),
+                }
+                for svc in services
+            ]
+            entity_state = self.state_manager.get_entity_state(session_id)
+            entity_state.services = {svc["id"]: svc for svc in service_list}
+            self.state_manager.save_entity_state(session_id, entity_state)
+            return {
+                "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
+                "services": service_list,
+                "count": len(service_list),
+                "can_proceed": True,
+                "next_action": "present_services_to_user",
+            }
+        except Exception as e:
+            logger.error(f"Failed to list services: {e}")
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+            }
+
+    def tool_list_doctors_for_service(
+        self,
+        session_id: str,
+        clinic_service_id: str,
+    ) -> Dict[str, Any]:
+        """List doctors who can perform a specific service."""
+        try:
+            clinic_context = getattr(self.db_client, "_clinic_context", None)
+            if not clinic_context:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "No clinic context available",
+                }
+            doctors = self.db_client.get_doctors_for_service(
+                clinic_context.clinic_id,
+                clinic_service_id,
+            )
+            doctor_list = [
+                {
+                    "id": doc.get("id"),
+                    "name": doc.get("name"),
+                    "title": doc.get("title"),
+                    "specialty": doc.get("specialty"),
+                    "languages_spoken": doc.get("languages_spoken", []),
+                }
+                for doc in doctors
+            ]
+            return {
+                "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
+                "doctors": doctor_list,
+                "count": len(doctor_list),
+                "can_proceed": True,
+                "next_action": "present_doctors_to_user",
+            }
+        except Exception as e:
+            logger.error(f"Failed to list doctors for service: {e}")
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
             }
 
     def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
@@ -1713,8 +1840,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         doctor_id: str,
         date: str,
         time: str,
-        reason: str,
-        correlation_id: str
+        reason: Optional[str],
+        correlation_id: str,
+        clinic_service_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute strict synchronous booking workflow with timeouts and verification.
@@ -1761,6 +1889,18 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     "recovery_message": "Please register the patient first",
                     "suggested_response": "I'll need to get you registered first. Can I have your full name and phone number?",
                     "message": "You must complete registration before booking an appointment. Please register first."
+                }
+
+            # Step 1.1: Ensure clinic service selection
+            if not clinic_service_id:
+                logger.error(f"❌ Validation failed: clinic_service_id is missing - correlation_id={correlation_id}")
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                    "error": "clinic_service_required",
+                    "error_code": "MISSING_CLINIC_SERVICE",
+                    "error_message": "Clinic service selection is required to book an appointment.",
+                    "suggested_response": "Please choose a service first. You can ask me to list available services.",
                 }
             
             # Step 1.5: Check for existing appointment at same time
@@ -1818,23 +1958,34 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                 logger.warning(f"Could not check for appointment conflicts: {e}")
                 # Continue with booking - conflict check is not critical
             
-            # Step 2: Generate idempotency key
+            # Step 2: Get clinic ID from orchestrator-provided context (HIPAA multi-tenant contract)
+            clinic_id = None
+            if getattr(self.db_client, "_clinic_context", None):
+                clinic_id = self.db_client._clinic_context.clinic_id
+                logger.info(f"Using clinic from context: {clinic_id} - correlation_id={correlation_id}")
+
+            if not clinic_id:
+                logger.error(f"❌ Missing clinic context - correlation_id={correlation_id}")
+                return {
+                    "success": False,
+                    "error": "Clinic context missing",
+                    "error_code": "CLINIC_CONTEXT_MISSING",
+                    "message": "Unable to determine clinic for booking. Please try again."
+                }
+            logger.info(f"🔍 Booking with clinic_id={clinic_id} - correlation_id={correlation_id}")
+
+            # Step 2.5: Ensure reason defaults to selected service name
+            if not reason or not str(reason).strip():
+                service = self.db_client.get_clinic_service_by_id(
+                    clinic_id,
+                    clinic_service_id,
+                )
+                service_name = service.get("name") if service else None
+                reason = service_name or "appointment"
+
+            # Step 3: Generate idempotency key (after reason is finalized)
             idempotency_key = self._generate_idempotency_key(patient_id, doctor_id, date, time, reason)
             logger.info(f"🔑 Idempotency key: {idempotency_key} - correlation_id={correlation_id}")
-            
-            # Step 3: Get clinic ID
-            clinic_info = self.db_client.get_clinic_info()
-            if not clinic_info:
-                all_clinics = self.db_client.get_all_clinics()
-                if all_clinics and len(all_clinics) > 0:
-                    clinic_id = all_clinics[0].get("id")
-                    logger.info(f"Using first available clinic: {clinic_id} - correlation_id={correlation_id}")
-                else:
-                    clinic_id = "11111111-1111-1111-1111-111111111111"
-                    logger.warning(f"No clinic found, using default: {clinic_id} - correlation_id={correlation_id}")
-            else:
-                clinic_id = clinic_info.get("id")
-                logger.info(f"Using clinic: {clinic_id} - correlation_id={correlation_id}")
             
             # Step 4: Get appointment type
             appointment_types = self.db_client.get_appointment_types()
@@ -1900,6 +2051,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                     end_time=end_time,
                     reason=reason,
                     emergency_level="routine",
+                    clinic_service_id=clinic_service_id,
                     request_id=idempotency_key  # Pass idempotency key as request_id
                 )
             
@@ -2136,7 +2288,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         doctor_id: str,
         date: str,
         time: str,
-        reason: str
+        reason: Optional[str] = None,
+        clinic_service_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Book a new appointment using strict synchronous workflow.
@@ -2154,8 +2307,32 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
         logger.info("APPOINTMENT_MANAGER: tool_book_appointment() CALLED")
         logger.info("=" * 80)
         logger.info(f"Session ID: {session_id}")
-        logger.info(f"Input: patient_id={patient_id}, doctor_id={doctor_id}, date={date}, time={time}, reason={reason}")
+        logger.info(f"Input: patient_id={patient_id}, doctor_id={doctor_id}, date={date}, time={time}, reason={reason}, clinic_service_id={clinic_service_id}")
         logger.info(f"📋 BOOKING REQUEST: correlation_id={correlation_id}")
+
+        if not clinic_service_id:
+            return {
+                "success": False,
+                "result_type": ToolResultType.USER_INPUT_NEEDED.value,
+                "error": "clinic_service_required",
+                "error_code": "MISSING_CLINIC_SERVICE",
+                "error_message": "Clinic service selection is required to book an appointment.",
+                "suggested_response": "Please choose a service first. You can ask me to list available services.",
+            }
+
+        if not reason or not str(reason).strip():
+            try:
+                clinic_id = getattr(self.db_client, "_clinic_context", None)
+                clinic_id = clinic_id.clinic_id if clinic_id else None
+                if clinic_id:
+                    service = self.db_client.get_clinic_service_by_id(
+                        clinic_id,
+                        clinic_service_id,
+                    )
+                    if service and service.get("name"):
+                        reason = service.get("name")
+            except Exception:
+                pass
         
         try:
             # Execute workflow with overall timeout (20 seconds)
@@ -2182,6 +2359,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                         date=date,
                                         time=time,
                                         reason=reason,
+                                        clinic_service_id=clinic_service_id,
                                         correlation_id=correlation_id
                                     ),
                                     timeout=20.0
@@ -2199,7 +2377,8 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                 date=date,
                                 time=time,
                                 reason=reason,
-                                correlation_id=correlation_id
+                                correlation_id=correlation_id,
+                                clinic_service_id=clinic_service_id,
                             ),
                             timeout=20.0  # Overall orchestration timeout
                         )
@@ -2414,11 +2593,11 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
         # Validate each appointment has required fields
         for idx, apt in enumerate(appointments):
-            if not all(k in apt for k in ['doctor_id', 'date', 'time', 'reason']):
+            if not all(k in apt for k in ['doctor_id', 'date', 'time', 'clinic_service_id']):
                 return {
                     "success": False,
                     "error": f"Appointment {idx + 1} missing required fields",
-                    "message": f"Appointment {idx + 1} is missing required fields (doctor_id, date, time, reason)",
+                    "message": f"Appointment {idx + 1} is missing required fields (doctor_id, date, time, clinic_service_id)",
                     "results": []
                 }
 
@@ -2429,7 +2608,7 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
 
         for idx, apt in enumerate(appointments):
             logger.info(f"📋 Booking appointment {idx + 1}/{len(appointments)}")
-            logger.info(f"   doctor_id={apt['doctor_id']}, date={apt['date']}, time={apt['time']}, reason={apt['reason']}")
+            logger.info(f"   doctor_id={apt['doctor_id']}, date={apt['date']}, time={apt['time']}, reason={apt.get('reason')}, clinic_service_id={apt.get('clinic_service_id')}")
 
             try:
                 # Execute booking workflow for this appointment
@@ -2453,8 +2632,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                             doctor_id=apt['doctor_id'],
                                             date=apt['date'],
                                             time=apt['time'],
-                                            reason=apt['reason'],
-                                            correlation_id=f"{correlation_id}_apt{idx + 1}"
+                                            reason=apt.get('reason'),
+                                            correlation_id=f"{correlation_id}_apt{idx + 1}",
+                                            clinic_service_id=apt.get('clinic_service_id'),
                                         ),
                                         timeout=20.0
                                     )
@@ -2470,8 +2650,9 @@ REMEMBER: You are INTELLIGENT and AUTONOMOUS. Think through the complete plan, e
                                     doctor_id=apt['doctor_id'],
                                     date=apt['date'],
                                     time=apt['time'],
-                                    reason=apt['reason'],
-                                    correlation_id=f"{correlation_id}_apt{idx + 1}"
+                                    reason=apt.get('reason'),
+                                    correlation_id=f"{correlation_id}_apt{idx + 1}",
+                                    clinic_service_id=apt.get('clinic_service_id'),
                                 ),
                                 timeout=20.0
                             )

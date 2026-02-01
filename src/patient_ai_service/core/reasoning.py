@@ -866,9 +866,10 @@ RESPOND WITH VALID VALID JSON ONLY - NO OTHER TEXT."""
             if not json_str:
                 raise ValueError("No JSON found in response")
 
-            # Try direct parse first
+            # Try direct parse first with robust handling
+            from patient_ai_service.core.json_utils import safe_json_loads
             try:
-                data = json.loads(json_str)
+                data = safe_json_loads(json_str, "SituationAssessment")
             except json.JSONDecodeError as e:
                 logger.warning(f"Initial JSON parse failed: {e}")
                 
@@ -2091,12 +2092,12 @@ Respond in JSON format as specified in the system prompt."""
         """Parse LLM finalization response into ValidationResult."""
         try:
             # Extract JSON from response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
-                raise ValueError("No JSON found in finalization response")
-
-            import json
-            data = json.loads(json_match.group())
+            from patient_ai_service.core.json_utils import extract_and_parse_json
+            try:
+                data = extract_and_parse_json(response, "Finalization")
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to parse finalization response: {e}")
+                raise ValueError("No valid JSON found in finalization response")
 
             # Create ValidationResult with finalization fields
             return ValidationResult(
@@ -2205,11 +2206,12 @@ IMPORTANT: Only mark is_valid=true if you're confident response is complete, acc
         """Parse LLM validation response into ValidationResult."""
         try:
             # Extract JSON from response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
-                raise ValueError("No JSON found in validation response")
-
-            data = json.loads(json_match.group())
+            from patient_ai_service.core.json_utils import extract_and_parse_json
+            try:
+                data = extract_and_parse_json(response, "Validation")
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to parse validation response: {e}")
+                raise ValueError("No valid JSON found in validation response")
 
             # Create ValidationResult
             return ValidationResult(

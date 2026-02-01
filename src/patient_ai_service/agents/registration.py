@@ -28,7 +28,7 @@ class RegistrationAgent(BaseAgent):
     """
 
     def __init__(self, db_client: Optional[DbOpsClient] = None, **kwargs):
-        super().__init__(agent_name="registration", **kwargs)
+        super().__init__(agent_name="Registration", **kwargs)
         self.db_client = db_client or DbOpsClient()
 
     async def on_activated(self, session_id: str, reasoning: Any):
@@ -105,12 +105,12 @@ The tool will automatically normalize date formats and handle existing users."""
         )
 
     def _get_agent_instructions(self) -> str:
-        """Registration-specific behavioral instructions."""
+        """Appointment-specific behavioral instructions."""
         return """
-1- Don't ask for gender, but ASSUME it based on patient name and wait for user to correct you, if needed, at confirmation.
-2- MANDATORY: Always confirm ALL details with user before calling register_patient.
-3- Show: name, phone, date_of_birth, gender. ONCE confirmed, call register_patient with ALL 5 fields immediately.
-"""
+MANDATORY: 
+1- Always ask for confirmation of all required fields before calling the registration tool.
+2- DON'T ASK USER ABOUT GENDER, ASK FOR ALL NAME FIRST then you should infer gender from name if obvious, but confirm with user before finalizing.
+        """
 
     def _get_system_prompt(self, session_id: str) -> str:
         """Generate simplified registration system prompt."""
@@ -167,6 +167,7 @@ INSTRUCTIONS:
 TOOL: register_patient(first_name, last_name, phone, date_of_birth, gender)
 - ALL parameters are REQUIRED - you must have all 5 fields before calling
 - Date format: YYYY-MM-DD preferred (but tool accepts various formats and normalizes automatically)
+- Do NOT call until the user has confirmed the full set of details
 - If you don't have all fields yet, use COLLECT_INFORMATION to ask the user for missing fields
 
 PRIVACY: Your information is securely stored and used only for providing dental care."""
@@ -206,7 +207,17 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                     "suggested_response": f"You're already registered! Your patient ID is {patient.patient_id}."
                 }
 
-            # === STEP 2: Validate all required fields are provided ===
+            # === STEP 2: Extract clinic_id from session for clinic association ===
+            # The clinic_id should be in the composite session key
+            clinic_id = None
+            if "clinic:" in session_id:
+                # Extract clinic_id from composite key: clinic:{clinic_id}:session:{phone}
+                parts = session_id.split(":")
+                if len(parts) >= 2:
+                    clinic_id = parts[1]
+                    logger.info(f"Extracted clinic_id {clinic_id} from session key")
+            
+            # === STEP 3: Validate all required fields are provided ===
             fields = {
                 "first_name": first_name.strip() if first_name else None,
                 "last_name": last_name.strip() if last_name else None,
@@ -268,13 +279,18 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                 user_id = existing_user.get("id")
                 logger.info(f"Found existing user: {user_id}")
             else:
-                # Create user
+                # Create user with "patient" role and associate with clinic
+                PATIENT_ROLE_ID = "33333333-3333-3333-3333-333333333333"  # "patient" role
                 user_data = self.db_client.register_user(
                     email=f"{fields['phone']}@temp.clinic",
                     full_name=f"{fields['first_name']} {fields['last_name']}",
                     phone_number=fields["phone"],
-                    role_id="patient_role_id"
+                    role_id=PATIENT_ROLE_ID,  # "patient" role
+                    clinic_id=clinic_id  # Associate with clinic (creates user_clinic_access)
                 )
+                
+                if user_data:
+                    logger.info(f"User created with clinic association: clinic_id={clinic_id}")
                 if not user_data:
                     # Try to fetch user again (might have been created by race condition)
                     existing_user = self.db_client.get_user_by_phone_number(fields["phone"])
@@ -310,7 +326,8 @@ PRIVACY: Your information is securely stored and used only for providing dental 
                 first_name=fields["first_name"],
                 last_name=fields["last_name"],
                 date_of_birth=normalized_dob,
-                gender=fields["gender"]
+                gender=fields["gender"],
+                clinic_id=clinic_id
             )
 
             if not patient_data:

@@ -131,7 +131,13 @@ class Orchestrator:
             db_client=self.db_client
         )
 
+        # Import language selection agent
+        from patient_ai_service.agents.language_selection import LanguageSelectionAgent
+
         self.agents: Dict[str, Any] = {
+            "language_selection": LanguageSelectionAgent(
+                llm_config_manager=self.llm_config_manager
+            ),
             "appointment_manager": appointment_manager,
             "medical_inquiry": MedicalInquiryAgent(
                 db_client=self.db_client
@@ -405,6 +411,41 @@ Your response:"""
             fallback_response = lang_fallbacks.get(situation, lang_fallbacks[SituationType.GREETING])
             return fallback_response, TokenUsage()
 
+    def _detect_language_change_request(self, message: str, english_message: str) -> Optional[str]:
+        """Detect if user is requesting to change language."""
+        msg_lower = english_message.lower()
+
+        # English change requests
+        if any(phrase in msg_lower for phrase in [
+            "switch to english", "change to english", "speak english",
+            "use english", "english please", "change language", "switch language"
+        ]):
+            logger.info("[Language Change] English change request detected")
+            return "en"
+
+        if any(phrase in msg_lower for phrase in [
+            "switch to arabic", "change to arabic", "speak arabic",
+            "use arabic", "arabic please"
+        ]):
+            logger.info("[Language Change] Arabic change request detected (from English)")
+            return "ar"
+
+        # Arabic change requests (check original message)
+        msg_original = message.lower()
+        if any(phrase in msg_original for phrase in [
+            "تكلم انجليزي", "غير للانجليزي", "استخدم انجليزي", "انجليزي"
+        ]):
+            logger.info("[Language Change] English change request detected (from Arabic)")
+            return "en"
+
+        if any(phrase in msg_original for phrase in [
+            "تكلم عربي", "غير للعربي", "استخدم عربي", "عربي"
+        ]):
+            logger.info("[Language Change] Arabic change request detected (from Arabic)")
+            return "ar"
+
+        return None
+
     async def _information_collection_response(
         self,
         session_id: str,
@@ -652,7 +693,8 @@ Respond in JSON format:
 
                 logger.info(f"⚡ [Info Collection] Cleaned response for parsing (removed markdown if present)")
 
-                result = json.loads(cleaned_response)
+                from patient_ai_service.core.json_utils import safe_json_loads
+                result = safe_json_loads(cleaned_response, "Info Collection")
                 extracted_info = result.get("extracted_info")  # Can be string or None
                 collection_complete = result.get("collection_complete", False)  # Boolean flag
                 response = result.get("response")  # Can be string or None
@@ -726,26 +768,26 @@ Respond in JSON format:
 
         if clinic_id:
             clinic_context = ClinicContext(clinic_id=clinic_id, session_id=session_id)
-            composite_session_key = clinic_context.composite_key
+            session_id = clinic_context.composite_key
             # Set clinic context on db_client for RLS header propagation
             self.db_client.set_clinic_context(clinic_context)
         else:
             # Fallback for backward compatibility (should not happen in production)
-            composite_session_key = session_id
+            session_id = session_id
             clinic_context = None
             logger.warning(f"No clinic_id provided for session {session_id} - using non-namespaced key")
 
         pipeline_start_time = time.time()
         # Import settings at function level to avoid UnboundLocalError
         from patient_ai_service.core.config import settings as config_settings
-        obs_logger = get_observability_logger(composite_session_key) if config_settings.enable_observability else None
+        obs_logger = get_observability_logger(session_id) if config_settings.enable_observability else None
 
         logger.info("=" * 100)
         logger.info("ORCHESTRATOR: process_message() CALLED")
         logger.info("=" * 100)
         logger.info(f"Session ID: {session_id}")
         logger.info(f"Clinic ID: {clinic_id}")
-        logger.info(f"Composite Session Key: {composite_session_key}")
+        logger.info(f"Composite Session Key: {session_id}")
         logger.info(f"Input Message: {message}")
         logger.info(f"Language Hint: {language}")
         logger.info(f"Pipeline Start Time: {pipeline_start_time}")
@@ -758,8 +800,8 @@ Respond in JSON format:
             logger.info("-" * 100)
             logger.info("ORCHESTRATOR STEP 1: Load Patient")
             logger.info("-" * 100)
-            with obs_logger.pipeline_step(1, "load_patient", "orchestrator", {"session_id": composite_session_key}) if obs_logger else nullcontext():
-                await self._ensure_patient_loaded(composite_session_key)
+            with obs_logger.pipeline_step(1, "load_patient", "orchestrator", {"session_id": session_id}) if obs_logger else nullcontext():
+                await self._ensure_patient_loaded(session_id)
             step1_duration = (time.time() - step1_start) * 1000
             logger.info(f"Step 1 completed in {step1_duration:.2f}ms")
 
@@ -769,70 +811,175 @@ Respond in JSON format:
             logger.info("ORCHESTRATOR STEP 2: Translation (Input) [OPTIMIZED]")
             logger.info("-" * 100)
             logger.info(f"Original message: {message[:200]}")
+
+            # Get current language context
+            global_state = self.state_manager.get_global_state(session_id)
+            language_context = global_state.language_context
+
+            # DEBUG: Log language context state
+            logger.info(f"[DEBUG] Language Context State:")
+            logger.info(f"  - language_selected: {language_context.language_selected}")
+            logger.info(f"  - current_language: {language_context.current_language}")
+            logger.info(f"  - current_dialect: {language_context.current_dialect}")
+            logger.info(f"  - preferred_language: {language_context.preferred_language}")
+            logger.info(f"  - preferred_dialect: {language_context.preferred_dialect}")
+
             with obs_logger.pipeline_step(2, "translation_input", "translation", {"message": message[:100]}) if obs_logger else nullcontext():
                 from patient_ai_service.core.feature_flags import is_translation_enabled
-                if is_translation_enabled(composite_session_key):
-                    translation_agent = self.agents["translation"]
+                from patient_ai_service.core.script_detector import ScriptDetector
 
-                    # OPTIMIZED: Single LLM call for detection AND translation
-                    translate_start = time.time()
-                    english_message, detected_lang, detected_dialect, translation_succeeded = await translation_agent.detect_and_translate(message, composite_session_key)
-                    translate_duration = (time.time() - translate_start) * 1000
-
-                    logger.info(
-                        f"[FAST] Language: {detected_lang}-{detected_dialect or 'unknown'}, "
-                        f"translation_succeeded: {translation_succeeded} "
-                        f"(took {translate_duration:.2f}ms - single LLM call)"
-                    )
-                else:
-                    logger.info("[SKIP] Translation disabled, using original message")
+                # Skip translation if language not yet selected (language_selection agent will handle it)
+                if not language_context.language_selected:
+                    logger.info("[Translation] Skipping - language not yet selected")
                     english_message = message
                     detected_lang = "en"
                     detected_dialect = None
                     translation_succeeded = True
+                elif is_translation_enabled(session_id):
+                    # ============================================================================
+                    # NEW SIMPLIFIED TRANSLATION LOGIC (Post Language Selection)
+                    # ============================================================================
+                    # Use the selected language preference instead of automatic detection
+                    # Only keep Arabic script detection as a safety barrier
+                    # ============================================================================
 
-                # Get current language context
-                global_state = self.state_manager.get_global_state(composite_session_key)
-                language_context = global_state.language_context
+                    translation_agent = self.agents["translation"]
+                    user_preference = language_context.preferred_language  # ISO code: "en" or "ar"
 
-                # Check if language switched
-                if language_context.current_language != detected_lang:
-                    logger.info(
-                        f"Language switch detected: {language_context.get_full_language_code()} "
-                        f"→ {detected_lang}-{detected_dialect or 'unknown'}"
-                    )
-                    language_context.record_language_switch(
-                        detected_lang,
-                        detected_dialect,
-                        language_context.turn_count
-                    )
+                    # Determine if translation is needed
+                    needs_translation = False
+                    detected_lang = user_preference  # Default to user's preference
+                    detected_dialect = language_context.preferred_dialect
+
+                    # ONLY check for Arabic - don't "detect" other languages
+                    if user_preference == "ar":
+                        # User prefers Arabic - always translate Arabic input to English for processing
+                        needs_translation = True
+                        detected_lang = "ar"
+                        detected_dialect = "ae"
+                        logger.info("[Translation] User preference: Arabic - translating to English for processing")
+                    elif ScriptDetector._has_arabic_letters(message):
+                        # SAFETY BARRIER: Arabic script detected regardless of preference
+                        needs_translation = True
+                        detected_lang = "ar"
+                        detected_dialect = "ae"
+                        logger.info("[Translation] SAFETY BARRIER: Arabic script detected - translating to prevent system break")
+                    else:
+                        # Use user's preference as-is, no translation needed
+                        needs_translation = False
+                        logger.info(f"[Translation] Using user preference: {user_preference}, no Arabic detected - no translation needed")
+
+                    # Perform translation if needed
+                    if needs_translation:
+                        translate_start = time.time()
+
+                        # Use simple translation without detection
+                        if detected_lang == "ar":
+                            english_message = await translation_agent._translate_arabic_to_english(message, session_id)
+                            translation_succeeded = True
+                        else:
+                            # Fallback for other languages
+                            english_message = await translation_agent.translate_to_english_with_dialect(
+                                message, detected_lang, detected_dialect
+                            )
+                            translation_succeeded = True
+
+                        translate_duration = (time.time() - translate_start) * 1000
+                        logger.info(
+                            f"[Translation] {detected_lang} → en completed in {translate_duration:.2f}ms"
+                        )
+                        logger.info(f"[Translation] Result: {message[:100]}... → {english_message[:100]}...")
+                    else:
+                        english_message = message
+                        translation_succeeded = True
+
+                    # ============================================================================
+                    # DEPRECATED: Old automatic language detection layer
+                    # ============================================================================
+                    # This has been replaced with preference-based translation + Arabic safety check
+                    # The old detect_and_translate() method is no longer used here
+                    #
+                    # OLD CODE (DEPRECATED):
+                    # english_message, detected_lang, detected_dialect, translation_succeeded =
+                    #     await translation_agent.detect_and_translate(message, session_id)
+                    # ============================================================================
+
                 else:
-                    # Update both language and dialect from detect_and_translate results
-                    # This ensures they stay in sync even if dialect changes within same language
-                    language_context.current_language = detected_lang
-                    language_context.current_dialect = detected_dialect
-                    language_context.last_detected_at = datetime.utcnow()
+                    logger.info("[SKIP] Translation disabled, using original message")
+                    english_message = message
+                    detected_lang = language_context.current_language or "en"
+                    detected_dialect = language_context.current_dialect
+                    translation_succeeded = True
 
+                # Update language context
                 language_context.turn_count += 1
+                language_context.last_detected_at = datetime.utcnow()
 
-                # Track translation status explicitly
-                if not translation_succeeded:
-                    logger.warning(
-                        f"⚠️ TRANSLATION FALLBACK for session {session_id}: "
-                        f"passing original message to reasoning engine"
-                    )
-                    language_context.translation_failures += 1
-                    language_context.last_translation_error = "Translation failed - using original"
-                elif detected_lang != "en":
-                    logger.info(f"Translation to English: {message[:100]}... -> {english_message[:100]}...")
-                else:
-                    logger.info("No translation needed (already in English)")
+                # Update current language based on user preference (already set by language_selection agent)
+                # detected_lang and detected_dialect are now derived from preference, not detection
+                if not detected_lang:
+                    detected_lang = language_context.current_language or "en"
+                if not detected_dialect and detected_lang == "ar":
+                    detected_dialect = "ae"
 
-                # Update global state with new language context
+                # CRITICAL FIX: Update current_language to match detected language
+                # This ensures that if Arabic script was detected (safety barrier),
+                # the preference is updated to "ar" for this turn and all future turns
+                if detected_lang != language_context.current_language:
+                    logger.info(f"[Language Context] Updating current_language from {language_context.current_language} to {detected_lang}")
+                    language_context.current_language = detected_lang
+                    if detected_dialect:
+                        language_context.current_dialect = detected_dialect
+
+                # Update global state with new language context (EVERY TURN)
                 self.state_manager.update_global_state(
-                    composite_session_key,
+                    session_id,
                     language_context=language_context
                 )
+
+                logger.info(f"[Language Context] Saved to global state - current_language: {language_context.current_language}, preferred_language: {language_context.preferred_language}")
+
+                # Check for language change request
+                if language_context.language_selected:
+                    new_lang = self._detect_language_change_request(message, english_message)
+                    if new_lang and new_lang != language_context.current_language:
+                        logger.info(f"[Language Change] Requested change to: {new_lang}")
+
+                        new_dialect = "ae" if new_lang == "ar" else None
+                        language_context.record_language_switch(new_lang, new_dialect, language_context.turn_count)
+                        language_context.mark_language_selected(new_lang, new_dialect)
+
+                        self.state_manager.update_global_state(
+                            session_id,
+                            language_context=language_context
+                        )
+
+                        # Generate acknowledgment
+                        if new_lang == "en":
+                            ack = "Switched to English. How can I help you?"
+                        else:
+                            ack = "تمام، غيرنا للعربي. كيف أقدر أساعدك؟"
+
+                        response = ChatResponse(
+                            response=ack,
+                            session_id=session_id,
+                            detected_language=language_context.get_full_language_code(),
+                            intent="language_changed",
+                            urgency=UrgencyLevel.LOW,
+                            metadata={
+                                "agent": "orchestrator",
+                                "flow": "language_change",
+                                "previous_language": language_context.language_history[-1]["from_language"] if language_context.language_history else "unknown",
+                                "new_language": new_lang
+                            }
+                        )
+
+                        # Store in memory
+                        self.memory_manager.add_user_turn(session_id, message)
+                        self.memory_manager.add_assistant_turn(session_id, ack)
+
+                        logger.info(f"[Language Change] Changed language preference to {new_lang}")
+                        return response
 
                 logger.info(
                     f"Language: {language_context.get_full_language_code()} | "
@@ -862,12 +1009,12 @@ Respond in JSON format:
             logger.info("-" * 100)
             with obs_logger.pipeline_step(3, "add_to_memory", "memory_manager", {"message": english_message[:100]}) if obs_logger else nullcontext():
                 # Store in ConversationMemory (English - for Unified Reasoning & _think())
-                self.memory_manager.add_user_turn(composite_session_key, english_message)
+                self.memory_manager.add_user_turn(session_id, english_message)
                 logger.info(f"📝 [ConversationMemory] Stored user turn (English): {english_message[:80]}...")
 
                 # Also store in NativeLanguageMemory (Original language - for response generators)
                 self.native_memory_manager.add_user_turn(
-                    session_id=composite_session_key,
+                    session_id=session_id,
                     content=message,  # Original message before translation
                     language=detected_lang,
                     dialect=detected_dialect
@@ -884,12 +1031,39 @@ Respond in JSON format:
             logger.info("ORCHESTRATOR STEP 4: Unified Reasoning")
             logger.info("-" * 100)
 
-            global_state = self.state_manager.get_global_state(composite_session_key)
+            global_state = self.state_manager.get_global_state(session_id)
 
             # Store clinic_id in global state if not already set
             if clinic_id and not global_state.clinic_id:
                 global_state.clinic_id = clinic_id
-                self.state_manager.update_global_state(composite_session_key, clinic_id=clinic_id)
+                self.state_manager.update_global_state(session_id, clinic_id=clinic_id)
+
+            # Fetch and cache clinic metadata
+            if clinic_id and not global_state.clinic_metadata:
+                clinic_metadata = self.state_manager.get_clinic_metadata(clinic_id)
+                if clinic_metadata:
+                    global_state.clinic_metadata = clinic_metadata
+                    self.state_manager.update_global_state(
+                        session_id,
+                        clinic_metadata=clinic_metadata
+                    )
+                    # Log detailed clinic metadata
+                    logger.info("=" * 80)
+                    logger.info("🏥 CLINIC METADATA LOADED")
+                    logger.info("=" * 80)
+                    logger.info(f"Clinic Name: {clinic_metadata.name}")
+                    logger.info(f"Clinic ID: {clinic_metadata.clinic_id}")
+                    if clinic_metadata.address:
+                        logger.info(f"Location: {clinic_metadata.address}")
+                    logger.info(f"Timezone: {clinic_metadata.timezone}")
+                    logger.info(f"Current Date & Time: {clinic_metadata.get_current_datetime_str()}")
+                    if clinic_metadata.phone_number:
+                        logger.info(f"Phone: {clinic_metadata.phone_number}")
+                    if clinic_metadata.email:
+                        logger.info(f"Email: {clinic_metadata.email}")
+                    logger.info("=" * 80)
+                else:
+                    logger.warning(f"Could not load clinic metadata for {clinic_id} - proceeding without clinic context")
 
             patient_info = {
                 "patient_id": global_state.patient_profile.patient_id,
@@ -899,7 +1073,7 @@ Respond in JSON format:
             }
 
             # Get continuation context
-            continuation_context = self.state_manager.get_continuation_context(composite_session_key)
+            continuation_context = self.state_manager.get_continuation_context(session_id)
             awaiting = continuation_context.get("awaiting") if continuation_context else None
             awaiting_context = continuation_context.get("awaiting_context") if continuation_context else None  # NEW
             pending_action = continuation_context.get("pending_action") if continuation_context else None      # NEW
@@ -915,7 +1089,7 @@ Respond in JSON format:
                 logger.info("=" * 80)
 
             # Get existing plan
-            existing_plan = self.state_manager.get_any_active_plan(composite_session_key)
+            existing_plan = self.state_manager.get_any_active_plan(session_id)
 
             # 🔍 ADD LOGGING HERE
             logger.info(f"🔍🔍🔍 [ORCHESTRATOR] PLAN RETRIEVAL ══════════════════")
@@ -937,17 +1111,17 @@ Respond in JSON format:
             logger.info(f"🔍🔍🔍 ══════════════════════════════════════════════════")
 
             # Get recent conversation turns (last 8 messages)
-            recent_turns = self._get_recent_turns(composite_session_key, limit=6)
+            recent_turns = self._get_recent_turns(session_id, limit=6)
 
             # Check if planning is enabled for this session (A/B testing)
-            planning_enabled = FeatureFlags.is_enabled("planning", composite_session_key)
+            planning_enabled = FeatureFlags.is_enabled("planning", session_id)
             if not planning_enabled:
                 logger.info(f"📋 [Orchestrator] Planning DISABLED for session {session_id}")
 
             # Single unified reasoning call
             with obs_logger.pipeline_step(4, "unified_reasoning", "unified_reasoning", {"message": english_message[:100]}) if obs_logger else nullcontext():
                 unified_output = await self.unified_reasoning.reason(
-                    session_id=composite_session_key,
+                    session_id=session_id,
                     message=english_message,
                     patient_info=patient_info,
                     active_agent=global_state.active_agent,
@@ -957,7 +1131,8 @@ Respond in JSON format:
                     information_collection=information_collection,  # NEW
                     recent_turns=recent_turns,
                     existing_plan=existing_plan,
-                    planning_enabled=planning_enabled  # A/B testing flag
+                    planning_enabled=planning_enabled,  # A/B testing flag
+                    clinic_metadata=global_state.clinic_metadata  # NEW
                 )
 
             step4_duration = (time.time() - step4_start) * 1000
@@ -995,7 +1170,7 @@ Respond in JSON format:
                 with obs_logger.pipeline_step(5, "fast_path_routing", "orchestrator", {"situation": unified_output.situation_type.value}) if obs_logger else nullcontext():
                     # Get conversation history from NativeLanguageMemory for context-aware response
                     # This provides original language context for better tone matching
-                    native_turns = self.native_memory_manager.get_recent_turns(composite_session_key, limit=4)
+                    native_turns = self.native_memory_manager.get_recent_turns(session_id, limit=4)
                     logger.info(f"🔍 [_conversational_response] Retrieved {len(native_turns)} turns from NativeLanguageMemory")
                     if native_turns:
                         logger.info(f"🔍 [_conversational_response] Language: {native_turns[0].get('language', 'unknown')}")
@@ -1362,7 +1537,7 @@ Respond in JSON format:
                     if existing_plan:
                         self.state_manager.abandon_all_plans(session_id, "unified_reasoning_abandon")
                         logger.info(f"📋 [Plan] Abandoned existing plan for {existing_plan.agent_name}")
-                
+
                 if unified_output.plan_decision == PlanDecision.COMPLETE:
                     if existing_plan:
                         self.state_manager.abandon_all_plans(session_id, "unified_reasoning_complete")
@@ -1486,8 +1661,65 @@ Respond in JSON format:
                 logger.error(f"Agent not found: {agent_name}")
                 english_response = "I'm sorry, I encountered an error. Please try again."
                 # execution_log already initialized above, no need to create again
+            elif agent_name == "language_selection":
+                # Special handling for language_selection agent
+                logger.info("[Language Selection] Handling language_selection agent")
+
+                # Build context for language selection agent
+                global_state = self.state_manager.get_global_state(session_id)
+                patient_info = {
+                    "patient_id": global_state.patient_profile.patient_id,
+                    "first_name": global_state.patient_profile.first_name,
+                    "last_name": global_state.patient_profile.last_name,
+                    "phone": global_state.patient_profile.phone,
+                }
+                # Get recent conversation turns
+                memory = self.memory_manager.get_memory(session_id)
+                recent_turns = memory.recent_turns if memory else []
+
+                context = {
+                    "patient_info": patient_info,
+                    "recent_turns": recent_turns,
+                    "session_id": session_id
+                }
+
+                # Call language selection agent
+                try:
+                    agent_result = await agent.process_message(
+                        session_id=session_id,
+                        message=message,  # Use original message (not translated)
+                        context=context
+                    )
+
+                    logger.info(f"[Language Selection] Agent result: {agent_result}")
+
+                    # Extract response
+                    english_response = agent_result.get("response", "")
+
+                    # Update language context if language was selected
+                    if agent_result.get("language_selected"):
+                        detected_lang = agent_result.get("detected_language")
+                        detected_dialect = agent_result.get("detected_dialect")
+
+                        logger.info(f"[Language Selection] Updating context: {detected_lang}-{detected_dialect}")
+
+                        # Update language context
+                        global_state = self.state_manager.get_global_state(session_id)
+                        language_context = global_state.language_context
+                        language_context.mark_language_selected(detected_lang, detected_dialect)
+
+                        self.state_manager.update_global_state(
+                            session_id,
+                            language_context=language_context
+                        )
+
+                        logger.info(f"[Language Selection] Preference stored: {detected_lang}-{detected_dialect}")
+
+                except Exception as e:
+                    logger.error(f"[Language Selection] Error: {e}")
+                    english_response = "Welcome to our dental clinic! How can I help you today?"
             else:
-                
+
                 # Call agent activation hook (for state setup)
                 activation_start = time.time()
                 logger.info(f"Activating agent: {agent_name}")
@@ -1747,25 +1979,29 @@ Respond in JSON format:
             step11_duration = (time.time() - step11_start) * 1000
             logger.info(f"Step 11 completed in {step11_duration:.2f}ms")
 
-            # Step 12: Add assistant response to conversation memory
+            # Step 12: Add assistant response to conversation memory (English version)
             step12_start = time.time()
             logger.info("-" * 100)
-            logger.info("ORCHESTRATOR STEP 12: Add Assistant Response to Memory")
+            logger.info("ORCHESTRATOR STEP 12: Add Assistant Response to ConversationMemory (English)")
             logger.info("-" * 100)
             with obs_logger.pipeline_step(12, "add_assistant_to_memory", "memory_manager", {"response_preview": english_response[:100]}) if obs_logger else nullcontext():
                 # Store in ConversationMemory (English - for Unified Reasoning & _think())
-                # Use suggested_response from execution_log (pre-humanization English)
-                # Fallback to english_response if suggested_response not available
-                response_for_conv_memory = execution_log.suggested_response if execution_log.suggested_response else english_response
+                # CRITICAL: Always use suggested_response from execution_log (pre-humanization English from _think())
+                # This ensures ConversationMemory stores English, not translated/humanized responses
+                if execution_log.suggested_response:
+                    response_for_conv_memory = execution_log.suggested_response
+                    logger.info(f"📝 [ConversationMemory] Using suggested_response from _think() (English): {response_for_conv_memory[:80]}...")
+                else:
+                    # Fallback: If suggested_response is not available, use english_response
+                    # NOTE: This should rarely happen - suggested_response should always be set by _think()
+                    # If it's missing, english_response might be in user's language (humanized/generated)
+                    # Log a warning to help debug this edge case
+                    response_for_conv_memory = english_response
+                    logger.warning(f"⚠️ [ConversationMemory] suggested_response not found in execution_log! Using english_response as fallback: {response_for_conv_memory[:80]}...")
+                    logger.warning(f"⚠️ [ConversationMemory] This may store a non-English response if humanizer/generator was used!")
+                
                 self.memory_manager.add_assistant_turn(session_id, response_for_conv_memory)
-                logger.info(f"📝 [ConversationMemory] Stored {'suggested' if execution_log.suggested_response else 'final'} response: {response_for_conv_memory[:80]}...")
-
-                # Also store in NativeLanguageMemory (for response generators)
-                self.native_memory_manager.add_assistant_turn(
-                    session_id=session_id,
-                    content=english_response  # Humanized response in target language
-                )
-                logger.info(f"📝 [NativeLanguageMemory] Stored humanized response ({language_context.current_language}): {english_response[:80]}...")
+                logger.info(f"📝 [ConversationMemory] Stored response (English): {response_for_conv_memory[:80]}...")
             step12_duration = (time.time() - step12_start) * 1000
             logger.info(f"Step 12 completed in {step12_duration:.2f}ms")
 
@@ -1790,6 +2026,14 @@ Respond in JSON format:
                     # Use agent response as-is (already in target language)
                     translated_response = english_response
                     logger.info(f"Response used as-is ({language_context.current_language}): {translated_response[:200]}...")
+            
+            # Store translated response in NativeLanguageMemory (AFTER translation)
+            with obs_logger.pipeline_step(13, "add_translated_to_native_memory", "memory_manager", {"response_preview": translated_response[:100]}) if obs_logger else nullcontext():
+                self.native_memory_manager.add_assistant_turn(
+                    session_id=session_id,
+                    content=translated_response  # Translated response in user's language
+                )
+                logger.info(f"📝 [NativeLanguageMemory] Stored translated response ({language_context.current_language}): {translated_response[:80]}...")
             
             step13_duration = (time.time() - step13_start) * 1000
             logger.info(f"Step 13 completed in {step13_duration:.2f}ms")
@@ -1924,10 +2168,17 @@ Respond in JSON format:
             
             logger.info(f"⚠️ Patient not in state, attempting to load from DB...")
 
-            # Try to extract phone from session_id (common pattern: phone number as session)
-            # This is a simple heuristic - adjust based on your session ID strategy
-            if session_id.startswith("+") or session_id.isdigit():
+            # Extract phone from session_id
+            # Format: "clinic:{clinic_id}:session:{phone_number}" OR legacy plain phone number
+            phone_number = None
+            if session_id.startswith("clinic:") and ":session:" in session_id:
+                # Extract phone number from composite key: clinic:xxx:session:{phone}
+                phone_number = session_id.split(":session:")[-1]
+            elif session_id.startswith("+") or session_id.isdigit():
+                # Legacy format: plain phone number
                 phone_number = session_id
+
+            if phone_number:
                 patient = self.db_client.get_patient_by_phone_number(phone_number)
 
                 if patient:

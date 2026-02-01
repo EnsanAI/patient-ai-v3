@@ -353,12 +353,13 @@ Response:"""
                     )
 
             # Parse JSON response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
-                logger.error(f"No JSON found in detect_and_translate response: {response[:200]}")
+            from patient_ai_service.core.json_utils import extract_and_parse_json
+            try:
+                result = extract_and_parse_json(response, "detect_and_translate")
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to parse detect_and_translate response: {e}")
+                logger.error(f"Response was: {response[:200]}")
                 return text, "en", None, False  # Fallback: assume English, mark as failed
-
-            result = json.loads(json_match.group())
 
             language = result.get("language", "en")
             dialect = result.get("dialect")
@@ -614,12 +615,13 @@ Response:"""
 
             # Try to extract JSON from response (handles markdown code blocks)
             # Claude often returns JSON wrapped like: ```json\n{...}\n```
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
-                logger.error(f"No JSON found in language detection response: {response[:200]}")
+            from patient_ai_service.core.json_utils import extract_and_parse_json
+            try:
+                result = extract_and_parse_json(response, "language_detection")
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.error(f"Failed to parse language detection response: {e}")
+                logger.error(f"Response was: {response[:200]}")
                 return "en", None
-
-            result = json.loads(json_match.group())
 
             language = result.get("language", "en")
             dialect = result.get("dialect")
@@ -759,7 +761,7 @@ Translation:"""
             target_lang: Target language code
 
         Returns:
-            Translated text
+            Translated tex
 
         Note: This is the legacy method. Use translate_from_english_with_dialect() for dialect support.
         """

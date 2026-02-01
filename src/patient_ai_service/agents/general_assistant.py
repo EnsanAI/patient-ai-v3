@@ -53,8 +53,29 @@ class GeneralAssistantAgent(BaseAgent):
         self.register_tool(
             name="get_services",
             function=self.tool_get_services,
-            description="Get list of dental services and procedures offered",
+            description="Get list of dental services and procedures offered (legacy procedure catalog)",
             parameters={}
+        )
+
+        # List clinic services (with prices, categories) - PREFER this when user asks about services
+        self.register_tool(
+            name="list_services",
+            function=self.tool_list_services,
+            description="List all available clinic services with prices and categories. Use when user asks what services are offered, consultation types, or procedure pricing.",
+            parameters={}
+        )
+
+        # List doctors who can perform a specific clinic service
+        self.register_tool(
+            name="list_doctors_for_service",
+            function=self.tool_list_doctors_for_service,
+            description="List doctors who can perform a specific clinic service. Call list_services first to get service IDs.",
+            parameters={
+                "clinic_service_id": {
+                    "type": "string",
+                    "description": "Clinic service ID from list_services",
+                }
+            }
         )
 
         # Get insurance providers
@@ -177,11 +198,12 @@ You're the first point of contact for patients. You help them with:
 
 WHAT YOU CAN HELP WITH:
 ✓ Clinic information (location, hours, contact)
-✓ Services and procedures offered (use get_services tool)
+✓ Services and procedures offered (use list_services or get_services tool)
 ✓ Doctor information and specialties (use get_doctors and get_doctor_info tools)
 ✓ Finding doctors by name (use find_doctor_by_name tool for fuzzy matching)
+✓ Doctors who perform a specific service (use list_doctors_for_service - call list_services first for service IDs)
 ✓ Checking doctor availability (use check_doctor_availability tool)
-✓ Specific procedure details, prices, and descriptions (use get_procedure_info tool)
+✓ Specific procedure details, prices, and descriptions (use get_procedure_info or list_services tool)
 ✓ Insurance and payment options
 ✓ General dental health information
 ✓ Directing to appointments, emergencies, or registration
@@ -190,9 +212,9 @@ WHAT YOU CAN HELP WITH:
 IMPORTANT: When users ask about:
 - **Doctors**: ALWAYS use get_doctors or get_doctor_info tool to provide accurate information
 - **Finding specific doctors by name**: Use find_doctor_by_name tool - it handles variations in spelling and transliterations (e.g., "Mohamed" vs "Mohammed", "mo7amed")
+- **Doctors for a specific service**: Use list_services first to get service IDs, then list_doctors_for_service with clinic_service_id
 - **Doctor availability**: Use check_doctor_availability tool with doctor_id and date. MUST get doctor_id first using find_doctor_by_name
-- **Procedures**: ALWAYS use get_services or get_procedure_info tool to provide accurate details including prices
-- **Services**: ALWAYS use get_services tool to list available procedures
+- **Services/Procedures with prices**: PREFER list_services (clinic-specific with prices); fall back to get_services or get_procedure_info if needed
 
 REGISTRATION HANDLING:
 - **If this is the FIRST message and patient is NOT registered**: 
@@ -236,7 +258,7 @@ You: "We're here to help you! Let me get our current hours for you."
 
 User: "What procedures do you offer?"
 You: "Great question! Let me show you all our available procedures."
-[Use get_services tool]
+[Use list_services tool (or get_services if that returns empty)]
 [Provide full information - let them explore]
 
 **Unregistered user wants to book:**
@@ -678,6 +700,114 @@ Use your tools to provide accurate, up-to-date information!"""
                 "should_retry": True,
                 "can_proceed": False
             }
+
+    def tool_list_services(self, session_id: str) -> Dict[str, Any]:
+        """List all available clinic services (with prices, categories)."""
+        try:
+            clinic_id = self._get_clinic_id(session_id)
+            if not clinic_id:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "No clinic context available",
+                    "should_retry": False,
+                    "can_proceed": False,
+                }
+            entity_state = self.state_manager.get_entity_state(session_id)
+            doctor_entity = entity_state.derived.get_valid_entity(
+                "doctor_uuid", entity_state.patient
+            ) or entity_state.derived.get_entity("doctor_uuid")
+            doctor_id = doctor_entity.value if doctor_entity else None
+
+            services = self.db_client.get_clinic_services(clinic_id, doctor_id=doctor_id)
+            service_list = [
+                {
+                    "id": svc.get("id"),
+                    "name": svc.get("name"),
+                    "description": svc.get("description"),
+                    "category": svc.get("category"),
+                    "price": svc.get("effective", {}).get("price") if svc.get("effective") else svc.get("price"),
+                    "currency": svc.get("effective", {}).get("currency") if svc.get("effective") else svc.get("currency"),
+                }
+                for svc in services
+            ]
+            entity_state = self.state_manager.get_entity_state(session_id)
+            entity_state.services = {s["id"]: s for s in service_list if s.get("id")}
+            self.state_manager.save_entity_state(session_id, entity_state)
+            if not service_list:
+                return {
+                    "success": True,
+                    "result_type": ToolResultType.SUCCESS.value,
+                    "services": [],
+                    "count": 0,
+                    "message": "No clinic services configured. Showing procedure catalog instead.",
+                    "can_proceed": True,
+                    "next_action": "fallback_to_get_services",
+                }
+            return {
+                "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
+                "services": service_list,
+                "count": len(service_list),
+                "can_proceed": True,
+                "next_action": "present_services_to_user",
+            }
+        except Exception as e:
+            logger.error(f"Error listing clinic services: {e}")
+            return self.tool_get_services(session_id)
+
+    def tool_list_doctors_for_service(
+        self, session_id: str, clinic_service_id: str
+    ) -> Dict[str, Any]:
+        """List doctors who can perform a specific clinic service."""
+        try:
+            clinic_id = self._get_clinic_id(session_id)
+            if not clinic_id:
+                return {
+                    "success": False,
+                    "result_type": ToolResultType.SYSTEM_ERROR.value,
+                    "error": "No clinic context available",
+                    "can_proceed": False,
+                }
+            doctors = self.db_client.get_doctors_for_service(
+                clinic_id, clinic_service_id
+            )
+            doctor_list = [
+                {
+                    "id": doc.get("id"),
+                    "name": doc.get("name"),
+                    "title": doc.get("title"),
+                    "specialty": doc.get("specialty"),
+                    "languages_spoken": doc.get("languages_spoken", []),
+                }
+                for doc in doctors
+            ]
+            return {
+                "success": True,
+                "result_type": ToolResultType.SUCCESS.value,
+                "doctors": doctor_list,
+                "count": len(doctor_list),
+                "can_proceed": True,
+                "next_action": "present_doctors_to_user",
+            }
+        except Exception as e:
+            logger.error(f"Error listing doctors for service: {e}")
+            return {
+                "success": False,
+                "result_type": ToolResultType.SYSTEM_ERROR.value,
+                "error": str(e),
+                "can_proceed": False,
+            }
+
+    def _get_clinic_id(self, session_id: str) -> Optional[str]:
+        """Resolve clinic_id from global state or db_client context."""
+        global_state = self.state_manager.get_global_state(session_id)
+        if global_state and global_state.clinic_id:
+            return global_state.clinic_id
+        ctx = getattr(self.db_client, "_clinic_context", None)
+        if ctx and getattr(ctx, "clinic_id", None):
+            return ctx.clinic_id
+        return None
 
     def tool_find_doctor_by_name(self, session_id: str, doctor_name: str) -> Dict[str, Any]:
         """

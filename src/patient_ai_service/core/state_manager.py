@@ -6,8 +6,9 @@ Supports both in-memory (development) and Redis (production) backends.
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -291,6 +292,12 @@ class StateManager:
             self.backend = InMemoryBackend()
 
         self.ttl = settings.session_ttl
+        
+        # In-memory clinic metadata cache
+        # Format: {clinic_id: (ClinicMetadata, expiry_timestamp)}
+        self._clinic_cache: Dict[str, Tuple[Any, float]] = {}
+        self._clinic_cache_ttl = 600  # 10 minutes
+        
         logger.info(f"StateManager initialized with {type(self.backend).__name__}")
 
     def _make_key(self, session_id: str, state_type: str) -> str:
@@ -388,6 +395,71 @@ class StateManager:
         """Get current LLM entities from GlobalState."""
         global_state = self.get_global_state(session_id)
         return global_state.llm_entities.copy()
+
+    def get_clinic_metadata(
+        self,
+        clinic_id: str,
+        force_refresh: bool = False
+    ) -> Optional[Any]:
+        """
+        Get clinic metadata with 10-minute TTL caching.
+        
+        Args:
+            clinic_id: UUID of the clinic
+            force_refresh: If True, bypass cache and fetch fresh data
+            
+        Returns:
+            ClinicMetadata instance or None on error
+        """
+        from patient_ai_service.models.clinic_metadata import ClinicMetadata
+        from patient_ai_service.infrastructure.db_ops_client import DbOpsClient
+        
+        # Check cache (unless force_refresh)
+        if not force_refresh and clinic_id in self._clinic_cache:
+            metadata, expiry = self._clinic_cache[clinic_id]
+            if time.time() < expiry:
+                time_remaining = int(expiry - time.time())
+                logger.info(f"🎯 Clinic metadata cache HIT for: {metadata.name}")
+                logger.info(f"   Cache expires in: {time_remaining}s")
+                return metadata
+            else:
+                logger.info(f"⏰ Clinic metadata cache EXPIRED for {clinic_id}")
+                del self._clinic_cache[clinic_id]
+
+        # Cache miss - fetch from db-ops
+        logger.info(f"📥 Clinic metadata cache MISS - fetching from db-ops for {clinic_id}")
+
+        try:
+            db_client = DbOpsClient()
+            clinic_data = db_client.get_clinic_metadata(clinic_id)
+
+            if not clinic_data:
+                return None
+
+            # Parse into model
+            metadata = ClinicMetadata(
+                clinic_id=clinic_data.get("id") or clinic_id,
+                name=clinic_data.get("name", "Unknown Clinic"),
+                address=clinic_data.get("address"),
+                timezone=clinic_data.get("timezone", "UTC"),
+                phone_number=clinic_data.get("phone_number"),
+                email=clinic_data.get("email"),
+                opening_hours=clinic_data.get("opening_hours", {})
+            )
+
+            # Cache with TTL
+            expiry = time.time() + self._clinic_cache_ttl
+            self._clinic_cache[clinic_id] = (metadata, expiry)
+
+            logger.info(f"✅ Cached clinic metadata for: {metadata.name}")
+            logger.info(f"   Location: {metadata.address or 'Not specified'}")
+            logger.info(f"   Timezone: {metadata.timezone}")
+            logger.info(f"   Current time: {metadata.get_current_datetime_str()}")
+            logger.info(f"   Cache TTL: {self._clinic_cache_ttl}s (expires in 10 minutes)")
+            return metadata
+        except Exception as e:
+            logger.error(f"Error getting clinic metadata: {e}", exc_info=True)
+            return None
 
     # Appointment Agent State
 

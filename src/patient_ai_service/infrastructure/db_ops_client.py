@@ -261,7 +261,10 @@ class DbOpsClient:
         # Add clinic context headers for multi-tenant RLS enforcement
         if self._clinic_context:
             headers.update(self._clinic_context.to_headers())
-            logger.debug(f"📤 {method} {endpoint} [clinic={self._clinic_context.clinic_id}]")
+            logger.info(
+                f"📤 {method} {endpoint} [clinic={self._clinic_context.clinic_id}] "
+                f"[session={self._clinic_context.session_id}]"
+            )
         else:
             logger.debug(f"📤 {method} {endpoint}")
 
@@ -325,6 +328,19 @@ class DbOpsClient:
                 return None
 
         logger.error(f"❌ Request failed after {attempts} attempts")
+        return None
+
+    def _resolve_clinic_id(self, clinic_id: Optional[str]) -> Optional[str]:
+        if clinic_id:
+            if self._clinic_context and self._clinic_context.clinic_id != clinic_id:
+                logger.warning(
+                    f"clinic_id mismatch: provided={clinic_id} context={self._clinic_context.clinic_id}. "
+                    "Using context clinic_id."
+                )
+                return self._clinic_context.clinic_id
+            return clinic_id
+        if self._clinic_context:
+            return self._clinic_context.clinic_id
         return None
 
     # --- Specific API call functions ---
@@ -472,13 +488,34 @@ class DbOpsClient:
             logger.warning(f"No available time slots found for doctor {doctor_id} on {date}")
             return []
 
-    def create_appointment(self, clinic_id: str, patient_id: str, doctor_id: str, appointment_type_id: str, appointment_date: str, start_time: str, end_time: str, status: Optional[str] = None, reason: Optional[str] = None, emergency_level: Optional[str] = None, procedure_id: Optional[str] = None, notes: Optional[str] = None, request_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def create_appointment(
+        self,
+        clinic_id: Optional[str],
+        patient_id: str,
+        doctor_id: str,
+        appointment_type_id: str,
+        appointment_date: str,
+        start_time: str,
+        end_time: str,
+        status: Optional[str] = None,
+        reason: Optional[str] = None,
+        emergency_level: Optional[str] = None,
+        procedure_id: Optional[str] = None,
+        clinic_service_id: Optional[str] = None,
+        notes: Optional[str] = None,
+        request_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         logger.info(f"Creating appointment for patient {patient_id} with doctor {doctor_id}")
         if request_id:
             logger.info(f"Request ID for idempotency: {request_id}")
 
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("create_appointment requires clinic_id but none was provided or available in context.")
+            return None
+
         payload = {
-            "clinic_id": clinic_id,
+            "clinic_id": effective_clinic_id,
             "patient_id": patient_id,
             "doctor_id": doctor_id,
             "appointment_type_id": appointment_type_id,
@@ -488,6 +525,7 @@ class DbOpsClient:
             "reason": reason,
             "emergency_level": emergency_level or "routine",
             "procedure_id": procedure_id,
+            "clinic_service_id": clinic_service_id,
             "notes": notes,
             "request_id": request_id  # Add request_id for idempotency
         }
@@ -567,6 +605,42 @@ class DbOpsClient:
         }
         return self._make_request("PATCH", f"/appointments/{appointment_id}/reschedule", json_data=payload)
 
+    def get_clinic_metadata(
+        self,
+        clinic_id: str,
+        clinic_context: Optional["ClinicContext"] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch clinic metadata from db-ops.
+        
+        Args:
+            clinic_id: UUID of the clinic
+            clinic_context: Optional ClinicContext for RLS headers
+            
+        Returns:
+            Clinic data dictionary or None on error
+        """
+        try:
+            # Set clinic context if provided (for RLS headers)
+            if clinic_context:
+                self.set_clinic_context(clinic_context)
+
+            effective_clinic_id = self._resolve_clinic_id(clinic_id)
+            if not effective_clinic_id:
+                logger.error("get_clinic_metadata requires clinic_id but none was provided or available in context.")
+                return None
+            result = self._make_request("GET", f"/clinics/{effective_clinic_id}")
+            
+            if result:
+                logger.info(f"✅ Fetched clinic metadata for {effective_clinic_id}")
+                return result
+            else:
+                logger.warning(f"⚠️ Failed to fetch clinic metadata: {effective_clinic_id}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Error fetching clinic metadata: {e}", exc_info=True)
+            return None
+
     def update_appointment(self, appointment_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Update an appointment with one or more parameters.
@@ -596,6 +670,17 @@ class DbOpsClient:
             Updated appointment dict if successful, None if error
         """
         logger.info(f"Updating appointment ID: {appointment_id} with fields: {list(updates.keys())}")
+
+        # Enforce clinic_id consistency if provided in updates
+        if "clinic_id" in updates or "clinicId" in updates:
+            provided_clinic_id = updates.get("clinic_id") or updates.get("clinicId")
+            effective_clinic_id = self._resolve_clinic_id(provided_clinic_id)
+            if not effective_clinic_id:
+                logger.error("update_appointment includes clinic_id but no clinic context is available.")
+                return None
+            updates["clinic_id"] = effective_clinic_id
+            if "clinicId" in updates:
+                updates.pop("clinicId", None)
         
         # Phase 1: Enhanced logging - Log exact payload being sent
         logger.info(f"🔍 PATCH /appointments/{appointment_id} payload: {json.dumps(updates, indent=2)}")
@@ -726,9 +811,17 @@ class DbOpsClient:
         logger.info(f"📱 Trying {len(unique_variations)} phone variations")
         
         # Try each variation
+        params = {}
+        if self._clinic_context:
+            params["clinic_id"] = self._clinic_context.clinic_id
+
         for i, variation in enumerate(unique_variations):
             try:
-                patient = self._make_request("GET", f"/patients/by-phone/{variation}")
+                patient = self._make_request(
+                    "GET",
+                    f"/patients/by-phone/{variation}",
+                    params=params if params else None,
+                )
                 if patient:
                     logger.info(f"✅ Found patient: '{variation}' -> ID: {patient.get('id')}")
                     return patient
@@ -743,7 +836,11 @@ class DbOpsClient:
             if user and user.get("id"):
                 user_id = user.get("id")
                 logger.info(f"✅ Found user: {user_id}, now fetching patient by user_id")
-                patient = self._make_request("GET", f"/patients/user/{user_id}")
+                patient = self._make_request(
+                    "GET",
+                    f"/patients/user/{user_id}",
+                    params=params if params else None,
+                )
                 if patient:
                     logger.info(f"✅ Found patient via fallback: user_id {user_id} -> patient ID: {patient.get('id')}")
                     return patient
@@ -960,16 +1057,16 @@ class DbOpsClient:
     def get_clinic_info(self, clinic_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         # This fetches clinic general info by clinic_id, or first clinic's info if no ID is provided.
         logger.info(f"Fetching clinic info. Clinic ID: {clinic_id if clinic_id else 'default'}")
-        if clinic_id:
-            return self._make_request("GET", f"/clinics/{clinic_id}")
-        else:
-            # If no clinic_id is provided, fetch the first clinic's info
-            clinics = self._make_request("GET", "/clinics")
-            if clinics and isinstance(clinics, list) and len(clinics) > 0:
-                return clinics[0]
-            else:
-                logger.warning("No clinics found when trying to get default clinic info.")
-                return None
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if effective_clinic_id:
+            return self._make_request("GET", f"/clinics/{effective_clinic_id}")
+
+        # If no clinic_id is provided, fetch the first clinic's info
+        clinics = self._make_request("GET", "/clinics")
+        if clinics and isinstance(clinics, list) and len(clinics) > 0:
+            return clinics[0]
+        logger.warning("No clinics found when trying to get default clinic info.")
+        return None
     
     def get_all_clinics(self) -> Optional[List[Dict[str, Any]]]:
         """Fetch all available clinic branches."""
@@ -1104,7 +1201,8 @@ class DbOpsClient:
     def register_user(self, email: str, full_name: str, phone_number: str, role_id: str, 
                       password: Optional[str] = None, # Made password optional
                       username: Optional[str] = None, 
-                      language_preference: Optional[str] = "en") -> Optional[Dict[str, Any]]:
+                      language_preference: Optional[str] = "en",
+                      clinic_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Registers a new user with the db-ops service.
         If password is None, db-ops must support passwordless registration, otherwise it will fail.
@@ -1117,6 +1215,14 @@ class DbOpsClient:
             "roleId": role_id,
             "languagePreference": language_preference
         }
+        
+        # Add clinic_id for clinic association (creates user_clinic_access record)
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if effective_clinic_id:
+            payload["clinic_id"] = effective_clinic_id
+            logger.info(f"Including clinic_id {effective_clinic_id} in user registration")
+        elif clinic_id:
+            logger.warning(f"clinic_id provided but could not be resolved: {clinic_id}")
         if username:
             payload["username"] = username
         else:
@@ -1160,27 +1266,45 @@ class DbOpsClient:
 
     def get_patient_by_user_id(self, user_id: str) -> Optional[Dict]:
         logger.info(f"DbOpsClient: Getting patient details by their associated user ID: {user_id}")
-        return self._make_request("GET", f"/patients/user/{user_id}") # Assuming this is the correct endpoint
+        params = {}
+        if self._clinic_context:
+            params["clinic_id"] = self._clinic_context.clinic_id
+        return self._make_request(
+            "GET",
+            f"/patients/user/{user_id}",
+            params=params if params else None,
+        ) # Assuming this is the correct endpoint
 
     def get_all_users(self) -> Optional[List[Dict[str, Any]]]:
         logger.info("Fetching all users.")
         return self._make_request("GET", "/users")
 
-    def create_patient(self, user_id: str, first_name: str, last_name: str, date_of_birth: Optional[str] = None, # Made optional to match DTO more closely
+    def create_patient(
+        self,
+        user_id: str,
+        first_name: str,
+        last_name: str,
+        date_of_birth: Optional[str] = None, # Made optional to match DTO more closely
                        gender: Optional[str] = None, # Made optional
                        emergency_contact_name: Optional[str] = None, 
                        emergency_contact_phone: Optional[str] = None, insurance_provider: Optional[str] = None, 
                        insurance_policy_number: Optional[str] = None, 
                        medical_history: Optional[Dict[str, Any]] = None, allergies: Optional[List[str]] = None, 
-                       medications: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+                       medications: Optional[List[str]] = None,
+                       clinic_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Creates a new patient record associated with an existing user.
         Matches the CreatePatientDto in db-ops.
         date_of_birth should be in 'YYYY-MM-DD' format if provided.
         """
         logger.info(f"Attempting to create patient record for user_id: {user_id}")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("create_patient requires clinicId but none was provided or available in context.")
+            return None
         payload = {
             "userId": user_id,
+            "clinicId": effective_clinic_id,
             "first_name": first_name,  # DTO uses snake_case
             "last_name": last_name,    # DTO uses snake_case
             # Optional fields, ensure they are not None if not allowed by DTO, or handle if API expects them to be absent
@@ -1239,19 +1363,31 @@ class DbOpsClient:
 
     def get_clinic_settings(self, clinic_id: str) -> Optional[List[Dict[str, Any]]]:
         """Gets all settings for a specific clinic."""
-        logger.info(f"Fetching settings for clinic ID: {clinic_id}")
-        return self._make_request("GET", f"/clinics/{clinic_id}/settings")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_settings requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching settings for clinic ID: {effective_clinic_id}")
+        return self._make_request("GET", f"/clinics/{effective_clinic_id}/settings")
 
     def get_clinic_setting_by_key(self, clinic_id: str, key: str) -> Optional[Dict[str, Any]]:
         """Gets a specific setting for a clinic by key."""
-        logger.info(f"Fetching setting '{key}' for clinic ID: {clinic_id}")
-        return self._make_request("GET", f"/clinics/{clinic_id}/settings/{key}")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_setting_by_key requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching setting '{key}' for clinic ID: {effective_clinic_id}")
+        return self._make_request("GET", f"/clinics/{effective_clinic_id}/settings/{key}")
 
     def create_or_update_clinic_setting(self, clinic_id: str, setting_key: str, setting_value: Any) -> Optional[Dict[str, Any]]:
         """Creates or updates a clinic setting."""
-        logger.info(f"Creating/updating setting '{setting_key}' for clinic ID: {clinic_id}")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("create_or_update_clinic_setting requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Creating/updating setting '{setting_key}' for clinic ID: {effective_clinic_id}")
         payload = {
-            "clinic_id": clinic_id,
+            "clinic_id": effective_clinic_id,
             "setting_key": setting_key,
             "setting_value": setting_value
         }
@@ -1259,32 +1395,46 @@ class DbOpsClient:
 
     def get_clinic_appointments(self, clinic_id: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """Gets appointments for a specific clinic, optionally filtered by date."""
-        logger.info(f"Fetching appointments for clinic ID: {clinic_id}")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_appointments requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching appointments for clinic ID: {effective_clinic_id}")
         params = {}
         if start_date:
             params["startDate"] = start_date
         if end_date:
             params["endDate"] = end_date
-        return self._make_request("GET", f"/clinics/{clinic_id}/appointments", params=params)
+        return self._make_request("GET", f"/clinics/{effective_clinic_id}/appointments", params=params)
 
     def get_clinic_appointment_policy(self, clinic_id: str) -> Optional[Dict[str, Any]]:
         """Get clinic appointment policy using settings endpoint since appointment-policy doesn't exist."""
-        logger.info(f"Fetching appointment policy for clinic ID: {clinic_id}")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_appointment_policy requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching appointment policy for clinic ID: {effective_clinic_id}")
         # Use clinic settings instead since appointment-policy endpoint doesn't exist
         try:
-            settings = self._make_request("GET", f"/clinics/{clinic_id}/appointment-policy")
+            settings = self._make_request("GET", f"/clinics/{effective_clinic_id}/appointment-policy")
             if settings:
                 # Look for appointment policy in settings
                 return settings
             return None
         except Exception as e:
-            logger.warning(f"Could not fetch appointment policy for clinic {clinic_id}: {e}")
+            logger.warning(f"Could not fetch appointment policy for clinic {effective_clinic_id}: {e}")
             return None
 
     def create_or_update_clinic_appointment_policy(self, clinic_id: str, policy_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Creates or updates the appointment policy for a specific clinic."""
-        logger.info(f"Creating/updating appointment policy for clinic ID: {clinic_id}")
-        return self._make_request("POST", f"/clinics/{clinic_id}/appointment-policy", json_data=policy_data)
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("create_or_update_clinic_appointment_policy requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Creating/updating appointment policy for clinic ID: {effective_clinic_id}")
+        policy_payload = dict(policy_data or {})
+        policy_payload["clinicId"] = effective_clinic_id
+        return self._make_request("POST", f"/clinics/{effective_clinic_id}/appointment-policy", json_data=policy_payload)
 
     # Doctors and Specialties
     def add_doctor_availability(self, doctor_id: str, availability_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1380,13 +1530,21 @@ class DbOpsClient:
     # Insurance and Payment
     def get_clinic_accepted_insurances(self, clinic_id: str) -> Optional[Dict[str, Any]]: # Response has a specific structure
         """Gets all insurance providers accepted by a specific clinic."""
-        logger.info(f"Fetching accepted insurances for clinic ID: {clinic_id}")
-        return self._make_request("GET", f"/clinics/{clinic_id}/accepted-insurances")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_accepted_insurances requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching accepted insurances for clinic ID: {effective_clinic_id}")
+        return self._make_request("GET", f"/clinics/{effective_clinic_id}/accepted-insurances")
 
     def get_clinic_insurance_providers(self, clinic_id: str) -> Optional[List[Dict[str, Any]]]:
         """Gets insurance providers for a specific clinic with network coverage details."""
-        logger.info(f"Fetching insurance providers for clinic ID: {clinic_id}")
-        return self._make_request("GET", f"/clinics/{clinic_id}/insurance/providers")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_insurance_providers requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching insurance providers for clinic ID: {effective_clinic_id}")
+        return self._make_request("GET", f"/clinics/{effective_clinic_id}/insurance/providers")
 
     def get_all_clinics_insurance_providers(self) -> Optional[List[Dict[str, Any]]]:
         """Gets insurance providers for all clinics with branch-specific details."""
@@ -1429,21 +1587,113 @@ class DbOpsClient:
 
     def get_clinic_procedures(self, clinic_id: str) -> Optional[Dict[str, Any]]: # Response has specific structure
         """Gets all dental procedures available at a specific clinic."""
-        logger.info(f"Fetching procedures for clinic ID: {clinic_id}")
-        return self._make_request("GET", f"/clinics/{clinic_id}/procedures")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
+        if not effective_clinic_id:
+            logger.error("get_clinic_procedures requires clinic_id but none was provided or available in context.")
+            return None
+        logger.info(f"Fetching procedures for clinic ID: {effective_clinic_id}")
+        return self._make_request("GET", f"/clinics/{effective_clinic_id}/procedures")
+
+    # --- Clinic Services (Phase 4.5) ---
+
+    def get_clinic_services(self, clinic_id: str, doctor_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch clinic services for a clinic. If doctor_id is provided, returns doctor-assigned services with overrides."""
+        try:
+            effective_clinic_id = self._resolve_clinic_id(clinic_id)
+            if not effective_clinic_id:
+                logger.error("get_clinic_services requires clinic_id but none was provided or available in context.")
+                return []
+            if doctor_id:
+                response = self._make_request(
+                    "GET",
+                    f"/clinics/{effective_clinic_id}/doctors/{doctor_id}/services",
+                )
+            else:
+                response = self._make_request(
+                    "GET",
+                    f"/clinics/{effective_clinic_id}/services",
+                    params={"is_active": "true"},
+                )
+            return response if isinstance(response, list) else []
+        except Exception as e:
+            logger.error(f"Failed to fetch clinic services: {e}")
+            return []
+
+    def search_clinic_services(self, clinic_id: str, query: str) -> List[Dict[str, Any]]:
+        """Search clinic services by name/description."""
+        try:
+            effective_clinic_id = self._resolve_clinic_id(clinic_id)
+            if not effective_clinic_id:
+                return []
+            response = self._make_request(
+                "GET",
+                f"/clinics/{effective_clinic_id}/services/search",
+                params={"query": query},
+            )
+            return response if isinstance(response, list) else []
+        except Exception as e:
+            logger.error(f"Failed to search clinic services: {e}")
+            return []
+
+    def get_doctors_for_service(
+        self,
+        clinic_id: str,
+        clinic_service_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Get all doctors who can perform a specific service."""
+        try:
+            effective_clinic_id = self._resolve_clinic_id(clinic_id)
+            if not effective_clinic_id:
+                return []
+            response = self._make_request(
+                "GET",
+                f"/clinics/{effective_clinic_id}/services/{clinic_service_id}/doctors",
+            )
+            return response if isinstance(response, list) else []
+        except Exception as e:
+            logger.error(f"Failed to fetch doctors for service: {e}")
+            return []
+
+    def get_clinic_service_by_id(
+        self,
+        clinic_id: str,
+        clinic_service_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Get specific clinic service by ID."""
+        try:
+            effective_clinic_id = self._resolve_clinic_id(clinic_id)
+            if not effective_clinic_id:
+                return None
+            return self._make_request(
+                "GET",
+                f"/clinics/{effective_clinic_id}/services/{clinic_service_id}",
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch clinic service: {e}")
+            return None
 
     # Emergencies
     def report_emergency(self, emergency_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Reports a new emergency."""
+        effective_clinic_id = self._resolve_clinic_id(
+            emergency_data.get("clinicId") or emergency_data.get("clinic_id")
+        )
+        if not effective_clinic_id:
+            logger.error("report_emergency requires clinicId but none was provided or available in context.")
+            return None
+        emergency_data = dict(emergency_data)
+        emergency_data.pop("clinic_id", None)
+        emergency_data["clinicId"] = effective_clinic_id
         logger.info(f"Reporting new emergency for clinic ID: {emergency_data.get('clinicId')}")
         return self._make_request("POST", "/emergencies", json_data=emergency_data)
 
     def get_all_emergencies(self, clinic_id: Optional[str] = None, status: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """Retrieves a list of all reported emergencies, optionally filtered."""
         logger.info("Fetching all emergencies.")
+        effective_clinic_id = self._resolve_clinic_id(clinic_id)
         params = {}
-        if clinic_id:
-            params["clinicId"] = clinic_id
+        if effective_clinic_id:
+            params["clinicId"] = effective_clinic_id
         if status:
             params["status"] = status
         return self._make_request("GET", "/emergencies", params=params if params else None)
